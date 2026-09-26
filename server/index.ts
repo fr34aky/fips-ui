@@ -313,8 +313,9 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access' && method === 'GET') {
     const you = principalOf(req);
+    if (you.role !== 'admin') return json(res, 200, { you });
     const h = await admin.helperInfo();
-    return json(res, 200, you.role === 'admin' ? { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: 5 } : { you });
+    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: 5 });
   }
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
@@ -336,8 +337,9 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access') {
     try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
-    // A sync already in flight was built from the previous list: wait for it, then run one for this save.
-    await meshSync.running?.catch(() => {});
+    // Syncs already in flight (or chained on them) were built from the previous list: wait until none is
+    // running, then start this save's own full sync before yielding.
+    while (meshSync.running) await meshSync.running.catch(() => {});
     meshSync.dirty = true;
     const firewall = await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
     await mesh.reconcile();
@@ -383,10 +385,10 @@ async function route(req: Req, res: Res) {
 }
 
 /**
- * Every request is attributed by its source address. An fd00::/8 source is a mesh identity and is admitted
- * only as an allowed npub (and only while the kernel guard is active, see server/access.ts), on either
- * listener. The mesh listener admits nothing else. On the main listener any other source is the local
- * operator (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
+ * Every request is attributed by its source address and listener. On the mesh listener only fd00::/8 sources
+ * are accepted, each admitted only as an allowed npub while the kernel guard is proven (see server/access.ts).
+ * On the main listener every source is the local operator (loopback, or whatever FIPS_UI_HOST exposes, where
+ * FIPS_UI_TOKEN applies), except fd00::/8 sources while mesh access is on, which are refused.
  */
 async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<void> {
   const remote = req.socket.remoteAddress;
@@ -450,11 +452,21 @@ const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) =
  * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the
  * access queue; a failed or refused step leaves `dirty` set and is retried on the next 15 s tick.
  */
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 type MeshSyncResult = { ok: boolean; guard?: string; rule?: string; skipped?: string };
 const meshSync = { dirty: true, running: null as Promise<MeshSyncResult> | null };
 // Only the mesh listener admits mesh identities, so only its port needs the guard.
 function guardPorts(cfg: AccessConfig): number[] { return [cfg.port]; }
+
+/** The managed firewall rule for mesh access: the mesh port on fips0, open to exactly the allowed npubs. */
+function meshRule(cfg: AccessConfig): FirewallRule | null {
+  return cfg.enabled && cfg.allowed.length
+    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
+    : null;
+}
+function applyMeshRule(cfg: AccessConfig): Promise<Record<string, unknown>> {
+  const rule = meshRule(cfg);
+  return admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
+}
 const samePorts = (a: number[], b: number[]) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
 
 /** Full sync after a change: guard and managed firewall rule. */
@@ -486,11 +498,8 @@ function syncMesh(): Promise<MeshSyncResult> {
       else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }
       else { result.ok = false; result.guard = g.error ?? 'failed'; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
-    const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
-      ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
-      : null;
     try {
-      const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
+      const r = await applyMeshRule(cfg);
       if (!r.ok) { result.ok = false; result.rule = String(r.error ?? 'rejected'); }
     } catch (e) { result.ok = false; result.rule = (e as Error).message; }
     // A failed guard needs the full sync again; a failed rule alone is retried without touching the guard.
@@ -543,12 +552,7 @@ let meshRuleDirty = false;
 /** Retry only the managed firewall rule (the guard is fine). */
 async function syncRule(): Promise<void> {
   if (meshSync.running) return;
-  const cfg = mesh.config;
-  const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
-    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
-    : null;
-  try { const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]); meshRuleDirty = !r.ok; }
-  catch { meshRuleDirty = true; }
+  try { meshRuleDirty = !(await applyMeshRule(mesh.config)).ok; } catch { meshRuleDirty = true; }
 }
 mesh.onChange = async () => { meshSync.dirty = true; };
 mesh.onTunChange = () => { meshGuardDirty = true; };

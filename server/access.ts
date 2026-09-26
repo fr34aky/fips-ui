@@ -111,11 +111,14 @@ export class MeshAccess {
    */
   setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }): void {
     // Every successful (re)load counts, not only inactive-to-active: a reload after an unnoticed flush is one too.
+    const wasActive = this.guard.active;
     if (g.active) this.guardSince = performance.now();
     this.guard = g;
     this.guardGen++;
-    // Losing the guard cuts every mesh connection and stops the listener. (Re)loading it closes and rebinds
-    // the listener, discarding any handshake that completed and queued in the backlog while it was missing.
+    // Losing the guard cuts every mesh connection and stops the listener. Getting it back (inactive to active)
+    // closes and rebinds the listener, discarding any handshake that queued in the backlog while it was
+    // missing. Re-applying a guard that was already active (every save) leaves connections alone.
+    if (wasActive && g.active) return;
     const gen = this.guardGen;
     if (!g.active) this.revalidate();
     void this.serial(async () => {
@@ -154,7 +157,7 @@ export class MeshAccess {
   }
 
   /**
-   * Called for every fd00::/8 connection as it is accepted (on either listener): prove the guard was loaded
+   * Called for every fd00::/8 connection as the mesh listener accepts it: prove the guard was loaded
    * for its handshake. A connection that fails is destroyed at once and can never be admitted. Only a canary
    * that actually accepts (not a timeout) marks the guard lost.
    */
@@ -182,7 +185,7 @@ export class MeshAccess {
   onTunChange: () => void = () => {};
 
   /**
-   * The principal for a connection from a mesh (fd00::/8) source, on any listener, or null if it is not
+   * The principal for a connection from a mesh (fd00::/8) source on the mesh listener, or null if it is not
    * admitted. When mesh access is disabled nobody is admitted from the mesh.
    */
   principalFor(remote: string | undefined): Principal | null {
