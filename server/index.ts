@@ -10,8 +10,8 @@ import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, t
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, type FirewallRule } from './admin.ts';
-import { MeshAccess, LOCAL, AccessError, expand6, type Principal, type AccessConfig } from './access.ts';
-import { isMeshAddress } from './net6.ts';
+import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
+import { expand6, isMeshAddress } from './net6.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -341,6 +341,9 @@ async function route(req: Req, res: Res) {
   const body = await readJsonBody(req);
 
   if (p === '/api/access') {
+    const want = body as Partial<AccessConfig>;
+    // The mesh listener binds this node's fips0 address; a main listener on every address already holds that port.
+    if (want?.enabled === true && Number(want.port) === PORT && (WILDCARD_BIND || isMeshAddress(HOST))) throw new HttpError(400, `port ${PORT} is already used by the main listener (FIPS_UI_HOST=${HOST}); choose another port for mesh access`);
     try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
     // Syncs already in flight (or chained on them) were built from the previous list: wait for a few of them,
     // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
@@ -410,6 +413,7 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
     // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
     // principal is read only after that, so a revocation during the proof takes effect.
     const proof = await mesh.provenAtAccept(req.socket);
+    if (proof === 'unlisted') return denyMesh(req, res);
     if (proof === 'retry') { res.setHeader('retry-after', '1'); return json(res, 503, { error: 'the spoofing guard was just reloaded; retry in a second' }, true); }
     if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection');
     if (!mesh.ready()) { res.setHeader('retry-after', '5'); return json(res, 503, { error: 'mesh access is not ready (guard or node identity missing); retry shortly' }, true); }
@@ -484,8 +488,10 @@ function syncMesh(): Promise<MeshSyncResult> {
     meshSync.dirty = false;
     const cfg: AccessConfig = mesh.config;
     const helper = await admin.helperInfo().catch(() => null);
-    // Nothing to load or remove without the helper while access is off (a helper that never ran cannot have loaded a guard).
-    if (!helper?.managementCapable && !cfg.enabled) return { ok: true, skipped: 'helper not installed' };
+    // With access off there is nothing to remove when the helper is known not to have a guard: not installed, or
+    // answering as older than v5. A helper check that failed may hide a loaded guard, so that case is retried.
+    const noGuardPossible = helper !== null && (helper.available ? (helper.version ?? 0) < 5 : /not installed/.test(helper.error ?? ''));
+    if (!cfg.enabled && noGuardPossible) return { ok: true, skipped: 'no guard to remove' };
     if (!helper?.managementCapable) {
       mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
       meshSync.dirty = true;
@@ -579,10 +585,9 @@ let meshTicks = 0;
 setInterval(() => {
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
   else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
-  else {
-    if (meshRuleDirty) void syncRule();
-    if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
-  }
+  // The 30 s guard check always gets its tick; a failing rule retry cannot starve it.
+  else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
+  else if (meshRuleDirty) void syncRule();
 }, 15_000).unref();
 void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 

@@ -297,7 +297,11 @@ export function createAdminHandler(opts: AdminOptions) {
       }
       if (sub === '/firewall/rules') {
         if (!Array.isArray(body.rules)) throw new BodyError(400, 'rules (array) required');
-        const rules = body.rules.map(validateRule);
+        // Tagged rules (mesh access) belong to the UI itself: whatever a possibly stale page sends for them is
+        // replaced by the rules currently on disk.
+        const managed = (await readDropins()).find((d) => d.managed);
+        const kept = managed ? parseManagedDropinStrict(managed.content).rules.filter((r) => r.tag) : [];
+        const rules = [...body.rules.map(validateRule).filter((r: FirewallRule) => !r.tag), ...kept];
         const result = await (rules.length === 0
           ? (existsSync(join(DROPIN_DIR, `${MANAGED_DROPIN}.nft`)) ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false })
           : helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(rules)));

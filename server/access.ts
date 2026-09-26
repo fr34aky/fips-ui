@@ -22,8 +22,9 @@ import http from 'node:http';
 import net, { type Socket } from 'node:net';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir, networkInterfaces } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { expand6, isMeshAddress as isMeshSource } from './net6.ts';
+import { expand6, isMeshAddress } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
 import { readHosts } from './system.ts';
@@ -40,19 +41,27 @@ const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME
 
 export class AccessError extends Error {}
 
-/** Every address configured on this host's interfaces (expanded), re-read at most once a second. */
+/**
+ * Every IPv6 address configured on this host (expanded), re-read at most once a second. /proc/net/if_inet6 lists
+ * the addresses of interfaces that are down or without carrier too, which os.networkInterfaces() leaves out.
+ */
 let localCache: { at: number; set: Set<string> } | null = null;
 function localAddresses(): Set<string> {
   const now = performance.now();
   if (!localCache || now - localCache.at > 1000) {
     const set = new Set<string>();
+    try {
+      for (const row of readFileSync('/proc/net/if_inet6', 'utf8').split('\n')) {
+        const hex = row.split(/\s+/)[0];
+        const k = /^[0-9a-f]{32}$/.test(hex ?? '') ? expand6(hex.match(/.{4}/g)!.join(':')) : null;
+        if (k) set.add(k);
+      }
+    } catch { /* not Linux */ }
     for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) { const k = a.family === 'IPv6' ? expand6(a.address.split('%')[0]) : null; if (k) set.add(k); }
     localCache = { at: now, set };
   }
   return localCache.set;
 }
-
-export { expand6 };
 
 export function validateAccess(input: unknown): AccessConfig {
   const x = input as Partial<AccessConfig>;
@@ -76,7 +85,7 @@ export function validateAccess(input: unknown): AccessConfig {
 export interface MeshStatus { listening: boolean; address: string | null; npub: string | null; port: number; guard: { active: boolean; ports: number[]; error?: string }; error?: string }
 
 type Entry = AccessEntry & { address: string };
-type Proof = 'ok' | 'retry' | 'fail';
+type Proof = 'ok' | 'retry' | 'fail' | 'unlisted';
 
 export class MeshAccess {
   config: AccessConfig = { enabled: false, port: 8321, allowed: [] };
@@ -179,6 +188,9 @@ export class MeshAccess {
   proveOnAccept(socket: Socket): void {
     const acceptedAt = performance.now();
     const p = (async (): Promise<Proof> => {
+      // A source that is not on the list is only ever shown the denial page: no canary connection is spent on it.
+      const key = expand6(socket.remoteAddress ?? '');
+      if (!key || !this.byAddress.has(key)) return 'unlisted';
       if (!this.guard.active || this.guard.tun !== this.tun) return 'retry';
       // The connection must have arrived on a port the loaded guard covers.
       if (!this.guard.ports.includes(socket.localPort ?? -1)) return 'fail';
@@ -221,7 +233,7 @@ export class MeshAccess {
     // This node's own addresses arrive over lo from any local process; they must never act as an npub.
     if (!key || key === expand6(this.own!.address) || localAddresses().has(key)) return null;
     const e = this.byAddress.get(key);
-    if (!e || e.npub === this.own.npub) return null;
+    if (!e || e.npub === this.own!.npub) return null;
     return { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address };
   }
 
@@ -339,7 +351,7 @@ export class MeshAccess {
     if (this.bound && this.bound.address === want.address && this.bound.port === want.port) return;
     if (this.server) this.close();
     const server = http.createServer(this.handler);
-    server.on('connection', (sock: Socket) => { if (isMeshSource(sock.remoteAddress)) this.proveOnAccept(sock); });
+    server.on('connection', (sock: Socket) => { if (isMeshAddress(sock.remoteAddress)) this.proveOnAccept(sock); });
     await new Promise<void>((resolve) => {
       server.once('error', (e: NodeJS.ErrnoException) => {
         this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address}` : `${e.code ?? 'error'}: ${e.message}`;
