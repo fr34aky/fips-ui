@@ -357,12 +357,12 @@ export function createAdminHandler(opts: AdminOptions) {
   }
 
   /** Read-only: is the guard loaded, and for which ports and interface? */
-  async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string } | null> {
+  async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string; canary: number } | null> {
     const h = await helperInfo();
     if (!h.available || (h.version ?? 0) < 4) return null;
     const r = await runHelper(helperPath, ['mesh-guard', 'status'], undefined, 15_000);
     if (r.code !== 0) return null;
-    try { const j = lastJson<{ active: boolean; ports?: string; tun?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '' }; }
+    try { const j = lastJson<{ active: boolean; ports?: string; tun?: string; canary?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '', canary: Number(j.canary ?? 0) }; }
     catch { return null; }
   }
 

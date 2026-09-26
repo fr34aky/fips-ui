@@ -11,17 +11,19 @@
 // the FIPS TUN device. Every packet is checked, the handshake included.
 //
 // Something outside the UI can flush the guard (restarting nftables.service flushes the whole ruleset), so
-// its presence is proven for every new mesh connection, without privileges: the same table holds a canary
-// rule that resets TCP to a private port on ::1 where this process listens. Before a connection is admitted
-// the UI connects to that port. Refused means the table is loaded; accepted means it is gone, and the
-// connection is denied. A connection whose handshake happened while the guard was loaded is trustworthy.
+// its presence is proven for every fd00::/8 connection at the moment it is accepted, without privileges: the
+// same table holds a canary rule that resets TCP to a private port on ::1 where this process listens. On
+// accept the UI connects to that port. Refused means the table is loaded, so the handshake just completed
+// under the guard; accepted means it is gone, and the connection is destroyed. The residual window is the
+// time between the kernel completing a handshake and this check (well under a millisecond), during which the
+// guard would have to be re-loaded by someone else for a forged connection to pass.
 
 import http from 'node:http';
 import net, { type Socket } from 'node:net';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { expand6 } from './net6.ts';
+import { expand6, isMeshAddress as isMeshSource } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
 
@@ -75,7 +77,7 @@ export class MeshAccess {
   private conns = new Map<Socket, string>();
   private tun = 'fips0';
   /** Whether the kernel guard for the current ports is loaded (set by the sync in server/index.ts). */
-  guard: { active: boolean; ports: number[]; error?: string } = { active: false, ports: [] };
+  guard: { active: boolean; ports: number[]; tun?: string; error?: string } = { active: false, ports: [] };
   /** Set when access.json exists but could not be loaded; saving is refused until it loads, so it is never overwritten. */
   private loadError: string | undefined;
   private loaded = false;
@@ -101,14 +103,14 @@ export class MeshAccess {
    * Record the guard state. It takes effect for admission at once (principalFor checks it), and losing it
    * cuts every mesh connection and stops the listener, through the queue so it cannot race a bind.
    */
-  setGuard(g: { active: boolean; ports: number[]; error?: string }): void {
+  setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }): void {
     this.guard = g;
     if (!g.active) { this.revalidate(); void this.serial(async () => { if (!this.guard.active && this.server) this.close(); }); }
   }
 
   // --- canary --------------------------------------------------------------------------------------
   private canaryServer: net.Server | null = null;
-  private proven = new WeakMap<Socket, boolean>();
+  private proven = new WeakMap<Socket, Promise<boolean>>();
   /** Port of the canary listener on ::1 (0 until started). */
   canaryPort = 0;
 
@@ -122,30 +124,36 @@ export class MeshAccess {
     });
   }
 
-  /** True if the guard table is loaded right now: our own connection to the canary port is reset. */
-  private canaryRefused(): Promise<boolean> {
-    if (!this.canaryPort) return Promise.resolve(false);
+  /** 'loaded' if our connection to the canary port is reset, 'missing' if it is accepted, 'unknown' otherwise. */
+  private canary(): Promise<'loaded' | 'missing' | 'unknown'> {
+    if (!this.canaryPort) return Promise.resolve('unknown');
     return new Promise((resolve) => {
       const s = net.connect({ host: '::1', port: this.canaryPort });
-      const done = (v: boolean) => { clearTimeout(t); s.destroy(); resolve(v); };
-      const t = setTimeout(() => done(false), 500);
-      s.once('connect', () => done(false));
-      s.once('error', (e: NodeJS.ErrnoException) => done(e.code === 'ECONNREFUSED' || e.code === 'ECONNRESET'));
+      const done = (v: 'loaded' | 'missing' | 'unknown') => { clearTimeout(t); s.destroy(); resolve(v); };
+      const t = setTimeout(() => done('unknown'), 500);
+      s.once('connect', () => done('missing'));
+      s.once('error', (e: NodeJS.ErrnoException) => done(e.code === 'ECONNREFUSED' || e.code === 'ECONNRESET' ? 'loaded' : 'unknown'));
     });
   }
 
   /**
-   * Admit a mesh connection only if the guard is confirmed and provably loaded now; the proof is cached per
-   * connection. A failed proof marks the guard inactive (the sync re-applies it).
+   * Called for every fd00::/8 connection as it is accepted (on either listener): prove the guard was loaded
+   * for its handshake. A connection that fails is destroyed at once and can never be admitted. Only a canary
+   * that actually accepts (not a timeout) marks the guard lost.
    */
-  async proveGuard(socket: Socket): Promise<boolean> {
-    const hit = this.proven.get(socket);
-    if (hit !== undefined) return hit;
-    const ok = this.guard.active && (await this.canaryRefused());
-    this.proven.set(socket, ok);
-    if (!ok && this.guard.active) { this.setGuard({ active: false, ports: [], error: 'guard table missing (was the nftables ruleset flushed?)' }); this.onGuardLost(); }
-    return ok;
+  proveOnAccept(socket: Socket): void {
+    const p = (async () => {
+      if (!this.guard.active) return false;
+      const r = await this.canary();
+      if (r === 'missing' && this.guard.active) { this.setGuard({ active: false, ports: [], error: 'guard table missing (was the nftables ruleset flushed?)' }); this.onGuardLost(); }
+      return r === 'loaded';
+    })();
+    this.proven.set(socket, p);
+    void p.then((ok) => { if (!ok) socket.destroy(); });
   }
+
+  /** Whether this connection's accept-time proof succeeded (false for a connection that was never proven). */
+  provenAtAccept(socket: Socket): Promise<boolean> { return this.proven.get(socket) ?? Promise.resolve(false); }
 
   onGuardLost: () => void = () => {};
 
@@ -266,6 +274,7 @@ export class MeshAccess {
     if (this.bound && this.bound.address === want.address && this.bound.port === want.port) return;
     if (this.server) this.close();
     const server = http.createServer(this.handler);
+    server.on('connection', (sock: Socket) => { if (isMeshSource(sock.remoteAddress)) this.proveOnAccept(sock); });
     await new Promise<void>((resolve) => {
       server.once('error', (e: NodeJS.ErrnoException) => {
         this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address}` : `${e.code ?? 'error'}: ${e.message}`;

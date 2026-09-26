@@ -16,13 +16,15 @@ someone's `fd00::/8` address, and with a forged router advertisement even comple
 the privileged helper loads a small kernel rule, table `inet fips_ui_guard`, that drops TCP from
 `fd00::/8` to the UI's ports unless it arrives on `lo` or the FIPS TUN device. The kernel applies it to
 every packet, the handshake included. The UI trusts `fd00::/8` sources only while it has confirmed the
-guard is loaded; without it (for example before helper v3 is installed) nobody is admitted from the mesh.
+guard is loaded; without it (for example before helper v4 is installed) nobody is admitted from the mesh.
 Something outside the UI (restarting `nftables.service`, for example) can flush the whole ruleset, so the
-guard's presence is proven for every new mesh connection without privileges: the same table holds a
-canary rule that resets TCP to a private port on `::1` where the UI listens. Before admitting a
-connection the UI connects to its canary; if that connection is accepted instead of reset, the table is
-gone, the connection is denied and the guard is re-applied. In addition the UI asks the helper every 30
-seconds whether the guard still covers the right ports (one read-only sudo call, visible in the auth log).
+guard's presence is proven for every mesh connection at the moment it is accepted, without privileges: the
+same table holds a canary rule that resets TCP to a private port on `::1` where the UI listens. On accept
+the UI connects to its canary; if that connection is accepted instead of reset, the table is gone, the new
+connection is destroyed and the guard is re-applied. What remains is the time between the kernel finishing
+a handshake and this check, well under a millisecond, during which someone else would have to re-load the
+guard for a forged connection to pass. In addition the UI asks the helper every 30 seconds whether the
+guard, including its canary, still matches (one read-only sudo call, visible in the auth log).
 
 While mesh access is on, `fd00::/8` sources are treated as mesh identities on the main listener too. If you
 expose the main listener on a LAN that itself uses `fd` ULA addresses, those clients cannot use it over IPv6

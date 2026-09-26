@@ -394,9 +394,11 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   // With mesh access off, fd00::/8 sources on the main listener are whatever they were before this feature
   // existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN); with it on they are mesh identities.
   if (isMeshAddress(remote) && (listener === 'mesh' || mesh.config.enabled)) {
+    // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
+    // principal is read only after that, so a revocation during the proof takes effect.
+    if (!(await mesh.provenAtAccept(req.socket))) return denyMesh(req, res, 'the spoofing guard was not loaded for this connection; try again');
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
-    if (!(await mesh.proveGuard(req.socket))) return denyMesh(req, res, 'the spoofing guard is not loaded right now; try again in a few seconds');
     mesh.track(req.socket, pr);
     principals.set(req, pr);
   } else if (listener === 'mesh') {
@@ -405,6 +407,7 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   return route(req, res);
 }
 const server = http.createServer((req, res) => { handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
+server.on('connection', (sock) => { if (isMeshAddress(sock.remoteAddress) && mesh.config.enabled) mesh.proveOnAccept(sock); });
 
 // ---------------------------------------------------------------------------------------------
 // Mesh access
@@ -463,17 +466,20 @@ function syncMesh(): Promise<MeshSyncResult> {
       return { ok: false, skipped: 'helper not installed' };
     }
     const ports = cfg.enabled ? guardPorts(cfg) : null;
+    const tun = mesh.tunName;
     const result: MeshSyncResult = { ok: true };
+    if (ports && !mesh.canaryPort) {
+      mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]; mesh access needs IPv6 loopback' });
+      return { ok: false, guard: 'no canary' };
+    }
+    // Only a failed re-apply of exactly the guard already confirmed (same ports, same interface) keeps it; the
+    // per-connection canary proof catches a real loss. Anything else stops admission.
+    const keeps = () => !!ports && mesh.guard.active && samePorts(mesh.guard.ports, ports) && mesh.guard.tun === tun;
     try {
-      const g = await admin.meshGuard(ports, mesh.tunName, mesh.canaryPort || undefined);
-      if (g.ok) mesh.setGuard(ports ? { active: true, ports } : { active: false, ports: [] });
-      else {
-        result.ok = false; result.guard = g.error ?? 'failed';
-        // Only a changed requirement (new ports) or a guard we never had makes admission stop; a failed
-        // re-apply of an unchanged guard keeps the confirmed state (the 30 s check catches a real loss).
-        if (!ports || !mesh.guard.active || !samePorts(mesh.guard.ports, ports)) mesh.setGuard({ active: false, ports: [], error: result.guard });
-      }
-    } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!mesh.guard.active) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+      const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
+      if (g.ok) mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] });
+      else { result.ok = false; result.guard = g.error ?? 'failed'; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+    } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
       ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
       : null;
@@ -492,16 +498,22 @@ function syncMesh(): Promise<MeshSyncResult> {
  * restarting nftables.service, can flush it). Read-only; only the guard is touched, never the firewall rule.
  * If it is gone, admission stops at once and the guard is re-applied.
  */
-async function verifyGuard(): Promise<void> {
-  if (!mesh.config.enabled || meshSync.running) return;
-  const st = await admin.meshGuardStatus().catch(() => null);
-  if (st === null) return; // could not ask (helper busy or missing): keep the last confirmed state
-  const want = guardPorts(mesh.config);
-  const ok = st.active && want.every((p) => st.ports.includes(p)) && st.tun === mesh.tunName;
-  if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want }); return; }
-  mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports or interface' : 'guard not loaded (was the nftables ruleset flushed?)' });
-  const g = await admin.meshGuard(want, mesh.tunName, mesh.canaryPort || undefined).catch((e) => ({ ok: false, error: (e as Error).message }));
-  mesh.setGuard(g.ok ? { active: true, ports: want } : { active: false, ports: [], error: g.error });
+function verifyGuard(): Promise<unknown> {
+  if (!mesh.config.enabled || meshSync.running) return Promise.resolve();
+  // Shares the single-flight slot with syncMesh, so a concurrent save cannot be undone by a stale check.
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    const st = await admin.meshGuardStatus().catch(() => null);
+    if (st === null || !mesh.config.enabled) return { ok: true };
+    const want = guardPorts(mesh.config), tun = mesh.tunName;
+    const ok = st.active && want.every((p) => st.ports.includes(p)) && st.tun === tun && st.canary === mesh.canaryPort;
+    if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want, tun }); return { ok: true }; }
+    mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports, interface or canary' : 'guard not loaded (was the nftables ruleset flushed?)' });
+    const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
+    if (g.ok && mesh.config.enabled) mesh.setGuard({ active: true, ports: want, tun });
+    else if (!g.ok) { mesh.setGuard({ active: false, ports: [], error: g.error }); meshSync.dirty = true; }
+    return { ok: g.ok };
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
 }
 
 mesh.onChange = async () => { meshSync.dirty = true; };

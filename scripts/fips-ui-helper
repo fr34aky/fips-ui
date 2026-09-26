@@ -1019,7 +1019,8 @@ case "$cmd" in
       if out=$(nft list table inet fips_ui_guard 2>/dev/null) && grep -q "iifname" <<<"$out"; then
         p=$(grep -E 'saddr fd00::/8' <<<"$out" | grep -oE 'dport \{? ?[0-9, ]+\}?' | grep -oE '[0-9]+' | paste -sd, -)
         t=$(grep -oE 'iifname \{ [^}]* \}' <<<"$out" | grep -oE '"[^"]+"' | tr -d '"' | grep -vx lo | head -n 1)
-        printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$p")" "$(json_escape "$t")"
+        c=$(grep -E 'canary' <<<"$out" | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | head -n 1)
+        printf '{"ok":true,"active":true,"ports":%s,"tun":%s,"canary":%s}\n' "$(json_escape "$p")" "$(json_escape "$t")" "$(json_escape "$c")"
       else printf '{"ok":true,"active":false}\n'; fi
       exit 0
     fi
@@ -1063,6 +1064,6 @@ NFT
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off> [tun]}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off|status> [tun] [canary]}"
     ;;
 esac
