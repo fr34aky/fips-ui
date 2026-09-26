@@ -254,6 +254,12 @@ KEYS = set(k.lower() for k in sys.argv[2].split('|'))
 MODE = sys.argv[1]
 NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
 HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
+# Copies of a secret elsewhere in the file are detected for values of at least this many characters. Shorter
+# ones ("tor", "control", "fips") are ordinary words of this configuration; they are redacted where they are
+# set, but the same word elsewhere is not treated as a copy (that would lock the editor on normal files).
+MIN_COPY = 8
+# Keys whose value is a public key, which fips also accepts as 64 hex characters.
+PUBLIC_KEYS = {'npub'}
 NOT_SECRET = {'', 'null', '~', 'true', 'false', 'cookie'}
 BOM = '\ufeff'
 KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, sorted(KEYS))) + r')[\'"]?\s*[:=]', re.I)
@@ -327,7 +333,7 @@ def secret_forms(value):
     forms |= {f.strip() for f in forms}
     return {f for f in forms if f.strip().lower() not in NOT_SECRET and len(f.strip()) >= 3}
 
-def secrets(text, root):
+def secrets(text, root, public=None):
     """[(path, keyname, value node)] for every secret key; refuse any form that cannot be redacted exactly."""
     counts = uses(root)
     if any(c > 1 for c in counts.values()):
@@ -348,6 +354,13 @@ def secrets(text, root):
                     continue
                 name = k.value.strip().lower()
                 p = path + [k.value]
+                if name in PUBLIC_KEYS and isinstance(v, nodes.ScalarNode):
+                    # A public key may be hex; only an nsec there is refused.
+                    if NSEC.search(squash(v.value)):
+                        raise Refuse(f'line {line(v)}: an nsec value under {name}')
+                    if public is not None:
+                        public.append(v)
+                    continue
                 if name in KEYS:
                     if not isinstance(v, nodes.ScalarNode):
                         raise Refuse(f'line {line(v)}: {name} holds a list or mapping, not a single value')
@@ -468,23 +481,21 @@ def scan(text):
         pos = m.end() if m else end
     return out, names
 
-def comment_spans(text):
-    return scan(text)[0]
-
 def comment_runs(text, spans):
     """Comments on consecutive lines, grouped (a key or password wrapped over several comment lines)."""
     runs = []
     for a, b in spans:
         # Consecutive: only one line break and indentation between the previous comment's end and this '#'.
-        if runs and re.fullmatch(r'(\r\n|[\r\n\x85\u2028\u2029])[ \t]*', text[runs[-1][-1][1]:a]):
+        if runs and re.fullmatch('(?:' + BREAK.pattern + r')[ \t]*', text[runs[-1][-1][1]:a]):
             runs[-1].append((a, b))
         else:
             runs.append([(a, b)])
     return runs
 
 def sensitive_comment(c, forms):
+    """forms: [(form, squashed form)]. Hiding a comment costs nothing, so short forms count here as whole words."""
     q = squash(c)
-    return bool(KEYED.search(c) or key_material(c) or any(f in c or (len(squash(f)) >= 6 and squash(f) in q) for f in forms))
+    return bool(KEYED.search(c) or key_material(c) or any(appears(f, c) or (len(sq) >= MIN_COPY and sq in q) for f, sq in forms))
 
 def appears(form, text):
     """Substring for values of 6+ characters; for shorter ones a whole-token match (avoids refusing a file because
@@ -498,7 +509,8 @@ def redact_text(text):
     if PH.search(text) or re.search(r'<redacted comment #', text):
         raise Refuse('the file already contains a redaction placeholder')
     root = compose(text, 'the file')
-    found = secrets(text, root)
+    public = []
+    found = secrets(text, root, public)
     # Per secret: its decoded forms, and those plus its raw spellings (escapes, quotes) as they appear in the text.
     decoded, spelled = [], []
     for _, _, v in found:
@@ -506,15 +518,18 @@ def redact_text(text):
         raw = text[v.start_mark.index:v.end_mark.index]
         decoded.append(f)
         spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
-    forms_all = set().union(*spelled) if spelled else set()
+    forms_all = [(f, squash(f)) for f in set().union(*spelled)] if spelled else []
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
     spans, names = scan(text)
-    hide = set()
+    hide = {s for s in spans if sensitive_comment(text[s[0]:s[1]], forms_all)}
+    # A key or password wrapped over consecutive comment lines: hide the shortest groups of otherwise visible lines
+    # whose joined text is sensitive (only those lines, so documentation around them stays visible).
     for run in comment_runs(text, spans):
-        # A run is judged as a whole too, so a key or password wrapped over several comment lines is hidden entirely.
-        if len(run) > 1 and sensitive_comment(''.join(text[a:b] for a, b in run), forms_all):
-            hide.update(run)
-        hide.update(s for s in run if sensitive_comment(text[s[0]:s[1]], forms_all))
+        for size in range(2, len(run) + 1):
+            for i in range(len(run) - size + 1):
+                win = run[i:i + size]
+                if not any(s in hide for s in win) and sensitive_comment(''.join(text[a:b] for a, b in win), forms_all):
+                    hide.update(win)
     comments = []
     for a, b in spans:
         if (a, b) in hide:
@@ -527,18 +542,20 @@ def redact_text(text):
     secret_ids = {id(v) for _, _, v in found}
     scalars = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
     keys = {id(k) for n in flatten(root) if isinstance(n, nodes.MappingNode) for k, _ in n.value} if root is not None else set()
-    values = [x for x in scalars if id(x) not in keys]
+    public_ids = {id(x) for x in public}
+    values = [(x.value, squash(x.value)) for x in scalars if id(x) not in keys and id(x) not in public_ids]
     keytexts = [x for x in scalars if id(x) in keys]
     # Raw text without placeholders and keys (whose spans shift by the same edits: blank them before redacting).
-    blank = splice(text, [(x.start_mark.index, x.end_mark.index, ' ' * (x.end_mark.index - x.start_mark.index)) for x in keytexts])
+    blank = splice(text, [(x.start_mark.index, x.end_mark.index, ' ' * (x.end_mark.index - x.start_mark.index)) for x in keytexts + public])
     bare = PLACEHOLDERS.sub('', splice(blank, edits))
     qbare = squash(bare)
     for (_, name, v), mine, spell in zip(found, decoded, spelled):
-        long_ = [f for f in spell if len(squash(f)) >= 6]
-        if (any(f in x.value or (f in long_ and squash(f) in squash(x.value)) for f in mine for x in values)
-                or any(len(f) >= 12 and f in x.value for f in mine for x in keytexts)
-                or any(f in n for f in spell for n in names)
-                or any(appears(f, bare) for f in spell) or any(squash(f) in qbare for f in long_)):
+        mine = [(f, squash(f)) for f in mine if len(f.strip()) >= MIN_COPY]
+        spell = [(f, squash(f)) for f in spell if len(f.strip()) >= MIN_COPY]
+        if (any(f in x or sq in qx for f, sq in mine for x, qx in values)
+                or any(len(f) >= 12 and f in x.value for f, _ in mine for x in keytexts)
+                or any(f in n for f, _ in spell for n in names)
+                or any(f in bare or sq in qbare for f, sq in spell)):
             raise Refuse(f'the value of {name} also appears elsewhere in the file (another value, anchor or tag)')
     if key_material(bare):
         raise Refuse('an nsec or 64-character hex value (possibly a private key) appears outside a secret key')
@@ -624,7 +641,7 @@ def restore(orig_path, new_path, base):
     if len(PH.findall(ntext)) != placeholder_nodes:
         raise Refuse('a redaction placeholder appears somewhere other than as a whole value (a comment, key or longer string)')
     cused, cfound = set(), 0
-    for a, b in comment_spans(ntext):
+    for a, b in scan(ntext)[0]:
         m = CPH.match(ntext[a:b])
         if not m:
             continue
@@ -654,7 +671,9 @@ def restore(orig_path, new_path, base):
     # was changed or removed).
     for j in sorted(cused):
         if ocomments[j - 1] not in now_comments:
-            raise Refuse(f'hidden comment #{j} mentions a secret you changed or removed; delete that comment line or keep the secret')
+            raise Refuse(f'hidden comment #{j} would become visible: it is hidden because of a secret or key text, alone or '
+                         f'together with the comment lines next to it. Keep those secrets and keep hidden comment lines together '
+                         f'(add new lines above or below them), or delete the hidden comment lines')
     return nbom + out
 
 try:
