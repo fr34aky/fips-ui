@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A malformed line from the control socket (a JSON scalar or `null`) crashed
+  the whole server from inside the socket's data handler; it is now reported
+  as a transport error for that one query.
+- Two upgrade jobs could start concurrently, because the "already running"
+  guard ran before an `await`; the slot is now claimed synchronously.
+- A non-numeric `FIPS_UI_POLL_MS` produced a NaN interval that fired every
+  millisecond; numeric settings are validated and clamped, with a warning.
+- A user-supplied git ref could begin with `-` and be parsed as a git option;
+  refs must now start with an alphanumeric character and are passed after `--`.
+- Service "since" times on the Overview never showed because systemd's
+  localized timestamps did not parse; monotonic timestamps are used instead.
+- `FIPS_BIN_DIR` and `FIPS_UI_BACKUPS` were honoured by the backend but
+  stripped by sudo before reaching the helper; the sudoers rule now forwards
+  exactly those two variables. Re-run `deploy/install-upgrade-helper.sh` to
+  pick this up on an existing install.
+- Rust toolchains installed with rustup were invisible under systemd's minimal
+  `PATH`; tool discovery and builds now also look in `~/.cargo/bin`,
+  `/usr/local/bin` and `/opt/homebrew/bin`.
+- Cancelling an upgrade during the download had no effect until the download
+  finished; in-process work is now aborted too, and any failure after a
+  cancel request reports as cancelled rather than failed.
+- The job panel's Dismiss button did nothing because the panel fell back to
+  the server's last job.
+- The Upgrade page's 15-second status poll spawned about 25 processes and one
+  sudo helper check every time. Slow probes are now cached for ten minutes and
+  re-run only on the Refresh button or when a job ends.
+
 ## [0.1.0] - 2026-09-26
 
 Initial release, developed and verified against FIPS `0.6.0-dev`.

@@ -13,10 +13,17 @@ import { upgradeApi, useUpgradeJob, type Backup, type JobSummary, type StepInfo,
 // ---------------------------------------------------------------------------
 
 export function Upgrade() {
-  const { data: st, error, refresh } = usePoll(() => upgradeApi.status(), [], 15000);
+  // The periodic poll reads cached probes; the Refresh button forces the backend to re-probe.
+  const forceRef = useRef(false);
+  const { data: st, error, refresh } = usePoll(() => { const f = forceRef.current; forceRef.current = false; return upgradeApi.status(f); }, [], 15000);
+  const forceRefresh = () => { forceRef.current = true; refresh(); };
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const { job: liveJob, log } = useUpgradeJob(activeJobId ?? st?.job?.id ?? null);
-  const job = liveJob ?? st?.job ?? null;
+  const [dismissedId, setDismissedId] = useState<string | null>(null);
+  // The server keeps its last job indefinitely, so "dismiss" has to be remembered client-side.
+  const serverJobId = st?.job && st.job.id !== dismissedId ? st.job.id : null;
+  const { job: liveJob, log } = useUpgradeJob(activeJobId ?? serverJobId);
+  const candidate = liveJob ?? st?.job ?? null;
+  const job = candidate && candidate.id !== dismissedId ? candidate : null;
   const busy = job?.state === 'running' || job?.state === 'queued';
 
   // Refresh status when a job ends so versions and backups update.
@@ -30,7 +37,7 @@ export function Upgrade() {
 
   const launch = async (fn: () => Promise<JobSummary | null>) => {
     setActionErr(null);
-    try { const j = await fn(); if (j) { setActiveJobId(j.id); refresh(); } }
+    try { const j = await fn(); if (j) { setDismissedId(null); setActiveJobId(j.id); refresh(); } }
     catch (e) { setActionErr((e as Error).message); }
   };
 
@@ -44,7 +51,7 @@ export function Upgrade() {
         <p className="text-ink-2 text-sm max-w-2xl">Install a published release or build the development version from <code>master</code>. Binaries are backed up before every install and can be rolled back from this page.</p>
         <div className="flex items-center gap-2">
           {st?.restartPending && <span className="chip warn"><span className="chip-dot" />restart pending</span>}
-          <button className="btn sm" onClick={refresh} title="Refresh"><RefreshCw size={14} /> Refresh</button>
+          <button className="btn sm" onClick={forceRefresh} title="Re-check versions, helper and toolchain"><RefreshCw size={14} /> Refresh</button>
         </div>
       </header>
 
@@ -107,7 +114,7 @@ export function Upgrade() {
       </section>
 
       {/* ---- job ----------------------------------------------------------- */}
-      {job && <JobPanel job={job} log={log} onCancel={() => upgradeApi.cancel().catch((e) => setActionErr(e.message))} onDismiss={() => setActiveJobId(null)} />}
+      {job && <JobPanel job={job} log={log} onCancel={() => upgradeApi.cancel().catch((e) => setActionErr(e.message))} onDismiss={() => { setDismissedId(job.id); setActiveJobId(null); }} />}
 
       {/* ---- backups ------------------------------------------------------- */}
       <BackupsCard backups={st?.backups ?? []} disabled={busy || !canInstall} onRollback={(b) => setConfirm({ source: 'release', ref: `rollback:${b.id}`, label: `Roll back to ${b.version || b.id}` })} />

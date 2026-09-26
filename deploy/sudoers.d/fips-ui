@@ -2,4 +2,7 @@
 # Installed by deploy/install-upgrade-helper.sh, which substitutes @UI_USER@.
 # The helper is the only root-capable path the UI has; keep this list to one user.
 Defaults!/usr/local/libexec/fips-ui-helper !requiretty
+# The backend and the helper must agree on where binaries and backups live; these two
+# overrides (see docs/upgrade.md) are the only environment forwarded through sudo.
+Defaults!/usr/local/libexec/fips-ui-helper env_keep += "FIPS_BIN_DIR FIPS_UI_BACKUPS"
 @UI_USER@ ALL=(root) NOPASSWD: /usr/local/libexec/fips-ui-helper

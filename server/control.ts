@@ -54,19 +54,22 @@ export function query<T = unknown>(
     const timer = setTimeout(() => finish(() => reject(new ControlError(`timeout after ${timeoutMs}ms`, 'transport'))), timeoutMs);
     sock.setEncoding('utf8');
     sock.on('connect', () => sock.write(line));
-    sock.on('data', (chunk: string) => {
+    const safe = (fn: () => void) => { try { fn(); } catch (e) { finish(() => reject(new ControlError(`client error: ${(e as Error).message}`, 'transport'))); } };
+    sock.on('data', (chunk: string) => safe(() => {
       buf += chunk;
       const nl = buf.indexOf('\n');
       if (nl === -1) return;
       handle(buf.slice(0, nl));
-    });
-    sock.on('end', () => { if (buf.trim()) handle(buf); else finish(() => reject(new ControlError('empty response', 'transport'))); });
+    }));
+    sock.on('end', () => safe(() => { if (buf.trim()) handle(buf); else finish(() => reject(new ControlError('empty response', 'transport'))); }));
     sock.on('error', (e: NodeJS.ErrnoException) => finish(() => reject(new ControlError(describeSocketError(e, socketPath), 'transport'))));
     function handle(text: string) {
-      let parsed: Ok<T> | Err;
+      let parsed: unknown;
       try { parsed = JSON.parse(text); } catch { return finish(() => reject(new ControlError('malformed response from daemon', 'transport'))); }
-      if (parsed.status === 'ok') finish(() => resolve(parsed.data));
-      else finish(() => reject(new ControlError(parsed.message ?? 'unknown error')));
+      if (!parsed || typeof parsed !== 'object') return finish(() => reject(new ControlError('unexpected non-object response from daemon', 'transport')));
+      const r = parsed as Partial<Ok<T>> & Partial<Err>;
+      if (r.status === 'ok') finish(() => resolve(r.data as T));
+      else finish(() => reject(new ControlError(typeof r.message === 'string' ? r.message : 'unknown error')));
     }
   });
 }

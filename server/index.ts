@@ -9,10 +9,17 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 
+function envInt(name: string, def: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) { console.warn(`${name}=${JSON.stringify(raw)} is not a number; using ${def}`); return def; }
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
 const HOST = process.env.FIPS_UI_HOST ?? '127.0.0.1';
-const PORT = Number(process.env.FIPS_UI_PORT ?? 8321);
+const PORT = envInt('FIPS_UI_PORT', 8321, 1, 65535);
 const TOKEN = process.env.FIPS_UI_TOKEN || null;
-const POLL_MS = Math.max(500, Number(process.env.FIPS_UI_POLL_MS ?? 2000));
+const POLL_MS = envInt('FIPS_UI_POLL_MS', 2000, 500, 60_000);
 const ALLOW_SERVICE_CONTROL = process.env.FIPS_UI_ALLOW_SERVICE_CONTROL === '1';
 const READ_ONLY = process.env.FIPS_UI_READ_ONLY === '1';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

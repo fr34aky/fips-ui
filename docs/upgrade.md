@@ -74,8 +74,8 @@ a shell (Homebrew and winget need no sudo).
 |---|---|---|
 | `FIPS_UI_WORKDIR` | downloads, source checkout, cargo target, stage dirs | per-OS data dir + `/fips-ui` |
 | `FIPS_UI_HELPER` | helper path | `/usr/local/libexec/fips-ui-helper` |
-| `FIPS_UI_BACKUPS` | backups dir (must match helper) | `/var/lib/fips-ui/backups` (Linux) |
-| `FIPS_BIN_DIR` | where the binaries live | autodetected |
+| `FIPS_UI_BACKUPS` | backups dir; forwarded to the helper through the sudoers `env_keep` rule so both sides agree | `/var/lib/fips-ui/backups` (Linux) |
+| `FIPS_BIN_DIR` | where the binaries live; forwarded to the helper the same way | autodetected |
 | `FIPS_CONTROL_SOCKET` | daemon control socket (or loopback port on Windows) | autodetected |
 | `FIPS_UI_GITHUB_TOKEN` | lifts the 60 req/h unauthenticated GitHub limit | – |
 | `FIPS_UI_GITHUB_REPO` / `FIPS_UI_REPO_URL` | build a fork instead | `jmcorgan/fips` |

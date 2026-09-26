@@ -34,7 +34,7 @@ export interface UpgradeStatus {
 }
 
 export const upgradeApi = {
-  status: () => api.get<UpgradeStatus>('/api/upgrade/status'),
+  status: (force = false) => api.get<UpgradeStatus>(`/api/upgrade/status${force ? '?refresh=1' : ''}`),
   start: (body: { source: UpgradeSource; ref?: string; restart?: boolean; dryRun?: boolean }) => api.post<JobSummary>('/api/upgrade/jobs', body),
   cancel: () => api.post<{ cancelled: boolean }>('/api/upgrade/jobs/current/cancel'),
   rollback: (id: string) => api.post<JobSummary>('/api/upgrade/rollback', { id }),

@@ -1,6 +1,7 @@
 // systemd unit state, /etc/fips/hosts parsing, and service actions.
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
@@ -22,11 +23,14 @@ export interface UnitState {
   unitFileState?: string;
 }
 
-const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestamp', 'ExecMainStartTimestamp', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
+// Timestamps are read as monotonic microseconds since boot: the human-readable variants are localized
+// ("Sat 2026-09-26 09:56:37 CEST") and do not parse reliably.
+const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestampMonotonic', 'ExecMainStartTimestampMonotonic', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
 
 export async function unitStates(): Promise<UnitState[]> {
   try {
     const { stdout } = await execFileP('systemctl', ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager']);
+    const bootEpochMs = Date.now() - os.uptime() * 1000;
     // Output is blank-line separated blocks, one per unit, in request order.
     const blocks = stdout.trim().split(/\n\s*\n/);
     return blocks.map((block, i) => {
@@ -35,9 +39,9 @@ export async function unitStates(): Promise<UnitState[]> {
         const eq = line.indexOf('=');
         if (eq > 0) kv[line.slice(0, eq)] = line.slice(eq + 1);
       }
-      const since = kv.ExecMainStartTimestamp || kv.ActiveEnterTimestamp;
-      const sinceMs = since ? Date.parse(since) : NaN;
       const num = (s?: string) => (s && s !== '[not set]' && !Number.isNaN(Number(s)) ? Number(s) : undefined);
+      const monoUs = num(kv.ExecMainStartTimestampMonotonic) || num(kv.ActiveEnterTimestampMonotonic);
+      const sinceMs = monoUs ? bootEpochMs + monoUs / 1000 : NaN;
       return {
         unit: UNITS[i] ?? `unit-${i}`,
         loaded: kv.LoadState === 'loaded',
@@ -92,6 +96,5 @@ export async function readHosts(): Promise<{ path: string; entries: HostEntry[];
 }
 
 export async function hostInfo() {
-  const os = await import('node:os');
   return { hostname: os.hostname(), platform: os.platform(), release: os.release(), uptimeSecs: os.uptime(), loadavg: os.loadavg(), totalMem: os.totalmem(), freeMem: os.freemem() };
 }

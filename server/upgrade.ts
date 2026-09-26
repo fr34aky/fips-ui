@@ -172,9 +172,21 @@ function nowId(): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 
+/**
+ * Environment for every tool this module spawns. Under a service manager PATH is minimal and excludes
+ * per-user toolchain locations (rustup's ~/.cargo/bin, Homebrew on Apple silicon), which is exactly where
+ * the UI tells operators to install Rust, so those are appended here.
+ */
+function toolEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sep = osPlatform() === 'win32' ? ';' : ':'
+  const parts = (process.env.PATH ?? '').split(sep).filter(Boolean)
+  for (const p of [join(homedir(), '.cargo', 'bin'), '/usr/local/bin', '/opt/homebrew/bin']) if (!parts.includes(p) && existsSync(p)) parts.push(p)
+  return { ...process.env, PATH: parts.join(sep), ...extra }
+}
+
 function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((res) => {
-    execFile(cmd, args, { cwd: opts.cwd, env: { ...process.env, ...opts.env }, timeout: opts.timeout ?? 60_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+    execFile(cmd, args, { cwd: opts.cwd, env: toolEnv(opts.env), timeout: opts.timeout ?? 60_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       let code = 0
       if (err) { const c = (err as { code?: unknown }).code; code = typeof c === 'number' ? c : 127 }
       res({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') })
@@ -244,8 +256,9 @@ async function sha256File(path: string): Promise<string> {
   return h.digest('hex')
 }
 
-async function downloadTo(url: string, dest: string): Promise<number> {
-  const r = await fetch(url, { headers: { 'user-agent': 'fips-ui' }, redirect: 'follow', signal: AbortSignal.timeout(15 * 60_000) })
+async function downloadTo(url: string, dest: string, cancel?: AbortSignal): Promise<number> {
+  const timeout = AbortSignal.timeout(15 * 60_000)
+  const r = await fetch(url, { headers: { 'user-agent': 'fips-ui' }, redirect: 'follow', signal: cancel ? AbortSignal.any([timeout, cancel]) : timeout })
   if (!r.ok || !r.body) throw new Error(`download failed: HTTP ${r.status}`)
   let done = 0
   const tmp = `${dest}.part`
@@ -316,6 +329,9 @@ class Job {
   private listeners = new Set<Listener>()
   private child: ChildProcess | null = null
   private cancelRequested = false
+  private readonly aborter = new AbortController()
+  /** Aborts in-process work (downloads) when the operator cancels; child processes are killed separately. */
+  get signal(): AbortSignal { return this.aborter.signal }
 
   readonly source: UpgradeSource
   readonly kind: JobKind
@@ -366,7 +382,7 @@ class Job {
     return new Promise((res, rej) => {
       if (!opts.quiet) this.info(`$ ${opts.display ?? [cmd, ...args].join(' ')}`)
       const win = osPlatform() === 'win32'
-      const child = spawn(cmd, args, { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: [opts.input !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'], detached: !win, windowsHide: true })
+      const child = spawn(cmd, args, { cwd: opts.cwd, env: toolEnv(opts.env), stdio: [opts.input !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'], detached: !win, windowsHide: true })
       this.child = child
       if (opts.input !== undefined && child.stdin) { child.stdin.on('error', () => { /* sudo may close stdin early */ }); child.stdin.end(opts.input) }
       let out = ''
@@ -385,6 +401,7 @@ class Job {
     if (!this.cancellable || (this.state !== 'running' && this.state !== 'queued')) return false
     this.cancelRequested = true
     this.info('cancel requested')
+    this.aborter.abort()
     const c = this.child
     if (c?.pid) {
       if (osPlatform() === 'win32') spawn('taskkill', ['/PID', String(c.pid), '/T', '/F'], { windowsHide: true })
@@ -395,7 +412,7 @@ class Job {
 
   finish(err?: unknown): void {
     this.endedAt = Date.now()
-    if (err instanceof CancelledError) { this.state = 'cancelled'; this.error = err.message }
+    if (err instanceof CancelledError || (err && this.cancelRequested)) { this.state = 'cancelled'; this.error = 'cancelled by operator' }
     else if (err) { this.state = 'failed'; this.error = err instanceof Error ? err.message : String(err); this.info(`✗ ${this.error}`) }
     else { this.state = 'succeeded'; this.info('✓ finished') }
     for (const s of this.steps) if (s.state === 'pending' || s.state === 'running') s.state = this.state === 'succeeded' ? 'done' : 'skipped'
@@ -516,6 +533,13 @@ export class UpgradeManager {
   readonly installer: Installer
   private binDirCache: string | null = null
   private current: Job | null = null
+  /** Probe results that only change when an operator acts (helper install, package changes, toolchain installs). */
+  private readonly cache = new Map<string, { at: number; value: unknown }>()
+  private memo<T>(key: string, ttlMs: number, force: boolean, fn: () => Promise<T>): Promise<T> {
+    const hit = this.cache.get(key)
+    if (!force && hit && Date.now() - hit.at < ttlMs) return Promise.resolve(hit.value as T)
+    return fn().then((value) => { this.cache.set(key, { at: Date.now(), value }); return value })
+  }
 
   constructor(opts: UpgradeOptions = {}) {
     const P = this.platform
@@ -599,8 +623,8 @@ export class UpgradeManager {
   // ---- build-dependency installation ------------------------------------
 
   /** What this OS needs for `cargo build`, and how to install it. */
-  async toolchainPlan(): Promise<{ manager: string | null; sudo: boolean; packages: string[]; command: string[]; note?: string; missing: string[] }> {
-    const tc = await this.toolchain()
+  async toolchainPlan(tcIn?: Record<string, { ok: boolean; required: boolean; detail?: string }>): Promise<{ manager: string | null; sudo: boolean; packages: string[]; command: string[]; note?: string; missing: string[] }> {
+    const tc = tcIn ?? await this.toolchain()
     const missing = Object.entries(tc).filter(([, v]) => !v.ok).map(([k]) => k)
     const os = this.platform.os
     const pick = async (cands: [string, string[], string[]][]): Promise<{ manager: string; packages: string[]; command: string[] } | null> => {
@@ -636,8 +660,21 @@ export class UpgradeManager {
     return { ...plan, sudo, missing, note }
   }
 
-  async status(): Promise<Record<string, unknown>> {
-    const [installed, running, pkg, helper, toolchain, backups, toolchainPlan] = await Promise.all([this.installedVersion(), this.runningVersion(), this.packageInfo(), this.installer.check(), this.toolchain(), this.installer.listBackups(), this.toolchainPlan()])
+  /**
+   * Everything the Upgrade page shows. The expensive probes (package ownership, helper self-test via sudo,
+   * toolchain discovery: ~25 process spawns) are cached for ten minutes; `force` (the page's Refresh button)
+   * and the end of any job invalidate them. Versions, backups and GitHub state are read every time.
+   */
+  async status(force = false): Promise<Record<string, unknown>> {
+    const TTL = 10 * 60_000
+    const [installed, running, pkg, helper, toolchain, backups] = await Promise.all([
+      this.installedVersion(), this.runningVersion(),
+      this.memo('package', TTL, force, () => this.packageInfo()),
+      this.memo('helper', TTL, force, () => this.installer.check()),
+      this.memo('toolchain', TTL, force, () => this.toolchain()),
+      this.installer.listBackups(),
+    ])
+    const toolchainPlan = await this.toolchainPlan(toolchain)
     let release: Record<string, unknown>
     try {
       const r = await this.gh.latestRelease()
@@ -664,16 +701,27 @@ export class UpgradeManager {
 
   // ---- job control --------------------------------------------------------
 
-  async start(req: JobRequest): Promise<Job> {
+  private claimSlot(job: Job): void {
     if (this.current && (this.current.state === 'running' || this.current.state === 'queued')) throw new Error('an upgrade job is already running')
-    if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
-    if (req.ref && !/^[A-Za-z0-9._\/-]{1,120}$/.test(req.ref)) throw new Error('invalid ref')
-    if (!req.dryRun) { const h = await this.installer.check(); if (!h.available) throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'}. Install the helper first, or start a dry run.`) }
-    const job = new Job(req.source, req)
-    this.current = job
+    this.current = job // reserved synchronously, before any await, so two concurrent starts cannot both pass the guard
+  }
+  private release(job: Job): void { if (this.current === job) this.current = null }
+  private launch(job: Job, work: () => Promise<void>): Job {
     job.state = 'running'
-    void this.execute(job).then(() => job.finish(), (e) => job.finish(e))
+    void work().then(() => job.finish(), (e) => job.finish(e)).finally(() => this.cache.clear())
     return job
+  }
+
+  async start(req: JobRequest): Promise<Job> {
+    if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
+    if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
+    const job = new Job(req.source, req)
+    this.claimSlot(job)
+    if (!req.dryRun) {
+      const h = await this.installer.check()
+      if (!h.available) { this.release(job); throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'}. Install the helper first, or start a dry run.`) }
+    }
+    return this.launch(job, () => this.execute(job))
   }
 
   private async execute(job: Job): Promise<void> {
@@ -695,7 +743,7 @@ export class UpgradeManager {
       })
       const dlDir = join(this.workDir, 'downloads'); await mkdir(dlDir, { recursive: true })
       const artifact = join(dlDir, rel.asset.name)
-      await job.runStep('download', async () => { const n = await downloadTo(rel.asset.browser_download_url, artifact); job.info(`downloaded ${(n / 1e6).toFixed(1)} MB → ${artifact}`); job.throwIfCancelled() })
+      await job.runStep('download', async () => { const n = await downloadTo(rel.asset.browser_download_url, artifact, job.signal); job.info(`downloaded ${(n / 1e6).toFixed(1)} MB → ${artifact}`); job.throwIfCancelled() })
       await job.runStep('verify', async () => {
         const actual = await sha256File(artifact)
         if (!rel.sums) { job.info(`sha256 ${actual} (unverified: no checksum file in this release)`); return }
@@ -730,7 +778,7 @@ export class UpgradeManager {
       await job.runStep('sync', async () => {
         if (!existsSync(join(src, '.git'))) { await mkdir(join(this.workDir, 'src'), { recursive: true }); await job.exec('git', ['clone', '--no-checkout', this.repoUrl, src]) }
         await job.exec('git', ['fetch', '--prune', '--tags', 'origin'], { cwd: src })
-        await job.exec('git', ['checkout', '--force', '--detach', job.ref], { cwd: src })
+        await job.exec('git', ['checkout', '--force', '--detach', job.ref, '--'], { cwd: src })
         const sha = (await job.exec('git', ['rev-parse', 'HEAD'], { cwd: src, quiet: true })).trim()
         const subject = (await job.exec('git', ['log', '-1', '--format=%s (%ci)'], { cwd: src, quiet: true })).trim()
         job.info(`building ${sha.slice(0, 10)} — ${subject}`)
@@ -802,11 +850,10 @@ export class UpgradeManager {
 
   async rollback(id: string): Promise<Job> {
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) throw new Error('invalid backup id')
-    if (this.current && (this.current.state === 'running' || this.current.state === 'queued')) throw new Error('an upgrade job is already running')
     const job = new Job('release', { source: 'release' }, `rollback:${id}`, 'rollback')
-    this.current = job
-    job.state = 'running'; job.cancellable = false
-    void (async () => {
+    this.claimSlot(job)
+    job.cancellable = false
+    return this.launch(job, async () => {
       job.defineSteps([['install', `Restore backup ${id} (privileged)`], ['confirm', 'Confirm running version']])
       const h = await this.installer.check(); if (!h.available) throw new Error(`cannot roll back: ${h.error}`)
       const before = await this.runningVersion()
@@ -820,8 +867,7 @@ export class UpgradeManager {
         }
         throw new Error('daemon did not come back within 120 s')
       })
-    })().then(() => job.finish(), (e) => job.finish(e))
-    return job
+    })
   }
 
   restartService(): Promise<string> { return this.installer.restart() }
@@ -854,7 +900,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
     if (method === 'POST' && opts.authorize && !(await opts.authorize(req))) { sendJson(res, 403, { error: 'forbidden' }); return true }
 
     try {
-      if (sub === '/status' && method === 'GET') { sendJson(res, 200, await mgr.status()); return true }
+      if (sub === '/status' && method === 'GET') { sendJson(res, 200, await mgr.status(url.searchParams.get('refresh') === '1')); return true }
       if (sub === '/backups' && method === 'GET') { sendJson(res, 200, { backups: await mgr.installer.listBackups() }); return true }
       if (sub === '/jobs' && method === 'POST') { const body = JSON.parse((await readBody(req)) || '{}') as JobRequest; sendJson(res, 202, (await mgr.start(body)).summary()); return true }
       if (sub === '/jobs/current' && method === 'GET') {
