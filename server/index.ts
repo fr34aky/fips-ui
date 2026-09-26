@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
-import { unitStates, serviceAction, readHosts, hostInfo, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
+import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, type FirewallRule } from './admin.ts';
@@ -287,7 +287,9 @@ async function route(req: Req, res: Res) {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
     const pr = principalOf(req);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, platform: PLATFORM, logSource: LOG_SOURCE, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    // Host details only for callers that passed authentication (health itself is open locally).
+    const authed = via === 'mesh' || tokenOk(req, url);
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -389,7 +391,10 @@ async function route(req: Req, res: Res) {
     const mode = await serviceControlMode();
     if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v4+, installed by deploy/setup-local.sh; Linux with systemd) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
     if (!(SERVICES as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown service');
-    if (mode === 'helper') await admin.serviceAction(`${svc[1]}.service`, svc[2]);
+    const native = unitName(svc[1] as ServiceId);
+    if (!native) throw new HttpError(400, `${svc[1]} is not a service on this system`);
+    // The native name honours FIPS_UI_SERVICE_<NAME>, so the helper acts on the unit the Services card shows.
+    if (mode === 'helper') await admin.serviceAction(native, svc[2]);
     else { const r = await serviceAction(svc[1] as ServiceId, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }
     return json(res, 200, { ok: true, units: await unitStates() });
   }
