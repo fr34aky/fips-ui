@@ -1,6 +1,6 @@
 // Types and client for the node upgrade API (server/upgrade.ts).
 import { useEffect, useRef, useState } from 'react';
-import { api, getToken } from './api';
+import { api, getToken, ApiError } from './api';
 
 export type UpgradeSource = 'release' | 'master';
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -68,7 +68,13 @@ export function useUpgradeJob(jobId: string | null | undefined): { job: JobSumma
         es?.close(); es = null;
         if (closed) return;
         // Fallback: poll once for the state, then retry the stream.
-        upgradeApi.current(lastSeq.current).then((s) => { s.log.forEach(push); setJob(s); if (s.state === 'running' || s.state === 'queued') setTimeout(open, 2000); }).catch(() => setTimeout(open, 3000));
+        upgradeApi.current(lastSeq.current)
+          .then((s) => { s.log.forEach(push); setJob(s); if (s.state === 'running' || s.state === 'queued') setTimeout(open, 2000); })
+          .catch((e) => {
+            // 404: the backend restarted and no longer knows this job. Stop, and show that instead of spinning forever.
+            if (e instanceof ApiError && e.status === 404) { closed = true; setJob((prev) => prev && (prev.state === 'running' || prev.state === 'queued') ? { ...prev, state: 'failed', error: 'the UI backend restarted while this job was running; its outcome is unknown. Check the versions above.', cancellable: false, endedAt: Date.now() } : prev); return; }
+            setTimeout(open, 3000);
+          });
       };
     };
     open();

@@ -42,6 +42,7 @@ import { createWriteStream, createReadStream, existsSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { join, dirname, basename, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { homedir, arch as osArch, platform as osPlatform } from 'node:os'
 import { connect as netConnect } from 'node:net'
 
@@ -103,6 +104,7 @@ export interface UpgradeOptions {
 
 const MAX_LOG_LINES = 6000
 const GITHUB_CACHE_MS = 10 * 60 * 1000
+const GITHUB_ERROR_CACHE_MS = 60 * 1000
 const BASE_BINARIES = ['fips', 'fipsctl', 'fipstop', 'fips-gateway'] as const
 
 // ---------------------------------------------------------------------------
@@ -277,32 +279,45 @@ function cmpWord(c: number): 'newer' | 'same' | 'older' { return c > 0 ? 'newer'
 interface GhRelease { tag_name: string; name: string; published_at: string; html_url: string; prerelease: boolean; body: string; assets: { name: string; size: number; browser_download_url: string }[] }
 interface GhCommit { sha: string; commit: { message: string; committer: { date: string } }; html_url: string }
 
+/**
+ * GitHub REST client with a small cache. The unauthenticated limit is 60 requests/hour and the Upgrade page
+ * polls status every 15 s, so successful answers are kept for ten minutes and failures for one minute (or
+ * until the rate-limit window resets), which bounds an open tab to a few requests per hour per endpoint.
+ */
 class GitHub {
-  private cache = new Map<string, { at: number; value: unknown }>()
+  private cache = new Map<string, { at: number; value?: unknown; error?: Error; until: number }>()
   private repo: string
   private token?: string
   constructor(repo: string, token?: string) { this.repo = repo; this.token = token }
   private async get<T>(path: string, ttl = GITHUB_CACHE_MS): Promise<T> {
     const c = this.cache.get(path)
-    if (c && Date.now() - c.at < ttl) return c.value as T
+    if (c && Date.now() < c.until) { if (c.error) throw c.error; return c.value as T }
     const headers: Record<string, string> = { 'user-agent': 'fips-ui', accept: 'application/vnd.github+json' }
     if (this.token) headers.authorization = `Bearer ${this.token}`
-    const r = await fetch(`https://api.github.com${path}`, { headers, signal: AbortSignal.timeout(15_000) })
-    if (!r.ok) {
-      if (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0') {
-        const reset = r.headers.get('x-ratelimit-reset')
-        throw new Error(`GitHub API rate limit exceeded (resets ${reset ? new Date(Number(reset) * 1000).toLocaleTimeString() : 'later'}); set FIPS_UI_GITHUB_TOKEN`)
+    try {
+      const r = await fetch(`https://api.github.com${path}`, { headers, signal: AbortSignal.timeout(15_000) })
+      if (!r.ok) {
+        if (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0') {
+          const reset = Number(r.headers.get('x-ratelimit-reset')) * 1000
+          const err = new Error(`GitHub API rate limit exceeded (resets ${reset ? new Date(reset).toLocaleTimeString() : 'later'}); set FIPS_UI_GITHUB_TOKEN`)
+          this.cache.set(path, { at: Date.now(), error: err, until: reset && reset > Date.now() ? reset : Date.now() + GITHUB_ERROR_CACHE_MS })
+          throw err
+        }
+        throw new Error(`GitHub API ${path}: HTTP ${r.status}`)
       }
-      throw new Error(`GitHub API ${path}: HTTP ${r.status}`)
+      const value = (await r.json()) as T
+      this.cache.set(path, { at: Date.now(), value, until: Date.now() + ttl })
+      return value
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e))
+      if (!this.cache.get(path)?.error) this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + GITHUB_ERROR_CACHE_MS })
+      throw err
     }
-    const value = (await r.json()) as T
-    this.cache.set(path, { at: Date.now(), value })
-    return value
   }
   latestRelease() { return this.get<GhRelease>(`/repos/${this.repo}/releases/latest`) }
   releaseByTag(tag: string) { return this.get<GhRelease>(`/repos/${this.repo}/releases/tags/${encodeURIComponent(tag)}`) }
-  branchHead(branch = 'master') { return this.get<GhCommit>(`/repos/${this.repo}/commits/${encodeURIComponent(branch)}`, 2 * 60 * 1000) }
-  compare(base: string, head: string) { return this.get<{ status: string; ahead_by: number; behind_by: number; commits: GhCommit[] }>(`/repos/${this.repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`, 2 * 60 * 1000) }
+  branchHead(branch = 'master') { return this.get<GhCommit>(`/repos/${this.repo}/commits/${encodeURIComponent(branch)}`) }
+  compare(base: string, head: string) { return this.get<{ status: string; ahead_by: number; behind_by: number; commits: GhCommit[] }>(`/repos/${this.repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`) }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +507,10 @@ class WindowsInstaller implements Installer {
   private async startService(job: Job) { const r = await run('sc.exe', ['start', this.service], { timeout: 60_000 }); if (r.code !== 0) throw new Error(`sc start ${this.service} failed: ${r.stdout.trim()}`); job.info(`started service ${this.service}`) }
   async install(job: Job, stageDir: string, restart: boolean) {
     const backup_id = await this.backup(job)
-    await this.swap(job, stageDir)
-    if (restart) await this.startService(job)
-    return { backup_id, restarted: restart }
+    await this.swap(job, stageDir) // stops the service: Windows locks running executables
+    if (!restart) job.info('note: on Windows the service must be stopped to replace its binaries, so it is started again regardless of the restart option')
+    await this.startService(job)
+    return { backup_id, restarted: true }
   }
   async rollback(job: Job, id: string) { await this.backup(job); await this.swap(job, join(this.backupsDir, id)); await this.startService(job); return { restarted: true } }
   async restart() { const s = await run('sc.exe', ['stop', this.service], { timeout: 60_000 }); await new Promise((r) => setTimeout(r, 2000)); const r = await run('sc.exe', ['start', this.service], { timeout: 60_000 }); if (r.code !== 0) throw new Error(r.stdout.trim()); return `${s.stdout.trim()}\n${r.stdout.trim()}` }
@@ -674,7 +690,7 @@ export class UpgradeManager {
       this.memo('toolchain', TTL, force, () => this.toolchain()),
       this.installer.listBackups(),
     ])
-    const toolchainPlan = await this.toolchainPlan(toolchain)
+    const toolchainPlan = await this.memo('toolchainPlan', TTL, force, () => this.toolchainPlan(toolchain))
     let release: Record<string, unknown>
     try {
       const r = await this.gh.latestRelease()
@@ -729,8 +745,6 @@ export class UpgradeManager {
     await mkdir(this.workDir, { recursive: true })
     const stageDir = join(this.workDir, 'stage', job.id)
     job.info(`platform ${P.os}/${P.arch} · installer ${this.installer.kind} · work dir ${this.workDir}`)
-    if (!job.dryRun) { const h = await this.installer.check(); if (!h.available) throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'} (see docs/upgrade.md)`) }
-
     if (job.source === 'release') {
       job.defineSteps([['resolve', 'Resolve release'], ['download', 'Download artifact'], ['verify', 'Verify checksum'], ['extract', P.artifactKind === 'pkg' ? 'Stage package' : 'Extract and stage'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version']])
       const rel = await job.runStep('resolve', async () => {
@@ -778,12 +792,22 @@ export class UpgradeManager {
       await job.runStep('sync', async () => {
         if (!existsSync(join(src, '.git'))) { await mkdir(join(this.workDir, 'src'), { recursive: true }); await job.exec('git', ['clone', '--no-checkout', this.repoUrl, src]) }
         await job.exec('git', ['fetch', '--prune', '--tags', 'origin'], { cwd: src })
-        await job.exec('git', ['checkout', '--force', '--detach', job.ref, '--'], { cwd: src })
+        // A bare branch name must mean the remote branch just fetched, not the local branch git created at clone
+        // time (which is never updated and would silently build stale code). Try origin/<ref> first, then <ref>
+        // itself (tags, shas, explicit origin/... names).
+        let target: string | null = null
+        for (const cand of job.ref.startsWith('origin/') ? [job.ref] : [`origin/${job.ref}`, job.ref]) {
+          const r = await run('git', ['rev-parse', '--verify', '--quiet', `${cand}^{commit}`], { cwd: src })
+          if (r.code === 0 && r.stdout.trim()) { target = r.stdout.trim(); job.info(`${job.ref} → ${cand} = ${target.slice(0, 12)}`); break }
+        }
+        if (!target) throw new Error(`unknown ref '${job.ref}': not a branch on origin, tag, or commit`)
+        await job.exec('git', ['checkout', '--force', '--detach', target, '--'], { cwd: src })
         const sha = (await job.exec('git', ['rev-parse', 'HEAD'], { cwd: src, quiet: true })).trim()
         const subject = (await job.exec('git', ['log', '-1', '--format=%s (%ci)'], { cwd: src, quiet: true })).trim()
         job.info(`building ${sha.slice(0, 10)} — ${subject}`)
       })
       const targetDir = join(this.workDir, 'target')
+      const buildStartedAt = Date.now()
       await job.runStep('build', async () => {
         const env: NodeJS.ProcessEnv = { CARGO_TARGET_DIR: targetDir, CARGO_TERM_COLOR: 'never', CARGO_TERM_PROGRESS_WHEN: 'never' }
         const tc = await this.toolchain()
@@ -791,7 +815,7 @@ export class UpgradeManager {
         if (!tc.libclang.ok) job.info('warning: libclang not detected; the fips-gateway build may fail (set LIBCLANG_PATH)')
         await job.exec('cargo', ['build', '--release', '--locked', ...this.cargoArgs], { cwd: src, env })
       })
-      await job.runStep('stage', async () => { await this.stageBinaries(job, join(targetDir, P.cargoOut), stageDir) })
+      await job.runStep('stage', async () => { await this.stageBinaries(job, join(targetDir, P.cargoOut), stageDir, buildStartedAt) })
     }
 
     job.result.stageDir = stageDir
@@ -815,7 +839,7 @@ export class UpgradeManager {
     const before = await this.runningVersion()
     const r = await job.runStep('install', () => this.installer.install(job, stageDir, job.restart))
     job.result.backupId = r.backup_id; job.result.restarted = !!r.restarted
-    if (!job.restart) { job.skipStep('restart', 'restart disabled by operator'); job.skipStep('confirm', 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
+    if (!job.restart && !job.result.restarted) { job.skipStep('restart', 'restart disabled by operator'); job.skipStep('confirm', 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
     await job.runStep('restart', async () => { if (!job.result.restarted) job.info('installer reported no restart; waiting for the daemon anyway') })
     await job.runStep('confirm', async () => {
       const deadline = Date.now() + 120_000
@@ -834,12 +858,22 @@ export class UpgradeManager {
     })
   }
 
-  private async stageBinaries(job: Job, from: string, stageDir: string): Promise<void> {
+  /**
+   * Copy the daemon binaries from `from` into a fresh stage dir. With `newerThan` (a cargo build's start time),
+   * binaries older than that are leftovers from a previous build of a different ref in the shared target dir
+   * and are not staged: optional ones are skipped, required ones fail the job.
+   */
+  private async stageBinaries(job: Job, from: string, stageDir: string, newerThan?: number): Promise<void> {
     await rm(stageDir, { recursive: true, force: true }); await mkdir(stageDir, { recursive: true })
     const staged: string[] = []
     for (const b of this.platform.binaries) {
       const p = join(from, b)
-      if (!existsSync(p)) { if (b.startsWith('fips.') || b === 'fips' || b.startsWith('fipsctl')) throw new Error(`missing ${b} in ${from}`); job.info(`note: ${b} not present, skipping`); continue }
+      const required = b.startsWith('fips.') || b === 'fips' || b.startsWith('fipsctl')
+      if (!existsSync(p)) { if (required) throw new Error(`missing ${b} in ${from}`); job.info(`note: ${b} not present, skipping`); continue }
+      if (newerThan !== undefined) {
+        const mtime = (await stat(p)).mtimeMs
+        if (mtime < newerThan - 1000) { if (required) throw new Error(`${b} was not rebuilt by this job (left over from an earlier build)`); job.info(`note: ${b} is from an earlier build, not staged`); continue }
+      }
       await copyFile(p, join(stageDir, b))
       if (this.platform.os !== 'windows') await chmod(join(stageDir, b), 0o755)
       staged.push(b)
@@ -932,7 +966,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
 // Standalone entry point (testing / development)
 // ---------------------------------------------------------------------------
 
-if (import.meta.main) {
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT ?? 8787)
   const host = process.env.HOST ?? '127.0.0.1'
   const upgrade = createUpgradeHandler()

@@ -23,6 +23,11 @@ const POLL_MS = envInt('FIPS_UI_POLL_MS', 2000, 500, 60_000);
 const ALLOW_SERVICE_CONTROL = process.env.FIPS_UI_ALLOW_SERVICE_CONTROL === '1';
 const READ_ONLY = process.env.FIPS_UI_READ_ONLY === '1';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Hosts a browser may address this API as. Requests whose Host (or Origin, when present) is not in this set
+// are refused: that is what stops DNS-rebinding reads and cross-site writes against a loopback-only UI.
+const WILDCARD_BIND = ['0.0.0.0', '::', '', '*'].includes(HOST);
+const ALLOWED_HOSTS = new Set<string>(['localhost', '127.0.0.1', '::1', ...(WILDCARD_BIND ? [] : [HOST.toLowerCase()]), ...(process.env.FIPS_UI_ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean)]);
+const HOST_CHECK = !WILDCARD_BIND || ALLOWED_HOSTS.size > 3; // a wildcard bind without an allow-list cannot know its names
 const STATIC_DIR = process.env.FIPS_UI_STATIC ?? path.join(ROOT, 'web', 'dist');
 
 // ---------------------------------------------------------------------------------------------
@@ -57,6 +62,38 @@ function tokenOk(req: Req, url: URL): boolean {
   if (!presented) return false;
   const a = Buffer.from(presented), b = Buffer.from(TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** Hostname of a Host header value or URL, lowercased, without port or IPv6 brackets. */
+function hostnameOf(value: string | undefined, isUrl = false): string | null {
+  if (!value) return null;
+  try {
+    const h = isUrl ? new URL(value).hostname : new URL(`http://${value}`).hostname;
+    return h.replace(/^\[|\]$/g, '').toLowerCase() || null;
+  } catch { return null; }
+}
+
+/**
+ * Browser-origin checks for the API. Host must be one of ours (DNS rebinding); a POST must carry a
+ * same-site Origin when the browser sends one, must not be flagged cross-site by Sec-Fetch-Site, and must
+ * be JSON, which HTML forms cannot produce and cross-origin fetches cannot send without a CORS preflight.
+ */
+function browserChecks(req: Req, method: string): string | null {
+  if (HOST_CHECK) {
+    const host = hostnameOf(req.headers.host);
+    if (!host || !ALLOWED_HOSTS.has(host)) return `host '${req.headers.host ?? ''}' is not allowed (set FIPS_UI_ALLOWED_HOSTS)`;
+  }
+  if (method === 'GET' || method === 'HEAD') return null;
+  const origin = req.headers.origin;
+  if (origin && origin !== 'null') {
+    const o = hostnameOf(origin, true);
+    if (!o || (HOST_CHECK ? !ALLOWED_HOSTS.has(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+  } else if (origin === 'null') return 'cross-origin request refused';
+  const site = req.headers['sec-fetch-site'];
+  if (typeof site === 'string' && site === 'cross-site') return 'cross-site request refused';
+  const ct = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  if (ct !== 'application/json') return 'mutating requests must be sent with content-type: application/json';
+  return null;
 }
 
 function errToResponse(res: Res, e: unknown) {
@@ -177,14 +214,20 @@ function serveStatic(url: URL, res: Res) {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(`<!doctype html><meta charset=utf-8><title>FIPS UI</title><body style="font:16px system-ui;padding:2rem;background:#0b1220;color:#e5eefc"><h1>FIPS UI API is running</h1><p>The frontend has not been built yet. Run <code>npm run build</code> (production) or <code>npm run dev</code> (development, then open the Vite URL).</p><p>API: <a style="color:#7dd3fc" href="/api/snapshot">/api/snapshot</a></p>`);
   }
-  let rel = decodeURIComponent(url.pathname);
-  if (rel.includes('..')) return json(res, 400, { error: 'bad path' });
+  let rel: string;
+  try { rel = decodeURIComponent(url.pathname); } catch { return json(res, 400, { error: 'bad path' }); }
+  if (rel.includes('..') || rel.includes('\0')) return json(res, 400, { error: 'bad path' });
   let file = path.join(STATIC_DIR, rel);
-  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(STATIC_DIR, 'index.html'); // SPA fallback
+  const isFile = (f: string) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+  if (!isFile(file)) file = path.join(STATIC_DIR, 'index.html'); // SPA fallback
+  if (!isFile(file)) return json(res, 404, { error: 'frontend not built: web/dist/index.html is missing' });
   const ext = path.extname(file);
   const immutable = rel.startsWith('/assets/');
-  res.writeHead(200, { 'content-type': MIME[ext] ?? 'application/octet-stream', 'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache' });
-  fs.createReadStream(file).pipe(res);
+  const stream = fs.createReadStream(file);
+  stream.on('open', () => res.writeHead(200, { 'content-type': MIME[ext] ?? 'application/octet-stream', 'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache' }));
+  // A file that vanishes or is unreadable (mid-build, wrong permissions) must fail this request, not the process.
+  stream.on('error', (e: NodeJS.ErrnoException) => { if (!res.headersSent) json(res, e.code === 'ENOENT' ? 404 : 500, { error: `cannot read ${path.basename(file)}: ${e.code ?? e.message}` }); else res.destroy(); });
+  stream.pipe(res);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -201,6 +244,9 @@ async function route(req: Req, res: Res) {
   const method = req.method ?? 'GET';
 
   if (!p.startsWith('/api/')) return serveStatic(url, res);
+
+  const refused = browserChecks(req, method);
+  if (refused) return json(res, 403, { error: refused });
 
   // Auth: when a token is configured, every API call needs it (mutations always, reads too).
   if (p !== '/api/health' && !tokenOk(req, url)) return json(res, 401, { error: 'unauthorized', auth: 'token' });
@@ -290,5 +336,6 @@ server.listen(PORT, HOST, () => {
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);
   console.log(`  service control: ${ALLOW_SERVICE_CONTROL && !READ_ONLY ? 'enabled' : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`);
+  console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
 for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); process.exit(0); });

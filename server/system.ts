@@ -23,14 +23,15 @@ export interface UnitState {
   unitFileState?: string;
 }
 
-// Timestamps are read as monotonic microseconds since boot: the human-readable variants are localized
-// ("Sat 2026-09-26 09:56:37 CEST") and do not parse reliably.
-const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestampMonotonic', 'ExecMainStartTimestampMonotonic', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
+// Timestamps: `--timestamp=unix` (systemd >= 250) yields `@<epoch-seconds>`; older systemd ignores the flag and
+// prints a localized string that does not parse, so the monotonic variants are read as a fallback and converted
+// with CLOCK_MONOTONIC (process.hrtime on Linux), which like systemd's clock excludes suspend.
+const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestamp', 'ExecMainStartTimestamp', 'ActiveEnterTimestampMonotonic', 'ExecMainStartTimestampMonotonic', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
 
 export async function unitStates(): Promise<UnitState[]> {
   try {
-    const { stdout } = await execFileP('systemctl', ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager']);
-    const bootEpochMs = Date.now() - os.uptime() * 1000;
+    const { stdout } = await execFileP('systemctl', ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager', '--timestamp=unix']);
+    const bootEpochMs = Date.now() - Number(process.hrtime.bigint() / 1_000_000n);
     // Output is blank-line separated blocks, one per unit, in request order.
     const blocks = stdout.trim().split(/\n\s*\n/);
     return blocks.map((block, i) => {
@@ -40,8 +41,9 @@ export async function unitStates(): Promise<UnitState[]> {
         if (eq > 0) kv[line.slice(0, eq)] = line.slice(eq + 1);
       }
       const num = (s?: string) => (s && s !== '[not set]' && !Number.isNaN(Number(s)) ? Number(s) : undefined);
+      const unix = /^@(\d+)/.exec(kv.ExecMainStartTimestamp || kv.ActiveEnterTimestamp || '');
       const monoUs = num(kv.ExecMainStartTimestampMonotonic) || num(kv.ActiveEnterTimestampMonotonic);
-      const sinceMs = monoUs ? bootEpochMs + monoUs / 1000 : NaN;
+      const sinceMs = unix ? Number(unix[1]) * 1000 : monoUs ? bootEpochMs + monoUs / 1000 : NaN;
       return {
         unit: UNITS[i] ?? `unit-${i}`,
         loaded: kv.LoadState === 'loaded',

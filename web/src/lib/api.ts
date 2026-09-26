@@ -11,7 +11,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const tok = getToken();
   if (tok) headers.set('authorization', `Bearer ${tok}`);
-  if (init?.body) headers.set('content-type', 'application/json');
+  if (init?.method && init.method !== 'GET') headers.set('content-type', 'application/json');
   const res = await fetch(path, { ...init, headers });
   const text = await res.text();
   let body: unknown = null;

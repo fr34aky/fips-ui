@@ -54,6 +54,7 @@ Everything is via environment variables.
 | -------- | ------- | ------- |
 | `FIPS_UI_HOST` | `127.0.0.1` | Bind address. Only bind to a non-loopback address together with `FIPS_UI_TOKEN` or a reverse proxy that authenticates. |
 | `FIPS_UI_PORT` | `8321` | Port. |
+| `FIPS_UI_ALLOWED_HOSTS` | – | Comma-separated hostnames browsers may use to reach the UI, in addition to loopback and the bind address, e.g. `htpc.lan,node.fips`. Requests with any other `Host` are refused (DNS-rebinding protection). |
 | `FIPS_UI_TOKEN` | – | When set, every API call needs `Authorization: Bearer <token>`; the UI prompts for it once and stores it in the browser. Put it in `/etc/default/fips-ui` (mode 0600), not in the unit file. |
 | `FIPS_UI_READ_ONLY` | – | `1` disables every mutating action (connect, disconnect, probe, service control, upgrade). |
 | `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | `1` enables restart/start buttons for the fips units. Requires the UI user to be allowed to run `systemctl restart fips.service` (polkit rule or running as root). |

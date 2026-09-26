@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Mutating API requests now require `content-type: application/json`, a
+  same-site `Origin` when the browser sends one, and no `cross-site`
+  `Sec-Fetch-Site`; every API request must address the UI by an allowed
+  hostname (loopback, the bind address, or `FIPS_UI_ALLOWED_HOSTS`). This
+  closes cross-site request forgery and DNS-rebinding against a token-less
+  loopback instance, which previously could have been made to disconnect
+  peers, stop the service, or start a root-level upgrade.
+
 ### Fixed
+
+- A missing or unreadable file under `web/dist` (for example mid-build)
+  crashed the server through an unhandled stream error; it now answers 404
+  or 500 for that request.
+- A bare branch name typed into the build box resolved to the never-updated
+  local branch from clone time and silently built stale code; refs are now
+  resolved against `origin/<ref>` first.
+- Binaries left in the shared cargo target directory by an earlier build of
+  a different ref could be staged and installed next to a new `fips`; only
+  binaries produced by the current build are staged.
+- On Windows an install with "restart" unchecked left the service stopped;
+  it is always started again after a swap, with a note.
+- Service "since" times drifted by the time spent suspended; systemd's
+  `--timestamp=unix` output is used, with a monotonic-clock fallback.
+- The Upgrade page's GitHub polling exceeded the anonymous rate limit and
+  retried failures immediately; answers are cached for ten minutes and
+  failures for a minute or until the limit resets.
+- The toolchain plan was still probed on every status poll, and the helper
+  self-test ran twice per job.
+- After a backend restart mid-job, the job panel retried two failing
+  requests every three seconds forever; a 404 now ends the job as unknown.
+- `node server/upgrade.ts` did nothing on Node 22 and 23 because its
+  entry-point check relied on a Node 24.2 feature.
 
 - A malformed line from the control socket (a JSON scalar or `null`) crashed
   the whole server from inside the socket's data handler; it is now reported
