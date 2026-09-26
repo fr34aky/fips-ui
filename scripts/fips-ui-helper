@@ -220,120 +220,101 @@ take_lock() {
   flock -w 10 9 || die "another privileged operation is in progress"
 }
 
-# Secret redaction, as one awk program with two modes. Every secret becomes one quoted placeholder,
-# `"<redacted #N>"`, written exactly where its value was: the key, a list item's dash and every sibling
-# stay visible and editable, and the YAML keeps its structure. A secret's value may be a plain or quoted
-# scalar (also spanning lines, or on the line after its key), a block scalar (| >), or a flow collection;
-# a flow collection that contains a secret key anywhere is hidden as a whole. Lines are tracked with a
-# stack of (indent, text) so every line knows its parent, compared in redacted form (so errors can never
-# echo a secret).
+# Secret redaction, fail-closed. fips keeps its secrets (node.identity.nsec, transports.tor.control_auth) as
+# simple single-line mapping values, and that is the only form handled: `key: value` on one line, the value
+# a plain or completely quoted scalar, not in a list item, followed by no continuation. The value becomes the
+# placeholder `"<redacted #N>"`. If a secret key or an nsec1… literal appears in ANY other form anywhere in
+# the file (flow collections, block scalars, tags, anchors, list items, values on following lines, comments),
+# the file is not shown at all and the offending lines are named: it must then be edited from a shell.
 #
-#   redact:  print the file with placeholders.
-#   restore: (original, new) each placeholder #N in the new file must sit under the same key and the same
-#            parent line as #N in the original and be used once; it is replaced by the original text.
-#            Deleting an entry drops its secret; moving, copying or re-parenting a placeholder is refused.
+#   redact:  print the file with placeholders, or print nothing and exit 3 with reasons on stderr.
+#   restore: (original, new) each placeholder #N must sit under the same key and the same chain of ancestor
+#            lines as in the original, and be used once; the original line is put back. Deleting a secret line
+#            deletes the secret; moving or copying a placeholder is refused. Messages show only redacted text.
 SECRETS_AWK='
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 function indent(s,   i) { i = match(s, /[^ ]/); return i ? i - 1 : length(s) }
-function body(s,   b) { b = s; sub(/^[ \t]*(-[ \t]+)?/, "", b); return b }
-function prefix(s) { return substr(s, 1, length(s) - length(body(s))) }
-function dashed(s) { return s ~ /^[ \t]*-([ \t]|$)/ }
-function blank_or_comment(s) { return s ~ /^[ \t]*(#.*)?$/ }
-# Remove quoted strings and comments, so brackets and keys inside them do not count.
-function code(s,   t) { t = s; gsub(/"([^"\\]|\\.)*"/, "\"\"", t); gsub(/\047[^\047]*\047/, "\047\047", t); sub(/(^|[ \t])#.*$/, "", t); return t }
-function depth(s,   t, o, c) { t = code(s); o = gsub(/[{[]/, "", t); t = code(s); c = gsub(/[]}]/, "", t); return o - c }
-# keyinfo(line): is it "key: ..."? Sets K_TEXT (key as written), K_NAME (normalised), K_END (colon index in body).
-function keyinfo(s,   b, e, c, rest) {
-  K_TEXT = ""; K_NAME = ""; K_END = 0; b = body(s)
-  if (b ~ /^"/) { e = index(substr(b, 2), "\""); if (!e) return 0; K_TEXT = substr(b, 1, e + 1); rest = substr(b, e + 2) }
-  else if (b ~ /^\047/) { e = index(substr(b, 2), "\047"); if (!e) return 0; K_TEXT = substr(b, 1, e + 1); rest = substr(b, e + 2) }
-  else { c = match(b, /:([ \t]|$)/); if (!c) return 0; K_TEXT = substr(b, 1, c - 1); rest = substr(b, c); if (K_TEXT ~ /[][{},#"\047]/) return 0 }
-  if (rest !~ /^[ \t]*:([ \t]|$)/) return 0
-  K_END = length(b) - length(rest) + index(rest, ":")
-  K_NAME = trim(K_TEXT); gsub(/^["\047]|["\047]$/, "", K_NAME); K_NAME = tolower(trim(K_NAME))
+function blank(s) { return s ~ /^[ \t]*$/ }
+function comment(s) { return s ~ /^[ \t]*#/ }
+# Any mention of a secret key followed by a colon, anywhere on the line, or an nsec1 bech32 literal.
+function mentions(s,   t) { t = tolower(s); return t ~ ("(^|[^a-z0-9_])[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") || t ~ /nsec1[02-9ac-hj-np-z]/ }
+# simple(line): "key: value" in a block mapping with a secret key and a simple one-line value. Sets S_KEY,
+# S_KEYTEXT (as written), S_COL (key column).
+function simple(s,   b, c, k, v) {
+  if (s ~ /^[ \t]*-/) return 0
+  b = s; sub(/^[ \t]+/, "", b)
+  c = match(b, /:([ \t]|$)/); if (!c) return 0
+  k = substr(b, 1, c - 1); if (k ~ /[][{},#&*!|>%@`]/) return 0
+  S_KEYTEXT = k; S_KEY = tolower(trim(k)); gsub(/^["\047]|["\047]$/, "", S_KEY); S_KEY = trim(S_KEY)
+  if (S_KEY !~ ("^(" KEYS ")$")) return 0
+  S_COL = indent(s)
+  v = trim(substr(b, c + 1))
+  if (v == "") return 0
+  if (v ~ /^"/) { if (v !~ /^"([^"\\]|\\.)*"[ \t]*(#.*)?$/) return 0 }
+  else if (v ~ /^\047/) { if (v !~ /^\047([^\047]|\047\047)*\047[ \t]*(#.*)?$/) return 0 }
+  else if (v ~ /^[-?:,\[\]{}#&*!|>%@`]/) return 0
+  # Exactly one secret mention (the key itself) outside the value: the value, which is hidden whole, may say
+  # anything inside its quotes, but a trailing comment may not mention a secret key or an nsec.
+  t = v; gsub(/^"([^"\\]|\\.)*"|^\047([^\047]|\047\047)*\047/, "", t)
+  if (index(t, "#")) { cm = substr(t, index(t, "#")); if (mentions(cm)) return 0 }
   return 1
 }
-function valueof(s) { return trim(substr(body(s), K_END + 1)) }
-function secretkey(k) { return k ~ ("^(" KEYS ")$") }
-function flowsecret(s,   t) { t = tolower(s); sub(/(^|[ \t])#.*$/, "", t); return t ~ ("[{,][ \t]*[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") }
-function parentof(ind) { while (sp > 0 && pind[sp] >= ind) sp--; return sp > 0 ? ptext[sp] : "" }
+function chain(ind,   i, r) { while (sp > 0 && pind[sp] >= ind) sp--; r = ""; for (i = 1; i <= sp; i++) r = r (i > 1 ? " > " : "") ptext[i]; return r }
 function push(ind, t) { sp++; pind[sp] = ind; ptext[sp] = t }
 function ph(id) { return "\"<redacted #" id ">\"" }
-function canonical(dash, ktext, id) { return (dash ? "- " : "") (ktext != "" ? trim(ktext) ": " : "") ph(id) }
-function unquoted_open(v, q,   t, n) { t = v; if (q == "\"") { gsub(/\\./, "", t); n = gsub(/"/, "", t) } else { gsub(/\047\047/, "", t); n = gsub(/\047/, "", t) } return n % 2 == 1 }
+function refuse(msg) { printf "line %d: %s\n", FNR, msg > "/dev/stderr"; bad = 1 }
 
-# Output hooks: redact prints; the first pass of restore records.
-function out_plain(s) { if (MODE == "redact") print s }
-function unit_start(s, keyed, par,   ind, id) {
-  n++; ind = indent(s)
-  if (MODE == "redact") print prefix(s) (keyed ? K_TEXT ": " : "") ph(n)
-  else { okey[n] = keyed ? K_NAME : ""; oparent[n] = par; otext[n] = s }
-  push(ind, canonical(dashed(s), keyed ? K_TEXT : "", n))
-}
-function unit_more(s) { if (MODE != "redact") otext[n] = otext[n] "\n" s }
-
-# The walker (redact mode and the first pass of restore).
-function walk(s,   ind, keyed, v, k, par) {
-  if (cont == "block" || cont == "plain") { if (s ~ /^[ \t]*$/ || indent(s) > cont_ind) { unit_more(s); return } cont = "" }
-  else if (cont == "flow") { unit_more(s); fdepth += depth(s); if (fdepth <= 0) cont = ""; return }
-  else if (cont == "dq" || cont == "sq") { unit_more(s); if (unquoted_open(s, cont == "dq" ? "\"" : "\047")) cont = ""; return }
-  if (hold != "") {
-    if (s ~ /^[ \t]*$/) { holdblank = holdblank s "\n"; return }
-    if (!blank_or_comment(s) && indent(s) > hold_keycol && !keyinfo(s) && !dashed(s)) {
-      keyinfo(hold); unit_start(hold, 1, hold_par)
-      n2 = split(holdblank, hb, "\n"); for (i = 1; i < n2; i++) unit_more(hb[i])
-      unit_more(s); cont = "plain"; cont_ind = hold_keycol; hold = ""; holdblank = ""; return
+# The walker for redact mode and the first pass of restore.
+function walk(s,   ind, ch) {
+  if (after_col >= 0 && !blank(s) && !comment(s)) {
+    # Deeper lines continue the value; for a key with an empty value a "- " item at the same column is its sequence.
+    if (indent(s) > after_col || (after_kind == "empty" && indent(s) == after_col && s ~ /^[ \t]*-([ \t]|$)/)) refuse(after_kind == "empty" ? "a secret key whose value is on the following lines" : "a secret value that continues on the next line")
+    after_col = -1
+  }
+  if (blank(s)) { emit(s); return }
+  if (comment(s)) { if (mentions(s)) refuse("a comment that mentions a secret key or an nsec"); else emit(s); return }
+  ind = indent(s); ch = chain(ind)
+  if (mentions(s)) {
+    if (simple(s)) {
+      n++; record(n, s, ch)
+      emit(substr(s, 1, S_COL) S_KEYTEXT ": " ph(n))
+      push(ind, trim(S_KEYTEXT) ": " ph(n)); after_col = S_COL; after_kind = "value"; return
     }
-    flush_hold()
-  }
-  if (blank_or_comment(s)) { out_plain(s); return }
-  ind = indent(s); par = parentof(ind); keyed = keyinfo(s)
-  k = keyed ? K_NAME : ""
-  if (keyed && secretkey(k)) {
-    v = valueof(s)
-    if (v == "" || v ~ /^#/) { hold = s; hold_par = par; hold_keycol = length(prefix(s)); return }
-    unit_start(s, 1, par)
-    if (v ~ /^[|>]/) { cont = "block"; cont_ind = length(prefix(s)) }
-    else if (depth(s) > 0) { cont = "flow"; fdepth = depth(s) }
-    else if (v ~ /^"/ && unquoted_open(v, "\"")) cont = "dq"
-    else if (v ~ /^\047/ && unquoted_open(v, "\047")) cont = "sq"
+    # A secret key with nothing after it is fine only if nothing is nested below it (a null value).
+    b = s; sub(/^[ \t]+/, "", b)
+    if (s !~ /^[ \t]*-/ && b ~ ("^[\"\047]?(" KEYS ")[\"\047]?[ \t]*:[ \t]*$") ) { emit(s); push(ind, trim(s)); after_col = ind; after_kind = "empty"; return }
+    refuse("a secret in a form this editor does not redact (flow collection, block scalar, tag, anchor, list item or quoted multi-line value)")
     return
   }
-  if (flowsecret(s) && (keyed ? valueof(s) : body(s)) ~ /^[{[]/) {
-    unit_start(s, keyed, par)
-    if (depth(s) > 0) { cont = "flow"; fdepth = depth(s) }
-    return
-  }
-  push(ind, trim(s)); out_plain(s)
+  emit(s); push(ind, trim(s))
 }
-function flush_hold(   n2, i, hb) {
-  if (hold == "") return
-  sp_hold = indent(hold); push(sp_hold, trim(hold)); out_plain(hold)
-  n2 = split(holdblank, hb, "\n"); for (i = 1; i < n2; i++) out_plain(hb[i])
-  hold = ""; holdblank = ""
-}
-function reset() { sp = 0; cont = ""; hold = ""; holdblank = "" }
+function emit(s) { if (MODE == "redact") out[++nout] = s }
+function record(id, s, ch) { if (MODE == "restore") { otext[id] = s; okey[id] = S_KEY; ochain[id] = ch } }
 
-BEGIN { reset(); n = 0 }
+BEGIN { sp = 0; after_col = -1; n = 0 }
 MODE == "redact" { walk($0); next }
 MODE == "restore" && FILENAME == ARGV[1] { walk($0); next }
-MODE == "restore" && !second { flush_hold(); reset(); second = 1 }
+MODE == "restore" && !second { if (bad) { print "the current file cannot be redacted, so it cannot be edited here" > "/dev/stderr"; exit 3 } sp = 0; second = 1 }
 MODE == "restore" {
-  if ($0 ~ /"<redacted #[0-9]+>"/) {
-    match($0, /"<redacted #[0-9]+>"/); id = substr($0, RSTART + 12, RLENGTH - 14)
-    ind = indent($0); par = parentof(ind)
-    if (keyinfo($0)) { key = K_NAME; ktext = K_TEXT; form = valueof($0) == ph(id) } else { key = ""; ktext = ""; form = trim(body($0)) == ph(id) }
-    if (!form) { printf "line %d: placeholder #%s must be the whole value\n", FNR, id > "/dev/stderr"; bad = 1; next }
-    if (!(id in otext)) { printf "line %d: placeholder #%s does not exist\n", FNR, id > "/dev/stderr"; bad = 1; next }
-    if (used[id]++) { printf "line %d: placeholder #%s is used twice\n", FNR, id > "/dev/stderr"; bad = 1; next }
-    if (key != okey[id] || par != oparent[id]) { printf "line %d: redacted secret #%s (%s) was moved or its parent line (%s) changed; put it back where it was\n", FNR, id, okey[id] == "" ? "flow value" : okey[id], oparent[id] == "" ? "top level" : oparent[id] > "/dev/stderr"; bad = 1; next }
-    print otext[id]; push(ind, canonical(dashed($0), ktext, id)); next
+  if ($0 ~ /<redacted/) {
+    if (!match($0, /"<redacted #[0-9]+>"/)) { refuse("a redaction placeholder in an unexpected form"); next }
+    id = substr($0, RSTART + 12, RLENGTH - 14)
+    b = $0; sub(/^[ \t]+/, "", b); c = match(b, /:([ \t]|$)/)
+    if ($0 ~ /^[ \t]*-/ || !c || trim(substr(b, c + 1)) != ph(id)) { refuse("placeholder #" id " must be the whole value of a plain key: line"); next }
+    k = tolower(trim(substr(b, 1, c - 1))); gsub(/^["\047]|["\047]$/, "", k); k = trim(k)
+    ind = indent($0); ch = chain(ind)
+    if (!(id in otext)) { refuse("placeholder #" id " does not exist"); next }
+    if (used[id]++) { refuse("placeholder #" id " is used twice"); next }
+    if (k != okey[id] || ch != ochain[id]) { refuse("redacted secret #" id " (" okey[id] ") was moved; it belongs under: " (ochain[id] == "" ? "the top level" : ochain[id])); next }
+    print otext[id]; push(ind, trim(substr(b, 1, c - 1)) ": " ph(id)); next
   }
-  if ($0 ~ /<redacted/) { printf "line %d mentions a redaction placeholder in an unexpected form\n", FNR > "/dev/stderr"; bad = 1; next }
-  if (!blank_or_comment($0)) push(indent($0), trim($0))
+  if (!blank($0) && !comment($0)) { chain(indent($0)); push(indent($0), trim($0)) }
   print
 }
-END { if (MODE == "redact") flush_hold(); exit bad }
+END {
+  if (MODE == "redact" && !bad) for (i = 1; i <= nout; i++) print out[i]
+  exit bad ? 3 : 0
+}
 '
 redact() { awk -v MODE=redact -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1"; }
 restore_secrets() { awk -v MODE=restore -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1" "$2" > "$3"; }
@@ -350,8 +331,7 @@ journal_tail_json() { # <unit> <since-epoch>
   json_escape "$out"
 }
 
-# The fixed default bin dir, not BIN_DIR: FIPS_BIN_DIR is forwarded from the caller by sudo.
-fipsctl_bin() { local d=${FIPS_TEST_FIPSCTL_DIR:-$BIN_DIR_DEFAULT}; [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]] || d=$BIN_DIR_DEFAULT; [[ -x "$d/fipsctl" ]] && echo "$d/fipsctl" || echo fipsctl; }
+fipsctl_bin() { [[ -x "$BIN_DIR/fipsctl" ]] && echo "$BIN_DIR/fipsctl" || echo fipsctl; }
 
 # Healthy = the unit stays active without systemd restarting it, and the control socket (at the path the new
 # config sets, if any) answers, for 8 consecutive seconds within a 45 s budget.
@@ -507,8 +487,13 @@ case "$cmd" in
 
   config-show)
     [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
-    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"; redact "$f"
-    else redact "$FIPS_CONFIG"; fi
+    f="$FIPS_CONFIG"
+    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"; fi
+    errf=$(mktemp); trap 'rm -f "$errf"' EXIT
+    if ! out=$(redact "$f" 2>"$errf"); then
+      die "cannot show this file safely: $(head -n 8 "$errf" | tr '\n' ';') edit it from a shell, or write secrets as single-line key: value"
+    fi
+    printf '%s\n' "$out"
     ;;
 
   config-apply)
