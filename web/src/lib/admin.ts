@@ -17,9 +17,9 @@ export interface DropinResult { ok: boolean; error?: string; detail?: string; re
 
 export const adminApi = {
   status: (refresh = false) => api.get<{ helper: HelperInfo; busy: string | null }>(`/api/admin/status${refresh ? '?refresh=1' : ''}`),
-  config: () => api.get<{ yaml: string; backups: ConfigBackup[]; path: string }>('/api/admin/config'),
+  config: () => api.get<{ yaml: string; base: string; backups: ConfigBackup[]; path: string }>('/api/admin/config'),
   backup: (id: string) => api.get<{ id: string; yaml: string }>(`/api/admin/config/backup?id=${encodeURIComponent(id)}`),
-  apply: (yaml: string, restart: boolean) => api.post<ApplyResult>('/api/admin/config', { yaml, restart }),
+  apply: (yaml: string, restart: boolean, base: string) => api.post<ApplyResult>('/api/admin/config', { yaml, restart, base }),
   restore: (id: string) => api.post<ApplyResult>('/api/admin/config/restore', { id }),
   firewall: () => api.get<FirewallState>('/api/admin/firewall'),
   saveRules: (rules: FirewallRule[]) => api.post<DropinResult>('/api/admin/firewall/rules', { rules }),

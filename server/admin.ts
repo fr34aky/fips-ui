@@ -240,7 +240,9 @@ export function createAdminHandler(opts: AdminOptions) {
           await requireHelper();
           const [yaml, backups] = await Promise.all([runHelper(helperPath, ['config-show']), helperJson<{ id: string; size: number; mtime: number }[]>(['config-backups'])]);
           if (yaml.code !== 0) throw new Error(helperError(yaml));
-          sendJson(res, 200, { yaml: yaml.stdout, backups, path: '/etc/fips/fips.yaml' }); return true;
+          const nl = yaml.stdout.indexOf('\n');
+          const base = /^base [0-9a-f]{64}$/.test(yaml.stdout.slice(0, nl)) ? yaml.stdout.slice(5, nl) : '';
+          sendJson(res, 200, { yaml: base ? yaml.stdout.slice(nl + 1) : yaml.stdout, base, backups, path: '/etc/fips/fips.yaml' }); return true;
         }
         if (sub === '/config/backup') {
           await requireHelper();
@@ -248,7 +250,7 @@ export function createAdminHandler(opts: AdminOptions) {
           if (!/^[0-9]{8}-[0-9]{6}(-[0-9]+)?$/.test(id)) throw new BodyError(400, 'invalid backup id');
           const r = await runHelper(helperPath, ['config-show', id]);
           if (r.code !== 0) throw new Error(helperError(r));
-          sendJson(res, 200, { id, yaml: r.stdout }); return true;
+          sendJson(res, 200, { id, yaml: r.stdout.replace(/^base [0-9a-f]{64}\n/, '') }); return true;
         }
         if (sub === '/firewall') { sendJson(res, 200, await firewallStatus()); return true; }
         if (sub === '/address') { sendJson(res, 200, { npub: url.searchParams.get('npub'), address: await meshAddress(url.searchParams.get('npub') ?? '') }); return true; }
@@ -269,7 +271,8 @@ export function createAdminHandler(opts: AdminOptions) {
         if (typeof yaml !== 'string' || !yaml.trim()) throw new BodyError(400, 'yaml (non-empty string) required');
         if (Buffer.byteLength(yaml) > 256 * 1024) throw new BodyError(400, 'configuration larger than 256 KiB');
         if (body.restart !== undefined && typeof body.restart !== 'boolean') throw new BodyError(400, 'restart must be a boolean');
-        const result = await helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : [])], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT);
+        if (typeof body.base !== 'string' || !/^[0-9a-f]{64}$/.test(body.base)) throw new BodyError(400, 'base (the hash returned with the configuration) required');
+        const result = await helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : []), '--base', body.base], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT);
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/config/restore') {

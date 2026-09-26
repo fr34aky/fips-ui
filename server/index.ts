@@ -232,13 +232,14 @@ function serveStatic(url: URL, res: Res) {
 // Router
 // ---------------------------------------------------------------------------------------------
 const startedAt = Date.now();
+let upgradeStarting = 0;
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
 const upgrade = createUpgradeHandler({ authorize: () => !READ_ONLY, controlSocket: SOCKET_PATH });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
   authorize: () => !READ_ONLY,
-  busy: () => { const j = upgrade.manager.job; return j && (j.state === 'running' || j.state === 'queued') ? 'an upgrade job is running; wait for it to finish' : null; },
+  busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
 });
 /** Service control is available through the helper (v3+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
@@ -269,7 +270,9 @@ async function route(req: Req, res: Res) {
   if (p === '/api/events') return handleSse(req, res);
   if (p.startsWith('/api/upgrade')) {
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
-    if (await upgrade(req, res)) return;
+    // Counted before any await, so a node-management change cannot start while this request reads its body.
+    if (method === 'POST') upgradeStarting++;
+    try { if (await upgrade(req, res)) return; } finally { if (method === 'POST') upgradeStarting--; }
   }
   if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());

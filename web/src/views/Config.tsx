@@ -51,7 +51,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   const apply = async () => {
     setBusy(true); setResult(null);
     try {
-      const r = await withResult(adminApi.apply(text, restart));
+      const r = await withResult(adminApi.apply(text, restart, cfg.data?.base ?? ''));
       setResult(r);
       if (r.ok) { toast('ok', r.changed ? (r.restarted ? 'Configuration applied and the daemon is healthy' : 'Configuration saved; restart the daemon to apply it') : 'No changes to apply'); setDraft(null); cfg.refresh(); }
       else toast('err', r.error ?? 'Apply failed');

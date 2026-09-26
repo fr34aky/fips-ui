@@ -16,7 +16,7 @@
 #   list-backups
 #   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted as
 #                                     numbered placeholders bound to their key and parent line
-#   config-apply [--no-restart]    <- new fips.yaml on stdin; redacted placeholders are restored from
+#   config-apply [--no-restart] [--base <sha256>] <- new fips.yaml on stdin; redacted placeholders are restored from
 #                                     the current file; backed up, installed, daemon restarted and
 #                                     rolled back automatically if it does not come up healthy
 #   config-backups                 -> JSON list of config backups
@@ -220,104 +220,226 @@ take_lock() {
   flock -w 10 9 || die "another privileged operation is in progress"
 }
 
-# Secret redaction, fail-closed. fips keeps its secrets (node.identity.nsec, transports.tor.control_auth) as
-# simple single-line mapping values, and that is the only form handled: `key: value` on one line, the value
-# a plain or completely quoted scalar, not in a list item, followed by no continuation. The value becomes the
-# placeholder `"<redacted #N>"`. If a secret key or an nsec1… literal appears in ANY other form anywhere in
-# the file (flow collections, block scalars, tags, anchors, list items, values on following lines, comments),
-# the file is not shown at all and the offending lines are named: it must then be edited from a shell.
-#
-#   redact:  print the file with placeholders, or print nothing and exit 3 with reasons on stderr.
-#   restore: (original, new) each placeholder #N must sit under the same key and the same chain of ancestor
-#            lines as in the original, and be used once; the original line is put back. Deleting a secret line
-#            deletes the secret; moving or copying a placeholder is refused. Messages show only redacted text.
-SECRETS_AWK='
-function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-function indent(s,   i) { i = match(s, /[^ ]/); return i ? i - 1 : length(s) }
-function blank(s) { return s ~ /^[ \t]*$/ }
-function comment(s) { return s ~ /^[ \t]*#/ }
-# Any mention of a secret key followed by a colon, anywhere on the line, or an nsec1 bech32 literal.
-function mentions(s,   t) { t = tolower(s); return t ~ ("(^|[^a-z0-9_])[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") || t ~ /nsec1[02-9ac-hj-np-z]/ }
-# simple(line): "key: value" in a block mapping with a secret key and a simple one-line value. Sets S_KEY,
-# S_KEYTEXT (as written), S_COL (key column).
-function simple(s,   b, c, k, v) {
-  if (s ~ /^[ \t]*-/) return 0
-  b = s; sub(/^[ \t]+/, "", b)
-  c = match(b, /:([ \t]|$)/); if (!c) return 0
-  k = substr(b, 1, c - 1); if (k ~ /[][{},#&*!|>%@`]/) return 0
-  S_KEYTEXT = k; S_KEY = tolower(trim(k)); gsub(/^["\047]|["\047]$/, "", S_KEY); S_KEY = trim(S_KEY)
-  if (S_KEY !~ ("^(" KEYS ")$")) return 0
-  S_COL = indent(s)
-  v = trim(substr(b, c + 1))
-  if (v == "") return 0
-  if (v ~ /^"/) { if (v !~ /^"([^"\\]|\\.)*"[ \t]*(#.*)?$/) return 0 }
-  else if (v ~ /^\047/) { if (v !~ /^\047([^\047]|\047\047)*\047[ \t]*(#.*)?$/) return 0 }
-  else if (v ~ /^[-?:,\[\]{}#&*!|>%@`]/) return 0
-  # Exactly one secret mention (the key itself) outside the value: the value, which is hidden whole, may say
-  # anything inside its quotes, but a trailing comment may not mention a secret key or an nsec.
-  t = v; gsub(/^"([^"\\]|\\.)*"|^\047([^\047]|\047\047)*\047/, "", t)
-  if (index(t, "#")) { cm = substr(t, index(t, "#")); if (mentions(cm)) return 0 }
-  return 1
-}
-function chain(ind,   i, r) { while (sp > 0 && pind[sp] >= ind) sp--; r = ""; for (i = 1; i <= sp; i++) r = r (i > 1 ? " > " : "") ptext[i]; return r }
-function push(ind, t) { sp++; pind[sp] = ind; ptext[sp] = t }
-function ph(id) { return "\"<redacted #" id ">\"" }
-function refuse(msg) { printf "line %d: %s\n", FNR, msg > "/dev/stderr"; bad = 1 }
+# Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
+# secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
+# character span is replaced by "<redacted #N>". Anything else is refused (exit 3, reasons on stderr), and so
+# is a file where a secret value also appears anywhere else (a comment, another key) or an nsec value sits
+# outside a secret key. Restore requires each placeholder to be a whole scalar value under the same key at the
+# same path, puts the original value text back, re-parses the result and checks each secret is exactly at its
+# path and nowhere else. Runs as root in isolated mode (python3 -I): no user environment is consulted.
+read -r -d '' REDACT_PY <<'PY' || true
+# Secret redaction for fips.yaml, decided from the parsed YAML tree (PyYAML's safe composer), never from text.
+#   redact <file>                     -> file with each secret value replaced by "<redacted #N>" (exit 3 + reasons if unsafe)
+#   restore <original> <new> <out>    -> new file with each placeholder replaced by the original value text
+import re, sys
+import yaml
+from yaml import nodes
 
-# The walker for redact mode and the first pass of restore.
-function walk(s,   ind, ch) {
-  if (after_col >= 0 && !blank(s) && !comment(s)) {
-    # Deeper lines continue the value; for a key with an empty value a "- " item at the same column is its sequence.
-    if (indent(s) > after_col || (after_kind == "empty" && indent(s) == after_col && s ~ /^[ \t]*-([ \t]|$)/)) refuse(after_kind == "empty" ? "a secret key whose value is on the following lines" : "a secret value that continues on the next line")
-    after_col = -1
-  }
-  if (blank(s)) { emit(s); return }
-  if (comment(s)) { if (mentions(s)) refuse("a comment that mentions a secret key or an nsec"); else emit(s); return }
-  ind = indent(s); ch = chain(ind)
-  if (mentions(s)) {
-    if (simple(s)) {
-      n++; record(n, s, ch)
-      emit(substr(s, 1, S_COL) S_KEYTEXT ": " ph(n))
-      push(ind, trim(S_KEYTEXT) ": " ph(n)); after_col = S_COL; after_kind = "value"; return
-    }
-    # A secret key with nothing after it is fine only if nothing is nested below it (a null value).
-    b = s; sub(/^[ \t]+/, "", b)
-    if (s !~ /^[ \t]*-/ && b ~ ("^[\"\047]?(" KEYS ")[\"\047]?[ \t]*:[ \t]*$") ) { emit(s); push(ind, trim(s)); after_col = ind; after_kind = "empty"; return }
-    refuse("a secret in a form this editor does not redact (flow collection, block scalar, tag, anchor, list item or quoted multi-line value)")
-    return
-  }
-  emit(s); push(ind, trim(s))
-}
-function emit(s) { if (MODE == "redact") out[++nout] = s }
-function record(id, s, ch) { if (MODE == "restore") { otext[id] = s; okey[id] = S_KEY; ochain[id] = ch } }
+KEYS = set(k.lower() for k in sys.argv[2].split('|'))
+MODE = sys.argv[1]
+NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
+PH = re.compile(r'<redacted #(\d+)>')
+SAFE_TAGS = {'tag:yaml.org,2002:str', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:null'}
+Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
 
-BEGIN { sp = 0; after_col = -1; n = 0 }
-MODE == "redact" { walk($0); next }
-MODE == "restore" && FILENAME == ARGV[1] { walk($0); next }
-MODE == "restore" && !second { if (bad) { print "the current file cannot be redacted, so it cannot be edited here" > "/dev/stderr"; exit 3 } sp = 0; second = 1 }
-MODE == "restore" {
-  if ($0 ~ /<redacted/) {
-    if (!match($0, /"<redacted #[0-9]+>"/)) { refuse("a redaction placeholder in an unexpected form"); next }
-    id = substr($0, RSTART + 12, RLENGTH - 14)
-    b = $0; sub(/^[ \t]+/, "", b); c = match(b, /:([ \t]|$)/)
-    if ($0 ~ /^[ \t]*-/ || !c || trim(substr(b, c + 1)) != ph(id)) { refuse("placeholder #" id " must be the whole value of a plain key: line"); next }
-    k = tolower(trim(substr(b, 1, c - 1))); gsub(/^["\047]|["\047]$/, "", k); k = trim(k)
-    ind = indent($0); ch = chain(ind)
-    if (!(id in otext)) { refuse("placeholder #" id " does not exist"); next }
-    if (used[id]++) { refuse("placeholder #" id " is used twice"); next }
-    if (k != okey[id] || ch != ochain[id]) { refuse("redacted secret #" id " (" okey[id] ") was moved; it belongs under: " (ochain[id] == "" ? "the top level" : ochain[id])); next }
-    print otext[id]; push(ind, trim(substr(b, 1, c - 1)) ": " ph(id)); next
-  }
-  if (!blank($0) && !comment($0)) { chain(indent($0)); push(indent($0), trim($0)) }
-  print
-}
-END {
-  if (MODE == "redact" && !bad) for (i = 1; i <= nout; i++) print out[i]
-  exit bad ? 3 : 0
-}
-'
-redact() { awk -v MODE=redact -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1"; }
-restore_secrets() { awk -v MODE=restore -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1" "$2" > "$3"; }
+class Refuse(Exception):
+    pass
+
+def line(n):
+    return n.start_mark.line + 1
+
+def compose(text, what):
+    try:
+        docs = list(yaml.compose_all(text, Loader=Loader))
+    except yaml.YAMLError as e:
+        raise Refuse(f'{what} is not valid YAML: {str(e).splitlines()[0]}')
+    if len(docs) > 1:
+        raise Refuse(f'{what} has more than one YAML document')
+    return docs[0] if docs else None
+
+def uses(root):
+    """How often each node object is reachable (an alias makes it more than once). Cycle-safe."""
+    counts = {}
+    stack = [root] if root is not None else []
+    while stack:
+        n = stack.pop()
+        counts[id(n)] = counts.get(id(n), 0) + 1
+        if counts[id(n)] > 1:
+            continue
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                stack.extend((k, v))
+        elif isinstance(n, nodes.SequenceNode):
+            stack.extend(n.value)
+    return counts
+
+def secrets(text, root, strict):
+    """[(path, keyname, value node)] for every secret key. With strict, refuse any form that cannot be redacted exactly."""
+    counts = uses(root)
+    found, seen = [], set()
+    def walk(n, path):
+        if id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                if not isinstance(k, nodes.ScalarNode):
+                    if strict and any(isinstance(x, nodes.ScalarNode) and x.value.strip().lower() in KEYS for x in flatten(k)):
+                        raise Refuse(f'line {line(k)}: a secret key inside a complex mapping key')
+                    walk(k, path + ['?']); walk(v, path + ['?'])
+                    continue
+                name = k.value.strip().lower()
+                p = path + [k.value]
+                if name in KEYS:
+                    if strict:
+                        if not isinstance(v, nodes.ScalarNode):
+                            raise Refuse(f'line {line(v)}: {name} holds a list or mapping, not a single value')
+                        if counts.get(id(v), 0) > 1 or counts.get(id(k), 0) > 1:
+                            raise Refuse(f'line {line(v)}: {name} is used through a YAML alias')
+                        if v.start_mark.line != v.end_mark.line:
+                            raise Refuse(f'line {line(v)}: {name} spans several lines')
+                        if v.style in ('|', '>'):
+                            raise Refuse(f'line {line(v)}: {name} is a block scalar')
+                        if v.tag not in SAFE_TAGS or text[v.start_mark.index:v.start_mark.index + 1] in ('&', '!', '*'):
+                            raise Refuse(f'line {line(v)}: {name} has an anchor or tag')
+                    if isinstance(v, nodes.ScalarNode) and v.value != '':
+                        found.append((p, name, v))
+                    continue
+                walk(v, p)
+        elif isinstance(n, nodes.SequenceNode):
+            for i, v in enumerate(n.value):
+                walk(v, path + [i])
+        elif isinstance(n, nodes.ScalarNode) and strict and NSEC.search(n.value):
+            raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
+    if root is not None:
+        walk(root, [])
+    return found
+
+def flatten(n, seen=None):
+    seen = seen if seen is not None else set()
+    if id(n) in seen:
+        return
+    seen.add(id(n))
+    yield n
+    if isinstance(n, nodes.MappingNode):
+        for k, v in n.value:
+            yield from flatten(k, seen); yield from flatten(v, seen)
+    elif isinstance(n, nodes.SequenceNode):
+        for v in n.value:
+            yield from flatten(v, seen)
+
+def splice(text, edits):
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+def ph(i):
+    return f'"<redacted #{i}>"'
+
+def fmt(path):
+    return '.'.join(str(x) for x in path) or 'the top level'
+
+def redact(path):
+    text = open(path, encoding='utf-8').read()
+    if PH.search(text):
+        raise Refuse('the file already contains a redaction placeholder')
+    root = compose(text, 'the file')
+    found = secrets(text, root, strict=True)
+    out = splice(text, [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)])
+    # Whatever the form, no secret value may survive anywhere in what is shown (comments, copies, other keys).
+    for _, name, v in found:
+        if len(v.value) >= 4 and v.value in out:
+            raise Refuse(f'the value of {name} also appears elsewhere in the file (a comment or another key)')
+    if NSEC.search(out):
+        raise Refuse('an nsec value appears outside a secret key (for example in a comment)')
+    return out
+
+def get(root, path):
+    n = root
+    for p in path:
+        if isinstance(n, nodes.MappingNode) and isinstance(p, str):
+            n = next((v for k, v in n.value if isinstance(k, nodes.ScalarNode) and k.value == p), None)
+        elif isinstance(n, nodes.SequenceNode) and isinstance(p, int) and p < len(n.value):
+            n = n.value[p]
+        else:
+            return None
+        if n is None:
+            return None
+    return n
+
+def restore(orig_path, new_path):
+    otext = open(orig_path, encoding='utf-8').read()
+    orig = secrets(otext, compose(otext, 'the current file'), strict=True)
+    ntext = open(new_path, encoding='utf-8').read()
+    nroot = compose(ntext, 'the new file')
+    edits, used = [], set()
+    placeholder_nodes = 0
+    def walk(n, path, key, seen):
+        nonlocal placeholder_nodes
+        if id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                if isinstance(k, nodes.ScalarNode) and PH.search(k.value):
+                    raise Refuse(f'line {line(k)}: a redaction placeholder used as a key')
+                walk(v, path + [k.value if isinstance(k, nodes.ScalarNode) else '?'], k, seen)
+        elif isinstance(n, nodes.SequenceNode):
+            for i, v in enumerate(n.value):
+                walk(v, path + [i], None, seen)
+        elif isinstance(n, nodes.ScalarNode):
+            m = PH.fullmatch(n.value)
+            if not m:
+                return
+            placeholder_nodes += 1
+            i = int(m.group(1))
+            if i < 1 or i > len(orig):
+                raise Refuse(f'line {line(n)}: placeholder #{i} does not exist')
+            if i in used:
+                raise Refuse(f'line {line(n)}: placeholder #{i} is used twice')
+            opath, oname, ov = orig[i - 1]
+            if path != opath or key is None or key.value.strip().lower() != oname:
+                raise Refuse(f'line {line(n)}: redacted secret #{i} ({oname}) must stay at {fmt(opath)}')
+            if n.start_mark.line != n.end_mark.line:
+                raise Refuse(f'line {line(n)}: placeholder #{i} must stay a single-line value')
+            used.add(i)
+            edits.append((n.start_mark.index, n.end_mark.index, otext[ov.start_mark.index:ov.end_mark.index]))
+    if nroot is not None:
+        walk(nroot, [], None, set())
+    if len(PH.findall(ntext)) != placeholder_nodes:
+        raise Refuse('a redaction placeholder appears somewhere other than as a whole value (a comment, key or longer string)')
+    out = splice(ntext, edits)
+    # Re-parse: every restored secret must be exactly the original value at its original path, and nowhere else.
+    root = compose(out, 'the result')
+    for i in used:
+        opath, oname, ov = orig[i - 1]
+        n = get(root, opath)
+        if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
+            raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
+        if len(ov.value) >= 4:
+            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and ov.value in x.value]
+            if len(places) != 1:
+                raise Refuse(f'redacted secret #{i} ({oname}) would appear in more than one place')
+    return out
+
+try:
+    if MODE == 'redact':
+        sys.stdout.write(redact(sys.argv[3]))
+    elif MODE == 'restore':
+        with open(sys.argv[5], 'w', encoding='utf-8') as f:
+            f.write(restore(sys.argv[3], sys.argv[4]))
+    else:
+        raise Refuse('unknown mode')
+except Refuse as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(3)
+except (OSError, UnicodeDecodeError) as e:
+    print(f'cannot read the file: {e}', file=sys.stderr)
+    sys.exit(3)
+PY
+require_yaml() { python3 -I -c 'import yaml' 2>/dev/null || die "config editing needs python3 with PyYAML (Arch: python-yaml, Debian/Ubuntu: python3-yaml, Fedora: python3-pyyaml)"; }
+redact() { python3 -I -c "$REDACT_PY" redact "$SECRET_KEYS" "$1"; }
+restore_secrets() { python3 -I -c "$REDACT_PY" restore "$SECRET_KEYS" "$1" "$2" "$3"; }
 
 read_stdin_limited() { # <dest> <max-bytes>
   head -c "$(( $2 + 1 ))" > "$1"
@@ -486,22 +608,26 @@ case "$cmd" in
     ;;
 
   config-show)
-    [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
+    require_yaml
     f="$FIPS_CONFIG"
-    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"; fi
+    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; fi
+    [[ -f "$f" ]] || die "$f not found"
     errf=$(mktemp); trap 'rm -f "$errf"' EXIT
     if ! out=$(redact "$f" 2>"$errf"); then
-      die "cannot show this file safely: $(head -n 8 "$errf" | tr '\n' ';') edit it from a shell, or write secrets as single-line key: value"
+      die "cannot show this file safely: $(head -n 8 "$errf" | tr '\n' ';') edit it from a shell"
     fi
-    printf '%s\n' "$out"
+    # First line: the hash of the file shown, which config-apply --base must match (no silent overwrite).
+    printf 'base %s\n%s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$out"
     ;;
 
   config-apply)
-    require_systemd; take_lock
-    restart=true; [[ "${2:-}" == "--no-restart" ]] && restart=false
+    require_systemd; require_yaml; take_lock
+    restart=true; base=""; shift
+    while [[ $# -gt 0 ]]; do case "$1" in --no-restart) restart=false ;; --base) base=${2:-}; shift ;; *) die "unknown option $1" ;; esac; shift; done
     [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
     tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
     read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
+    if [[ -n "$base" && "$(sha256sum "$FIPS_CONFIG" | cut -d' ' -f1)" != "$base" ]]; then die "fips.yaml changed since you loaded it; reload the page and make your edit again"; fi
     if ! err=$(restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" 2>&1); then die "$(printf '%s' "$err" | head -n 3 | tr '\n' ' ')"; fi
     grep -q '<redacted #' "$tmp2" && die "a redaction placeholder is still present"
     if cmp -s "$tmp2" "$FIPS_CONFIG"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
