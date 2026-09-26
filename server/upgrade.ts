@@ -213,7 +213,7 @@ const isRoot = (): boolean => typeof process.getuid === 'function' ? process.get
 
 async function isElevatedWindows(): Promise<boolean> { return (await run('net', ['session'], { timeout: 5000 })).code === 0 }
 
-/** Parse "fips 0.6.0-dev (rev 0f0e1dc2bd)\ntarget: ..." */
+/** Parse "fips 0.6.0-dev (rev 1a2b3c4d5e)\ntarget: ..." */
 export interface ParsedVersion { version: string; rev?: string; revFull?: string; target?: string }
 /**
  * Parse `fips --version`. `rev` is the bare commit hash (what git and GitHub understand); `revFull` is the whole
@@ -226,7 +226,7 @@ export function parseVersionOutput(out: string): ParsedVersion | null {
   const revFull = m[2] ? `${m[2]}${(m[3] ?? '').trim() ? (m[3].trim().startsWith('-') ? '' : '-') + m[3].trim().replace(/^[,\s]+/, '') : ''}` : undefined
   return { version: m[1], rev: m[2], revFull, target: t?.[1] }
 }
-/** Canonical one-line rendering: `0.6.0-dev (rev 0f0e1dc2bd-dirty)`. */
+/** Canonical one-line rendering: `0.6.0-dev (rev 1a2b3c4d5e-dirty)`. */
 export function fmtVersion(v: { version?: string; rev?: string; revFull?: string } | null | undefined): string {
   if (!v?.version) return 'unknown'
   const r = v.revFull ?? v.rev
