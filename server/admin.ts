@@ -14,6 +14,8 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { unitStates } from './system.ts';
 
 export const MIN_HELPER_VERSION = 4;
+/** The helper version that can load the mesh-access spoofing guard. */
+export const GUARD_HELPER_VERSION = 5;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
@@ -170,7 +172,7 @@ export interface AdminOptions {
   busy: () => string | null;
 }
 
-export type HelperInfo = { available: boolean; version: number | null; error?: string; managementCapable: boolean };
+export type HelperInfo = { installed: boolean; available: boolean; version: number | null; error?: string; managementCapable: boolean };
 
 export function createAdminHandler(opts: AdminOptions) {
   const helperPath = opts.helperPath ?? process.env.FIPS_UI_HELPER ?? '/usr/local/libexec/fips-ui-helper';
@@ -187,13 +189,13 @@ export function createAdminHandler(opts: AdminOptions) {
 
   async function checkHelper(): Promise<HelperInfo> {
     let value: HelperInfo;
-    if (!existsSync(helperPath)) value = { available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
+    if (!existsSync(helperPath)) value = { installed: false, available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
     else {
       const r = await runHelper(helperPath, ['check'], undefined, 15_000);
-      if (r.code !== 0) value = { available: false, version: null, error: helperError(r), managementCapable: false };
+      if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false };
       else {
-        try { const j = lastJson<{ ok: boolean; version: number }>(r.stdout); value = { available: j.ok, version: j.version, managementCapable: j.ok && j.version >= MIN_HELPER_VERSION, error: j.version < MIN_HELPER_VERSION ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh` : undefined }; }
-        catch { value = { available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false }; }
+        try { const j = lastJson<{ ok: boolean; version: number }>(r.stdout); value = { installed: true, available: j.ok, version: j.version, managementCapable: j.ok && j.version >= MIN_HELPER_VERSION, error: j.version < MIN_HELPER_VERSION ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh` : undefined }; }
+        catch { value = { installed: true, available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false }; }
       }
     }
     helperCache = { at: Date.now(), value };
@@ -357,9 +359,9 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
   async function meshGuard(ports: number[] | null, tun: string, canary?: number): Promise<{ ok: boolean; error?: string }> {
     const h = await helperInfo();
-    // A helper older than v5 cannot have loaded the guard, so "off" is trivially satisfied.
-    if (!(ports && ports.length) && (h.version ?? 0) < 5) return { ok: true };
-    if (!h.available || (h.version ?? 0) < 5) return { ok: false, error: `mesh access needs helper v5 or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
+    // A helper older than the guard cannot have loaded it, so "off" is trivially satisfied.
+    if (!(ports && ports.length) && (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: true };
+    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: false, error: `mesh access needs helper v${GUARD_HELPER_VERSION} or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
     const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun, ...(canary ? [String(canary)] : [])], undefined, 30_000);
     if (r.code !== 0) return { ok: false, error: helperError(r) };
     return lastJson<{ ok: boolean; error?: string }>(r.stdout);
@@ -368,7 +370,7 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Read-only: is the guard loaded, and for which ports and interface? */
   async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string; canary: number } | null> {
     const h = await helperInfo();
-    if (!h.available || (h.version ?? 0) < 5) return null;
+    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return null;
     const r = await runHelper(helperPath, ['mesh-guard', 'status'], undefined, 15_000);
     if (r.code !== 0) return null;
     try { const j = lastJson<{ active: boolean; ports?: string; tun?: string; canary?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '', canary: Number(j.canary ?? 0) }; }

@@ -56,8 +56,10 @@ function localAddresses(): Set<string> {
         const k = /^[0-9a-f]{32}$/.test(hex ?? '') ? expand6(hex.match(/.{4}/g)!.join(':')) : null;
         if (k) set.add(k);
       }
-    } catch { /* not Linux */ }
-    for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) { const k = a.family === 'IPv6' ? expand6(a.address.split('%')[0]) : null; if (k) set.add(k); }
+    } catch {
+      // Not Linux: interfaces that are up only.
+      for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) { const k = a.family === 'IPv6' ? expand6(a.address.split('%')[0]) : null; if (k) set.add(k); }
+    }
     localCache = { at: now, set };
   }
   return localCache.set;
@@ -354,7 +356,7 @@ export class MeshAccess {
     server.on('connection', (sock: Socket) => { if (isMeshAddress(sock.remoteAddress)) this.proveOnAccept(sock); });
     await new Promise<void>((resolve) => {
       server.once('error', (e: NodeJS.ErrnoException) => {
-        this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address}` : `${e.code ?? 'error'}: ${e.message}`;
+        this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address} (by the main listener if FIPS_UI_HOST is ::); choose another mesh port` : `${e.code ?? 'error'}: ${e.message}`;
         resolve();
       });
       server.listen({ host: want.address, port: want.port, ipv6Only: true }, () => {

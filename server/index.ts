@@ -9,7 +9,7 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, NPUB_RE, type FirewallRule } from './admin.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, type FirewallRule } from './admin.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -320,7 +320,7 @@ async function route(req: Req, res: Res) {
     const you = principalOf(req);
     if (you.role !== 'admin') return json(res, 200, { you });
     const h = await admin.helperInfo();
-    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: 5 });
+    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
   }
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
@@ -342,8 +342,9 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access') {
     const want = body as Partial<AccessConfig>;
-    // The mesh listener binds this node's fips0 address; a main listener on every address already holds that port.
-    if (want?.enabled === true && Number(want.port) === PORT && (WILDCARD_BIND || isMeshAddress(HOST))) throw new HttpError(400, `port ${PORT} is already used by the main listener (FIPS_UI_HOST=${HOST}); choose another port for mesh access`);
+    // The mesh listener binds this node's fips0 address, which the main listener already holds on its port when it
+    // is bound to every IPv6 address or to that address itself.
+    if (want?.enabled === true && mainHoldsMeshPort(Number(want.port))) throw new HttpError(400, `port ${want.port} is already used by the main listener (FIPS_UI_HOST=${HOST}); choose another port for mesh access`);
     try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
     // Syncs already in flight (or chained on them) were built from the previous list: wait for a few of them,
     // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
@@ -425,6 +426,13 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   return route(req, res);
 }
 const server = http.createServer((req, res) => { mainRequests.add(req); handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
+/** Whether the main listener holds `port` on this node's fips0 address (bound to [::] or to that address). */
+function mainHoldsMeshPort(port: number): boolean {
+  const a = server.address();
+  if (!a || typeof a !== 'object' || a.port !== port) return false;
+  const own = mesh.status().address;
+  return a.address === '::' || (!!own && expand6(a.address) === expand6(own));
+}
 
 
 // ---------------------------------------------------------------------------------------------
@@ -489,8 +497,8 @@ function syncMesh(): Promise<MeshSyncResult> {
     const cfg: AccessConfig = mesh.config;
     const helper = await admin.helperInfo().catch(() => null);
     // With access off there is nothing to remove when the helper is known not to have a guard: not installed, or
-    // answering as older than v5. A helper check that failed may hide a loaded guard, so that case is retried.
-    const noGuardPossible = helper !== null && (helper.available ? (helper.version ?? 0) < 5 : /not installed/.test(helper.error ?? ''));
+    // answering as too old for it. A helper check that failed may hide a loaded guard, so that case is retried.
+    const noGuardPossible = helper !== null && (helper.available ? (helper.version ?? 0) < GUARD_HELPER_VERSION : !helper.installed);
     if (!cfg.enabled && noGuardPossible) return { ok: true, skipped: 'no guard to remove' };
     if (!helper?.managementCapable) {
       mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
@@ -552,7 +560,9 @@ function reapplyGuard(): Promise<MeshSyncResult> {
  * any other guard change is discarded.
  */
 function verifyGuard(): Promise<unknown> {
-  if (!mesh.config.enabled || meshSync.running) return Promise.resolve();
+  if (!mesh.config.enabled) return Promise.resolve();
+  // A sync or rule retry holding the slot delays the check instead of skipping it (once; a sync reloads the guard anyway).
+  if (meshSync.running) return meshSync.running.catch(() => {}).then(() => (meshSync.running ? undefined : verifyGuard()));
   const gen = mesh.guardGen;
   meshSync.running = (async (): Promise<MeshSyncResult> => {
     const st = await admin.meshGuardStatus().catch(() => null);
