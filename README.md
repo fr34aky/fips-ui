@@ -126,6 +126,11 @@ deploy/        systemd unit, helper installer, sudoers snippet
 docs/          upgrade.md, screenshots
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, [PR-REVIEW.md](PR-REVIEW.md) for the review
+checklist every PR goes through, and [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
+
 ## License
 
 MIT. FIPS itself is © its authors, MIT licensed.
