@@ -9,7 +9,7 @@ import { diffStats, lineDiff, withContext, type DiffLine } from '../lib/diff';
 import { fmtAgo, fmtBytes } from '../lib/format';
 
 const REDACTED = '"<redacted #N>"';
-const PLACEHOLDER_RE = /<redacted #\d+>/g;
+const PLACEHOLDER_RE = /<redacted (?:comment )?#\d+>/g;
 
 
 export default function Config({ readOnly }: { readOnly: boolean }) {
@@ -42,7 +42,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
       else if (!('node' in js) && !('transports' in js)) warnings.push('neither node: nor transports: is present; is this the right file?');
     }
     const origRedacted = (original.match(PLACEHOLDER_RE) ?? []).length, nowRedacted = (text.match(PLACEHOLDER_RE) ?? []).length;
-    if (nowRedacted < origRedacted) warnings.push(`${origRedacted - nowRedacted} redacted secret line(s) were removed or changed; that secret will be deleted from the file.`);
+    if (nowRedacted < origRedacted) warnings.push(`${origRedacted - nowRedacted} redacted secret or hidden comment line(s) were removed or changed; they will be deleted from the file.`);
     return { errors, warnings };
   }, [text, original]);
 
@@ -135,7 +135,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
       <ConfirmDialog open={!!confirm && typeof confirm === 'object'} onClose={() => setConfirm(null)} onConfirm={() => typeof confirm === 'object' && confirm && restore(confirm.restore)} busy={busy} danger title="Restore this backup?" confirmLabel="Restore and restart"
         body={confirm && typeof confirm === 'object' ? <>The current file is backed up, <span className="mono">{confirm.restore.id}</span> is reinstalled and the daemon restarted, with the same automatic rollback.</> : null} />
       <Modal open={!!viewBackup} onClose={() => setViewBackup(null)} title={`Backup ${viewBackup?.id ?? ''} vs current`} width="max-w-4xl">
-        {viewBackup && <div className="max-h-[70vh] overflow-auto rounded-lg border border-line">{viewBackup.yaml === original ? <Empty>Identical to the current file.</Empty> : <DiffView lines={lineDiff(viewBackup.yaml, original)} labels={['backup', 'current']} />}</div>}
+        {viewBackup && <div className="max-h-[70vh] overflow-auto rounded-lg border border-line">{viewBackup.yaml.replace(/\r\n/g, '\n') === original ? <Empty>Identical to the current file.</Empty> : <DiffView lines={lineDiff(viewBackup.yaml.replace(/\r\n/g, '\n'), original)} labels={['backup', 'current']} />}</div>}
       </Modal>
     </div>
   );
