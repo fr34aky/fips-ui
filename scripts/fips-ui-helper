@@ -223,9 +223,9 @@ take_lock() {
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
 # secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
 # character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret of 8+
-# characters, or
-# holds an nsec or 64-hex key (alone or wrapped over consecutive comment lines) is shown as
-# "# <redacted comment #N>". Anything else is refused (exit 3, reasons on stderr), and so is a file where a
+# characters, or holds an nsec or 64-hex key (alone or wrapped over consecutive comment lines: every line
+# holding part of it) is shown as "# <redacted comment #N>". A secret line commented out in the editor
+# ('# nsec: "<redacted #1>"') gets its value back inside the comment, which then stays hidden. Anything else is refused (exit 3, reasons on stderr), and so is a file where a
 # secret of 8+ characters also appears in another value (npub included), anchor, tag or directive (keys only
 # as long copies), or an nsec or 64-hex value sits outside a secret key (hex public keys under npub are
 # allowed). Shorter secrets are redacted in place only. Restore requires each placeholder to be a whole scalar
@@ -271,6 +271,7 @@ BREAK = re.compile(r'\r\n|[\r\n\x85\u2028\u2029]')
 RUN_GAP = re.compile('(?:' + BREAK.pattern + r')[ \t]*')
 PLACEHOLDERS = re.compile(r'"<redacted #\d+>"|# <redacted comment #\d+>')
 PH = re.compile(r'<redacted #(\d+)>')
+COMMENTED = re.compile(r'^(#\s*(?:-\s+)?)([^:#"\']+|"[^"]*"|\'[^\']*\')\s*:\s*("<redacted #(\d+)>")\s*$')
 CPH = re.compile(r'^#\s*<redacted comment #(\d+)>\s*$')
 SAFE_TAGS = {'tag:yaml.org,2002:str', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:null'}
 Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
@@ -499,10 +500,19 @@ def comment_runs(text, spans):
     return runs
 
 def sensitive_comment(c, forms):
-    """forms: [(form, squashed form)] of at least MIN_COPY characters (like copies in values; a hidden comment
-    blocks changing its secret, so ordinary short words must not hide comments)."""
-    q = squash(c)
-    return bool(KEYED.search(c) or key_material(c) or any(f in c or sq in q for f, sq in forms))
+    """A single comment that names a secret key or quotes a secret form. Key material and wrapped forms are found by
+    hidden_windows, which also covers single lines."""
+    return bool(KEYED.search(c) or any(f in c for f, _ in forms))
+
+def copy_forms(forms):
+    """[(form, squashed form or '')] for the forms of at least MIN_COPY characters; the squashed form (for copies
+    wrapped over lines) only where it is itself that long."""
+    out = []
+    for f in forms:
+        if len(f.strip()) >= MIN_COPY:
+            q = squash(f)
+            out.append((f, q if len(q) >= MIN_COPY else ''))
+    return out
 
 def hidden_windows(text, run, forms):
     """Lines of a comment run that reveal key material or a secret only when joined (a key wrapped over lines).
@@ -514,14 +524,27 @@ def hidden_windows(text, run, forms):
         joined.append(q); owner.extend([k] * len(q))
     q = ''.join(joined)
     hits = set()
-    matches = [(m.start(), m.end()) for rx in (NSEC, HEXRUN) for m in rx.finditer(q)]
+    # (start, end, characters a whole key needs: 63 for a bech32 nsec, 64 for hex, 0 for an exact secret form)
+    matches = [(m.start(), m.end(), need) for rx, need in ((NSEC, 63), (HEXRUN, 64)) for m in rx.finditer(q)]
     for _, s in forms:
+        if not s:
+            continue
         start = q.find(s)
         while start >= 0:
-            matches.append((start, start + len(s)))
+            matches.append((start, start + len(s), 0))
             start = q.find(s, start + 1)
-    for a, b in matches:
-        hits.update(owner[a:b])
+    # A greedy match can run into a neighbouring line whose words happen to be hex or bech32 letters ("# added a
+    # new one"). An edge line stays visible when the rest of the match still holds a whole key without it.
+    for a, b, need in matches:
+        lines = owner[a:b]
+        keep = set(lines)
+        left = len(lines)
+        if need and lines[0] != lines[-1]:
+            for edge in (lines[-1], lines[0]):
+                c = lines.count(edge)
+                if left - c >= need:
+                    keep.discard(edge); left -= c
+        hits.update(keep)
     return [run[k] for k in sorted(hits)]
 
 def redact_text(text):
@@ -538,7 +561,7 @@ def redact_text(text):
         raw = text[v.start_mark.index:v.end_mark.index]
         decoded.append(f)
         spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
-    forms_all = [(f, q) for f, q in ((f, squash(f)) for f in set().union(*spelled)) if len(q) >= MIN_COPY] if spelled else []
+    forms_all = copy_forms(set().union(*spelled)) if spelled else []
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
     spans, names = scan(text)
     hide = {s for s in spans if sensitive_comment(text[s[0]:s[1]], forms_all)}
@@ -566,12 +589,11 @@ def redact_text(text):
     bare = PLACEHOLDERS.sub('', splice(blank, edits))
     qbare = squash(bare)
     for (_, name, v), mine, spell in zip(found, decoded, spelled):
-        mine = [(f, q) for f, q in ((f, squash(f)) for f in mine) if len(q) >= MIN_COPY]
-        spell = [(f, q) for f, q in ((f, squash(f)) for f in spell) if len(q) >= MIN_COPY]
-        if (any(f in x or sq in qx for f, sq in mine for x, qx in values)
+        mine, spell = copy_forms(mine), copy_forms(spell)
+        if (any(f in x or (sq and sq in qx) for f, sq in mine for x, qx in values)
                 or any(len(f) >= 12 and f in x.value for f, _ in mine for x in keytexts)
                 or any(f in n for f, _ in spell for n in names)
-                or any(f in bare or sq in qbare for f, sq in spell)):
+                or any(f in bare or (sq and sq in qbare) for f, sq in spell)):
             raise Refuse(f'the value of {name} also appears elsewhere in the file (another value, anchor or tag)')
     if key_material(bare):
         raise Refuse('an nsec or 64-character hex value (possibly a private key) appears outside a secret key')
@@ -654,10 +676,20 @@ def restore(orig_path, new_path, base):
             edits.append((n.start_mark.index, n.end_mark.index, otext[ov.start_mark.index:ov.end_mark.index]))
     if nroot is not None:
         walk(nroot, [], None, set())
-    if len(PH.findall(ntext)) != placeholder_nodes:
+    if len(PH.findall(ntext)) != placeholder_nodes + sum(1 for a, b in scan(ntext)[0] if COMMENTED.match(ntext[a:b])):
         raise Refuse('a redaction placeholder appears somewhere other than as a whole value (a comment, key or longer string)')
     cused, cfound = set(), 0
     for a, b in scan(ntext)[0]:
+        # A secret line commented out ('# nsec: "<redacted #1>"'): its value is put back inside the comment, which
+        # names the secret key and so stays hidden.
+        cm = COMMENTED.match(ntext[a:b])
+        if cm:
+            i = int(cm.group(4))
+            if i < 1 or i > len(orig) or cm.group(2).strip('\'"').strip().lower() != orig[i - 1][1]:
+                raise Refuse(f'a commented-out placeholder #{i} must stay under its own key ({orig[i - 1][1] if 0 < i <= len(orig) else "unknown"})')
+            ov = orig[i - 1][2]
+            edits.append((a + cm.start(3), a + cm.end(3), otext[ov.start_mark.index:ov.end_mark.index]))
+            continue
         m = CPH.match(ntext[a:b])
         if not m:
             continue
