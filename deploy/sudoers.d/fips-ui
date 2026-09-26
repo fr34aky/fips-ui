@@ -1,0 +1,5 @@
+# Allow the FIPS UI backend user to run the upgrade helper without a password.
+# Installed by deploy/install-upgrade-helper.sh, which substitutes @UI_USER@.
+# The helper is the only root-capable path the UI has; keep this list to one user.
+Defaults!/usr/local/libexec/fips-ui-helper !requiretty
+@UI_USER@ ALL=(root) NOPASSWD: /usr/local/libexec/fips-ui-helper

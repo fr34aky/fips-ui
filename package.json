@@ -1,0 +1,16 @@
+{
+  "name": "fips-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web dashboard to watch and manage a FIPS mesh node",
+  "engines": { "node": ">=22.6" },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node --watch server/index.ts",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm --prefix web run build",
+    "start": "node server/index.ts",
+    "install:all": "npm --prefix web install"
+  }
+}

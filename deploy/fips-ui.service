@@ -1,0 +1,33 @@
+# systemd unit for the FIPS web UI.
+#   sudo cp deploy/fips-ui.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fips-ui
+# Runs as a dedicated unprivileged user that is a member of the "fips" group
+# (that group owns the control socket). Adjust WorkingDirectory/User to taste.
+[Unit]
+Description=FIPS mesh node web UI
+After=network.target fips.service
+Wants=fips.service
+
+[Service]
+Type=simple
+User=fips-ui
+Group=fips
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/opt/fips-ui
+ExecStart=/usr/bin/node server/index.ts
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=FIPS_UI_HOST=127.0.0.1
+Environment=FIPS_UI_PORT=8321
+# Optional hardening knobs; see README.
+#Environment=FIPS_UI_TOKEN=change-me
+#Environment=FIPS_UI_READ_ONLY=1
+#Environment=FIPS_UI_ALLOW_SERVICE_CONTROL=1
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

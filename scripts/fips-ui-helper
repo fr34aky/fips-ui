@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# fips-ui-helper — the only privileged part of the FIPS UI upgrade flow.
+# Linux (systemd / OpenRC), macOS (launchd) and FreeBSD (rc.d).
+#
+# Installed root-owned at /usr/local/libexec/fips-ui-helper and reachable by
+# the UI user through a single NOPASSWD sudoers rule (deploy/sudoers.d/fips-ui).
+# The web backend stages binaries (or a release .pkg) as an unprivileged user;
+# this script does the root-only steps: back up, swap the binaries (or run the
+# native package installer), restart the service.
+#
+# Commands:
+#   check                          -> {"ok":true,"version":2,...}
+#   install <stagedir> [--no-restart]
+#   rollback <backup-id>
+#   restart
+#   list-backups
+#
+# Environment overrides (also honoured under sudo only if the sudoers rule
+# passes them; the defaults are chosen per OS):
+#   FIPS_BIN_DIR, FIPS_UI_BACKUPS, FIPS_SERVICE, FIPS_GATEWAY_SERVICE
+#
+# Anyone allowed to run "install" can place arbitrary root binaries — that is
+# inherent to what an upgrade is. Restrict the sudoers rule to the UI user.
+
+set -euo pipefail
+umask 022
+
+HELPER_VERSION=2
+OS=$(uname -s)
+BINARIES=(fips fipsctl fipstop fips-gateway)
+
+case "$OS" in
+  Darwin)
+    BIN_DIR_DEFAULT=/usr/local/bin
+    BACKUPS_DEFAULT=/usr/local/var/fips-ui/backups
+    SERVICE_DEFAULT=com.fips.daemon
+    GATEWAY_DEFAULT=com.fips.gateway
+    ;;
+  FreeBSD)
+    BIN_DIR_DEFAULT=/usr/local/bin
+    BACKUPS_DEFAULT=/var/db/fips-ui/backups
+    SERVICE_DEFAULT=fips
+    GATEWAY_DEFAULT=fips_gateway
+    ;;
+  *)
+    BIN_DIR_DEFAULT=/usr/bin
+    [[ -x /usr/bin/fips || ! -x /usr/local/bin/fips ]] || BIN_DIR_DEFAULT=/usr/local/bin
+    BACKUPS_DEFAULT=/var/lib/fips-ui/backups
+    SERVICE_DEFAULT=fips
+    GATEWAY_DEFAULT=fips-gateway
+    ;;
+esac
+
+BIN_DIR=${FIPS_BIN_DIR:-$BIN_DIR_DEFAULT}
+BACKUPS_DIR=${FIPS_UI_BACKUPS:-$BACKUPS_DEFAULT}
+SERVICE=${FIPS_SERVICE:-$SERVICE_DEFAULT}
+GATEWAY_SERVICE=${FIPS_GATEWAY_SERVICE:-$GATEWAY_DEFAULT}
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+# Minimal JSON string escaper (no python dependency).
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/}
+  printf '"%s"' "$s"
+}
+
+# Root is required for real installs. FIPS_UI_HELPER_TEST=1 allows exercising
+# the file logic as a normal user against a private FIPS_BIN_DIR with
+# FIPS_SERVICE=none (used by the test suite; never set this in sudoers).
+if [[ $(id -u) -ne 0 ]]; then
+  [[ ${FIPS_UI_HELPER_TEST:-0} == 1 && -n ${FIPS_BIN_DIR:-} && ${FIPS_SERVICE:-} == none ]] || die "must run as root (via sudo)"
+fi
+
+# ---------------------------------------------------------------- service mgr
+detect_service_manager() {
+  if [[ "$OS" == Darwin ]]; then echo launchd
+  elif [[ "$OS" == FreeBSD ]]; then echo rc
+  elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then echo systemd
+  elif command -v rc-service >/dev/null 2>&1; then echo openrc
+  elif [[ -x /etc/init.d/fips ]]; then echo sysv
+  else echo none; fi
+}
+SM=$(detect_service_manager)
+[[ "$SERVICE" == none ]] && SM=none
+
+svc_exists() {
+  case "$SM" in
+    systemd) systemctl cat "$1" >/dev/null 2>&1 ;;
+    launchd) launchctl print "system/$1" >/dev/null 2>&1 || [[ -f "/Library/LaunchDaemons/$1.plist" ]] ;;
+    rc)      service "$1" status >/dev/null 2>&1 || [[ -x "/usr/local/etc/rc.d/$1" ]] ;;
+    openrc)  rc-service -e "$1" ;;
+    sysv)    [[ -x "/etc/init.d/$1" ]] ;;
+    *) return 1 ;;
+  esac
+}
+svc_active() {
+  case "$SM" in
+    systemd) systemctl is-active --quiet "$1" ;;
+    launchd) launchctl print "system/$1" 2>/dev/null | grep -q 'state = running' ;;
+    rc)      service "$1" status >/dev/null 2>&1 ;;
+    openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
+    sysv)    "/etc/init.d/$1" status >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+svc_restart() {
+  case "$SM" in
+    systemd) systemctl restart "$1" ;;
+    launchd) launchctl kickstart -k "system/$1" ;;
+    rc)      service "$1" restart ;;
+    openrc)  rc-service "$1" restart ;;
+    sysv)    "/etc/init.d/$1" restart ;;
+    *) return 1 ;;
+  esac
+}
+
+restart_services() {
+  local restarted=false
+  if svc_exists "$SERVICE"; then
+    log "restarting $SERVICE ($SM)"
+    svc_restart "$SERVICE" && restarted=true
+  else
+    log "warning: service $SERVICE not found under $SM; not restarted"
+  fi
+  if svc_active "$GATEWAY_SERVICE"; then
+    log "restarting $GATEWAY_SERVICE"
+    svc_restart "$GATEWAY_SERVICE" || log "warning: $GATEWAY_SERVICE restart failed"
+  fi
+  printf '%s' "$restarted"
+}
+
+# ---------------------------------------------------------------- helpers
+current_version() { "$BIN_DIR/fips" --version 2>/dev/null | head -n 1 || echo "unknown"; }
+ensure_backups_dir() { mkdir -p "$BACKUPS_DIR"; chmod 0755 "$BACKUPS_DIR"; }
+runs() { "$1" --version >/dev/null 2>&1; }   # portable "is this a working executable" (ELF or Mach-O)
+
+do_backup() {
+  ensure_backups_dir
+  local ver id dir d
+  ver=$(current_version | sed -E 's/^fips +//; s/[^A-Za-z0-9._-]+/_/g')
+  id="$(date +%Y%m%d-%H%M%S)_${ver:-unknown}"
+  dir="$BACKUPS_DIR/$id"
+  local i=1; while [[ -e "$dir" ]]; do i=$((i + 1)); dir="$BACKUPS_DIR/${id}-$i"; done; id=$(basename "$dir")
+  mkdir -p "$dir"
+  for b in "${BINARIES[@]}"; do
+    [[ -f "$BIN_DIR/$b" ]] && cp -p "$BIN_DIR/$b" "$dir/$b"
+  done
+  current_version > "$dir/VERSION"
+  chmod -R a+rX "$dir"
+  log "backed up current binaries to $dir"
+  # keep the 10 most recent backups (portable: no xargs -r)
+  local n=0
+  for d in $(ls -1dt "$BACKUPS_DIR"/*/ 2>/dev/null); do
+    n=$((n + 1)); [[ $n -gt 10 ]] && rm -rf -- "$d"
+  done
+  printf '%s' "$id"
+}
+
+install_binaries() {
+  local src=$1 installed=() f
+  for b in "${BINARIES[@]}"; do
+    f="$src/$b"
+    [[ -e "$f" ]] || continue
+    [[ -L "$f" ]] && die "refusing symlink $f"
+    [[ -f "$f" ]] || die "$f is not a regular file"
+    runs "$f" || die "$f does not execute (--version failed)"
+    if [[ $(id -u) -eq 0 ]]; then install -m 0755 -o 0 -g 0 "$f" "$BIN_DIR/.$b.new"; else install -m 0755 "$f" "$BIN_DIR/.$b.new"; fi
+    mv -f "$BIN_DIR/.$b.new" "$BIN_DIR/$b"
+    installed+=("$b")
+  done
+  [[ ${#installed[@]} -gt 0 ]] || die "nothing to install in $src"
+  log "installed: ${installed[*]}"
+}
+
+install_package() {
+  local pkg=$1
+  case "$OS" in
+    Darwin)  log "installer -pkg $pkg -target /"; installer -pkg "$pkg" -target / ;;
+    FreeBSD) log "pkg add -f $pkg"; pkg add -f "$pkg" ;;
+    *) die "package artifacts are not supported on $OS" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- commands
+cmd=${1:-}
+case "$cmd" in
+  check)
+    ensure_backups_dir
+    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s}\n' \
+      "$HELPER_VERSION" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
+      "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")"
+    ;;
+
+  install)
+    stage=${2:-}
+    [[ -n "$stage" ]] || die "usage: install <stagedir> [--no-restart]"
+    [[ "$stage" == /* ]] || die "stage dir must be an absolute path"
+    [[ -d "$stage" ]] || die "stage dir $stage does not exist"
+    no_restart=false; [[ "${3:-}" == "--no-restart" ]] && no_restart=true
+    log "current: $(current_version)"
+    backup_id=$(do_backup)
+    if [[ -f "$stage/PACKAGE" ]]; then
+      pkgfile="$stage/$(head -n 1 "$stage/PACKAGE")"
+      [[ -f "$pkgfile" ]] || die "package file $pkgfile missing"
+      install_package "$pkgfile"
+      newver=$(current_version)
+    else
+      [[ -f "$stage/fips" ]] || die "$stage/fips missing"
+      runs "$stage/fips" || die "staged fips does not run"
+      newver=$("$stage/fips" --version 2>&1 | head -n 1)
+      log "new:     $newver"
+      install_binaries "$stage"
+    fi
+    restarted=false
+    if ! $no_restart; then restarted=$(restart_services); fi
+    printf '{"ok":true,"backup_id":%s,"installed_version":%s,"restarted":%s}\n' \
+      "$(json_escape "$backup_id")" "$(json_escape "$newver")" "$restarted"
+    ;;
+
+  rollback)
+    id=${2:-}
+    [[ "$id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || die "invalid backup id"
+    dir="$BACKUPS_DIR/$id"
+    [[ -d "$dir" && -f "$dir/fips" ]] || die "backup $id not found"
+    log "rolling back to $id ($(cat "$dir/VERSION" 2>/dev/null || echo '?'))"
+    pre=$(do_backup)
+    install_binaries "$dir"
+    restarted=$(restart_services)
+    printf '{"ok":true,"restored":%s,"pre_rollback_backup":%s,"restarted":%s}\n' \
+      "$(json_escape "$id")" "$(json_escape "$pre")" "$restarted"
+    ;;
+
+  restart)
+    restarted=$(restart_services)
+    printf '{"ok":true,"restarted":%s}\n' "$restarted"
+    ;;
+
+  list-backups)
+    ensure_backups_dir
+    printf '['
+    first=true
+    for d in $(ls -1dt "$BACKUPS_DIR"/*/ 2>/dev/null); do
+      id=$(basename "$d")
+      $first || printf ','
+      first=false
+      printf '{"id":%s,"version":%s}' "$(json_escape "$id")" "$(json_escape "$(cat "$d/VERSION" 2>/dev/null || echo '')")"
+    done
+    printf ']\n'
+    ;;
+
+  *)
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups}"
+    ;;
+esac
