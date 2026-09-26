@@ -48,7 +48,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
     try {
       const res = await api.post<SaveResponse>('/api/access', draft);
       setDraft(res.config); setLastFw(res.firewall); r.refresh();
-      toast(res.firewall.ok ? 'ok' : 'info', res.firewall.ok ? 'Access saved; firewall rule updated' : `Access saved; firewall: ${res.firewall.skipped ?? res.firewall.error}`);
+      toast(res.firewall.ok ? 'ok' : 'info', res.firewall.ok ? 'Access saved; guard and firewall rule updated' : `Access saved; ${res.firewall.skipped ?? res.firewall.guard ?? res.firewall.rule ?? 'not fully applied yet'}`);
     } catch (x) { toast('err', (x as Error).message); }
     finally { setBusy(false); }
   };
