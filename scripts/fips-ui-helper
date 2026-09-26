@@ -222,7 +222,8 @@ take_lock() {
 
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
 # secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
-# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret value, or
+# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret of 8+
+# characters, or
 # holds an nsec or 64-hex key (alone or wrapped over consecutive comment lines) is shown as
 # "# <redacted comment #N>". Anything else is refused (exit 3, reasons on stderr), and so is a file where a
 # secret of 8+ characters also appears in another value (npub included), anchor, tag or directive (keys only
@@ -256,7 +257,6 @@ MODE = sys.argv[1]
 NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
 # In text with whitespace and '#' removed a key can touch hex letters of neighbouring words: any run of 64+.
 HEXRUN = re.compile(r'[0-9a-fA-F]{64,}')
-HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
 # Copies of a secret elsewhere in the file are detected for values of at least this many characters. Shorter
 # ones ("tor", "control", "fips") are ordinary words of this configuration; they are redacted where they are
 # set, but the same word elsewhere is not treated as a copy (that would lock the editor on normal files).
@@ -321,7 +321,7 @@ def squash(s):
 
 def key_material(s):
     """An nsec or a 64-hex key anywhere in s, even wrapped over several lines or next to other hex letters."""
-    return bool(NSEC.search(s) or HEXKEY.search(s) or squashed_key_material(squash(s)))
+    return squashed_key_material(squash(s))
 
 def squashed_key_material(q):
     return bool(NSEC.search(q) or HEXRUN.search(q))
@@ -505,33 +505,24 @@ def sensitive_comment(c, forms):
     return bool(KEYED.search(c) or key_material(c) or any(f in c or sq in q for f, sq in forms))
 
 def hidden_windows(text, run, forms):
-    """Groups of consecutive comment lines that reveal key material or a secret only when joined (a key wrapped
-    over lines), whatever else hides some of them. Only minimal groups: neither end can be dropped. A match spans
-    at most `limit` squashed characters, so the inner lines of a group are bounded and the search is linear."""
-    sq = [squash(text[a:b]) for a, b in run]
-    limit = max([90] + [len(s) for _, s in forms])
-    def sens(i, j):
-        q = ''.join(sq[i:j + 1])
-        return squashed_key_material(q) or any(s in q for _, s in forms)
-    out = []
-    for i in range(len(run)):
-        inner = 0
-        for j in range(i + 1, len(run)):
-            if sens(i, j):
-                if not sens(i + 1, j) and not sens(i, j - 1):
-                    out.extend(run[i:j + 1])
-                break
-            inner += len(sq[j])
-            if inner > limit:
-                break
-    return out
-
-def appears(form, text):
-    """Substring for values of 6+ characters; for shorter ones a whole-token match (avoids refusing a file because
-    'red' or '80' occurs somewhere)."""
-    if len(form) >= 6:
-        return form in text
-    return re.search(r'(?<![A-Za-z0-9_])' + re.escape(form) + r'(?![A-Za-z0-9_])', text) is not None
+    """Lines of a comment run that reveal key material or a secret only when joined (a key wrapped over lines).
+    The squashed lines are joined once and searched; every line a match touches is hidden, so a greedy nsec match
+    covers all of a wrapped key even when its first line is sensitive on its own. Linear in the run's length."""
+    joined, owner = [], []
+    for k, (a, b) in enumerate(run):
+        q = squash(text[a:b])
+        joined.append(q); owner.extend([k] * len(q))
+    q = ''.join(joined)
+    hits = set()
+    matches = [(m.start(), m.end()) for rx in (NSEC, HEXRUN) for m in rx.finditer(q)]
+    for _, s in forms:
+        start = q.find(s)
+        while start >= 0:
+            matches.append((start, start + len(s)))
+            start = q.find(s, start + 1)
+    for a, b in matches:
+        hits.update(owner[a:b])
+    return [run[k] for k in sorted(hits)]
 
 def redact_text(text):
     """-> (redacted text, secrets found, original texts of the redacted comments). Raises Refuse if unsafe."""
@@ -547,7 +538,7 @@ def redact_text(text):
         raw = text[v.start_mark.index:v.end_mark.index]
         decoded.append(f)
         spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
-    forms_all = [(f, squash(f)) for f in set().union(*spelled) if len(f.strip()) >= MIN_COPY] if spelled else []
+    forms_all = [(f, q) for f, q in ((f, squash(f)) for f in set().union(*spelled)) if len(q) >= MIN_COPY] if spelled else []
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
     spans, names = scan(text)
     hide = {s for s in spans if sensitive_comment(text[s[0]:s[1]], forms_all)}
@@ -575,8 +566,8 @@ def redact_text(text):
     bare = PLACEHOLDERS.sub('', splice(blank, edits))
     qbare = squash(bare)
     for (_, name, v), mine, spell in zip(found, decoded, spelled):
-        mine = [(f, squash(f)) for f in mine if len(f.strip()) >= MIN_COPY]
-        spell = [(f, squash(f)) for f in spell if len(f.strip()) >= MIN_COPY]
+        mine = [(f, q) for f, q in ((f, squash(f)) for f in mine) if len(q) >= MIN_COPY]
+        spell = [(f, q) for f, q in ((f, squash(f)) for f in spell) if len(q) >= MIN_COPY]
         if (any(f in x or sq in qx for f, sq in mine for x, qx in values)
                 or any(len(f) >= 12 and f in x.value for f, _ in mine for x in keytexts)
                 or any(f in n for f, _ in spell for n in names)
