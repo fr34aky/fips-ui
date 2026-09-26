@@ -343,7 +343,10 @@ export function createAdminHandler(opts: AdminOptions) {
       if (current.invalid) throw new Error(`${MANAGED_DROPIN}.nft has ${current.invalid} rule definition(s) that no longer validate; fix them on the Firewall page first so they are not lost`);
       const next = mutate(current.rules).map(validateRule);
       if (next.length === 0) return managed ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false };
-      return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(next));
+      const content = await renderManagedDropin(next);
+      // Unchanged rules need no write and no firewall reload.
+      if (managed && managed.content === content) return { ok: true, reloaded: false, unchanged: true };
+      return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], content);
     });
   }
 

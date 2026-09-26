@@ -83,8 +83,8 @@ function browserChecks(req: Req, method: string, via: 'local' | 'mesh'): string 
   const origin = req.headers.origin;
   if (origin && origin !== 'null') {
     if (via === 'mesh') {
-      // Any .fips name is a valid Host, so Origin must be exactly this request's own origin (same host and port):
-      // a page served by another mesh node cannot post here.
+      // Several names are valid Hosts (address, <npub>.fips, hosts-file aliases), so Origin must be exactly this
+      // request's own origin (same host and port): a page served by another mesh node cannot post here.
       let same = false;
       try { same = new URL(origin).host.toLowerCase() === String(req.headers.host ?? '').toLowerCase(); } catch { /* invalid origin */ }
       if (!same) return `cross-origin request from ${origin} refused`;
@@ -404,7 +404,7 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   // Mesh identities are admitted on the mesh listener only. With mesh access on, an fd00::/8 source on the main
   // listener is refused (it would bypass the guard, which covers the mesh port); with it off such sources are
   // what they were before this feature existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN).
-  if (listener === 'main' && isMeshAddress(remote) && mesh.config.enabled) return denyMesh(req, res, 'use the mesh address and port for access over the mesh');
+  if (listener === 'main' && isMeshAddress(remote) && mesh.meshSourcesReserved) return denyMesh(req, res, 'use the mesh address and port for access over the mesh');
   if (listener === 'mesh') {
     if (!isMeshAddress(remote)) return denyMesh(req, res, 'not a mesh connection');
     // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
@@ -484,6 +484,8 @@ function syncMesh(): Promise<MeshSyncResult> {
     meshSync.dirty = false;
     const cfg: AccessConfig = mesh.config;
     const helper = await admin.helperInfo().catch(() => null);
+    // Nothing to load or remove without the helper while access is off (a helper that never ran cannot have loaded a guard).
+    if (!helper?.managementCapable && !cfg.enabled) return { ok: true, skipped: 'helper not installed' };
     if (!helper?.managementCapable) {
       mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
       meshSync.dirty = true;
@@ -500,6 +502,8 @@ function syncMesh(): Promise<MeshSyncResult> {
     // A guard already confirmed for exactly these ports and this interface is left alone (no reload): the
     // per-connection canary and the 30 s check notice if it disappears.
     const confirmed = !!ports && mesh.guard.active && mesh.guard.tun === tun && samePorts(mesh.guard.ports, ports);
+    // Changing an active guard: stop admitting first, so nothing is admitted on a port while the kernel covers another.
+    if (!confirmed && mesh.guard.active) mesh.setGuard({ active: false, ports: [], error: 'reloading the guard' });
     if (confirmed) {
       meshGuardDirty = false;
     } else try {
@@ -521,13 +525,13 @@ function syncMesh(): Promise<MeshSyncResult> {
 
 /** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
 function reapplyGuard(): Promise<MeshSyncResult> {
-  // If a sync is running it applies the guard itself; only re-apply afterwards if the guard is still not right.
   // After a running sync, re-apply only if the guard is still not right for the current ports and interface.
   if (meshSync.running) return meshSync.running.then(() => (mesh.guard.active && mesh.guard.tun === mesh.tunName && samePorts(mesh.guard.ports, guardPorts(mesh.config)) ? { ok: true } : reapplyGuard()));
   meshSync.running = (async (): Promise<MeshSyncResult> => {
     if (!mesh.config.enabled) return { ok: true };
-    if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); return { ok: false, guard: 'no canary' }; }
+    if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); meshGuardDirty = true; return { ok: false, guard: 'no canary' }; }
     const want = guardPorts(mesh.config), tun = mesh.tunName;
+    if (mesh.guard.active && !(mesh.guard.tun === tun && samePorts(mesh.guard.ports, want))) mesh.setGuard({ active: false, ports: [], error: 'reloading the guard' });
     const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
     if (g.ok && tun === mesh.tunName) mesh.setGuard({ active: true, ports: want, tun }, { reloaded: true });
     else { mesh.setGuard({ active: false, ports: [], error: g.ok ? 'interface changed while applying' : g.error }); meshGuardDirty = true; }
@@ -560,10 +564,13 @@ function verifyGuard(): Promise<unknown> {
 let meshGuardDirty = false;
 let meshRuleDirty = false;
 
-/** Retry only the managed firewall rule (the guard is fine). */
-async function syncRule(): Promise<void> {
-  if (meshSync.running) return;
-  try { meshRuleDirty = !(await applyMeshRule(mesh.config)).ok; } catch { meshRuleDirty = true; }
+/** Retry only the managed firewall rule (the guard is fine), in the same slot as the other syncs. */
+function syncRule(): Promise<unknown> {
+  if (meshSync.running) return Promise.resolve();
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    try { const r = await applyMeshRule(mesh.config); meshRuleDirty = !r.ok; return { ok: !!r.ok }; } catch (e) { meshRuleDirty = true; return { ok: false, rule: (e as Error).message }; }
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
 }
 mesh.onChange = async () => { meshSync.dirty = true; };
 mesh.onTunChange = () => { meshGuardDirty = true; };

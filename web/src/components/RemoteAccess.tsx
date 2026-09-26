@@ -53,7 +53,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
     finally { setBusy(false); }
   };
 
-  const urls = st.address ? [`http://[${st.address}]:${draft.port}`, ...(st.npub ? [`http://${st.npub}.fips:${draft.port}`] : [])] : [];
+  const urls = st.address ? [`http://[${st.address}]:${saved.port}`, ...(st.npub ? [`http://${st.npub}.fips:${saved.port}`] : [])] : [];
 
   return (
     <Card title="Web UI over the mesh" hint="Other FIPS nodes can open this dashboard at this node's mesh address. The npub of each connection is established by the mesh itself, so there is no password: only the npubs listed here get in."

@@ -21,7 +21,7 @@
 import http from 'node:http';
 import net, { type Socket } from 'node:net';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expand6, isMeshAddress as isMeshSource } from './net6.ts';
 import { query } from './control.ts';
@@ -39,6 +39,18 @@ export const LOCAL: Principal = { kind: 'local', role: 'admin' };
 const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'access.json');
 
 export class AccessError extends Error {}
+
+/** Every address configured on this host's interfaces (expanded), re-read at most once a second. */
+let localCache: { at: number; set: Set<string> } | null = null;
+function localAddresses(): Set<string> {
+  const now = performance.now();
+  if (!localCache || now - localCache.at > 1000) {
+    const set = new Set<string>();
+    for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) { const k = a.family === 'IPv6' ? expand6(a.address.split('%')[0]) : null; if (k) set.add(k); }
+    localCache = { at: now, set };
+  }
+  return localCache.set;
+}
 
 export { expand6 };
 
@@ -189,6 +201,12 @@ export class MeshAccess {
   /** Called when the daemon reports a different TUN name, so the guard is re-applied for it. */
   onTunChange: () => void = () => {};
 
+  /**
+   * Whether the main listener must refuse fd00::/8 sources: while mesh access is on, and while access.json has
+   * not loaded (it may turn mesh access on, so the main listener must not admit mesh sources meanwhile).
+   */
+  get meshSourcesReserved(): boolean { return this.config.enabled || !this.loaded; }
+
   /** Whether admission is possible at all right now (false while the guard or the node's identity is missing). */
   ready(): boolean { return this.config.enabled && this.guard.active && !!this.own && this.guard.tun === this.tun; }
 
@@ -198,10 +216,10 @@ export class MeshAccess {
    */
   principalFor(remote: string | undefined): Principal | null {
     // Without the node's own identity the own address cannot be excluded, so nobody is admitted until it is known.
-    if (!this.config.enabled || !this.guard.active || !this.own || this.guard.tun !== this.tun) return null;
+    if (!this.ready()) return null;
     const key = remote ? expand6(remote) : null;
-    // This node's own address arrives over lo from any local process; it must never act as an npub.
-    if (!key || key === expand6(this.own.address)) return null;
+    // This node's own addresses arrive over lo from any local process; they must never act as an npub.
+    if (!key || key === expand6(this.own!.address) || localAddresses().has(key)) return null;
     const e = this.byAddress.get(key);
     if (!e || e.npub === this.own.npub) return null;
     return { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address };
