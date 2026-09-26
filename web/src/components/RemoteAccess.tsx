@@ -96,7 +96,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
-        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v3): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
+        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v4): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 
         {!readOnly && (
           <div className="flex justify-end gap-2">

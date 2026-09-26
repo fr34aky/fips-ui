@@ -335,7 +335,10 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access') {
     try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
-    const firewall = await syncMesh();
+    // A sync already in flight was built from the previous list: wait for it, then run one for this save.
+    await meshSync.running?.catch(() => {});
+    meshSync.dirty = true;
+    const firewall = await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
     await mesh.reconcile();
     return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
   }
@@ -386,9 +389,14 @@ async function route(req: Req, res: Res) {
  */
 async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<void> {
   const remote = req.socket.remoteAddress;
-  if (isMeshAddress(remote)) {
+  // A connection that is already gone reports no address; never attribute that to anyone.
+  if (!remote) return denyMesh(req, res, 'unknown peer address');
+  // With mesh access off, fd00::/8 sources on the main listener are whatever they were before this feature
+  // existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN); with it on they are mesh identities.
+  if (isMeshAddress(remote) && (listener === 'mesh' || mesh.config.enabled)) {
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
+    if (!(await mesh.proveGuard(req.socket))) return denyMesh(req, res, 'the spoofing guard is not loaded right now; try again in a few seconds');
     mesh.track(req.socket, pr);
     principals.set(req, pr);
   } else if (listener === 'mesh') {
@@ -439,6 +447,10 @@ const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) =
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 type MeshSyncResult = { ok: boolean; guard?: string; rule?: string; skipped?: string };
 const meshSync = { dirty: true, running: null as Promise<MeshSyncResult> | null };
+function guardPorts(cfg: AccessConfig): number[] { return [...new Set([cfg.port, ...(LOOPBACK_HOSTS.has(HOST) ? [] : [PORT])])]; }
+const samePorts = (a: number[], b: number[]) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+
+/** Full sync after a change: guard and managed firewall rule. */
 function syncMesh(): Promise<MeshSyncResult> {
   if (meshSync.running) return meshSync.running;
   meshSync.running = (async (): Promise<MeshSyncResult> => {
@@ -446,18 +458,22 @@ function syncMesh(): Promise<MeshSyncResult> {
     const cfg: AccessConfig = mesh.config;
     const helper = await admin.helperInfo().catch(() => null);
     if (!helper?.managementCapable) {
-      mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper (v3), which installs the spoofing guard' });
+      mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
       meshSync.dirty = true;
-      return { ok: false, skipped: 'helper v3 not installed' };
+      return { ok: false, skipped: 'helper not installed' };
     }
-    // Guard every port that could see an fd00::/8 source: the mesh port, and the main port if it is not loopback-only.
-    const ports = cfg.enabled ? [...new Set([cfg.port, ...(LOOPBACK_HOSTS.has(HOST) ? [] : [PORT])])] : null;
+    const ports = cfg.enabled ? guardPorts(cfg) : null;
     const result: MeshSyncResult = { ok: true };
     try {
-      const g = await admin.meshGuard(ports, mesh.tunName);
-      mesh.setGuard(ports && g.ok ? { active: true, ports } : { active: false, ports: [], error: ports ? g.error : undefined });
-      if (!g.ok) { result.ok = false; result.guard = g.error ?? 'failed'; }
-    } catch (e) { mesh.setGuard({ active: false, ports: [], error: (e as Error).message }); result.ok = false; result.guard = (e as Error).message; }
+      const g = await admin.meshGuard(ports, mesh.tunName, mesh.canaryPort || undefined);
+      if (g.ok) mesh.setGuard(ports ? { active: true, ports } : { active: false, ports: [] });
+      else {
+        result.ok = false; result.guard = g.error ?? 'failed';
+        // Only a changed requirement (new ports) or a guard we never had makes admission stop; a failed
+        // re-apply of an unchanged guard keeps the confirmed state (the 30 s check catches a real loss).
+        if (!ports || !mesh.guard.active || !samePorts(mesh.guard.ports, ports)) mesh.setGuard({ active: false, ports: [], error: result.guard });
+      }
+    } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!mesh.guard.active) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
       ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
       : null;
@@ -470,15 +486,33 @@ function syncMesh(): Promise<MeshSyncResult> {
   })().finally(() => { meshSync.running = null; });
   return meshSync.running;
 }
+
+/**
+ * Every 30 s while mesh access is on, confirm the guard is really loaded (something outside the UI, such as
+ * restarting nftables.service, can flush it). Read-only; only the guard is touched, never the firewall rule.
+ * If it is gone, admission stops at once and the guard is re-applied.
+ */
+async function verifyGuard(): Promise<void> {
+  if (!mesh.config.enabled || meshSync.running) return;
+  const st = await admin.meshGuardStatus().catch(() => null);
+  if (st === null) return; // could not ask (helper busy or missing): keep the last confirmed state
+  const want = guardPorts(mesh.config);
+  const ok = st.active && want.every((p) => st.ports.includes(p)) && st.tun === mesh.tunName;
+  if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want }); return; }
+  mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports or interface' : 'guard not loaded (was the nftables ruleset flushed?)' });
+  const g = await admin.meshGuard(want, mesh.tunName, mesh.canaryPort || undefined).catch((e) => ({ ok: false, error: (e as Error).message }));
+  mesh.setGuard(g.ok ? { active: true, ports: want } : { active: false, ports: [], error: g.error });
+}
+
 mesh.onChange = async () => { meshSync.dirty = true; };
-// Something outside the UI can remove the guard (restarting nftables.service flushes the whole ruleset), so
-// while mesh access is on it is re-applied every 2 minutes; the reload is atomic and idempotent.
+mesh.onTunChange = () => { meshSync.dirty = true; };
+mesh.onGuardLost = () => { meshSync.dirty = true; void syncMesh().then(() => mesh.reconcile()); };
 let meshTicks = 0;
 setInterval(() => {
-  if (mesh.config.enabled && ++meshTicks % 8 === 0) meshSync.dirty = true;
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
+  else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
 }, 15_000).unref();
-void mesh.start().then(() => syncMesh()).then(() => mesh.reconcile());
+void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 
 server.listen(PORT, HOST, () => {
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);

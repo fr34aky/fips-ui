@@ -8,11 +8,16 @@
 // A source address alone is not proof: a host on the LAN could send packets with someone's fd00::/8
 // address, and with a forged router advertisement even complete a handshake. So the helper loads a kernel
 // guard (table inet fips_ui_guard) that drops TCP from fd00::/8 to the UI's ports unless it arrives on lo or
-// the FIPS TUN device. Every packet is checked, the handshake included. fd00::/8 sources are trusted as
-// npubs only while that guard is confirmed active; without it nobody is admitted from the mesh.
+// the FIPS TUN device. Every packet is checked, the handshake included.
+//
+// Something outside the UI can flush the guard (restarting nftables.service flushes the whole ruleset), so
+// its presence is proven for every new mesh connection, without privileges: the same table holds a canary
+// rule that resets TCP to a private port on ::1 where this process listens. Before a connection is admitted
+// the UI connects to that port. Refused means the table is loaded; accepted means it is gone, and the
+// connection is denied. A connection whose handshake happened while the guard was loaded is trustworthy.
 
 import http from 'node:http';
-import type { Socket } from 'node:net';
+import net, { type Socket } from 'node:net';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -92,11 +97,60 @@ export class MeshAccess {
     return { listening: !!this.bound, address: this.bound?.address ?? this.own?.address ?? null, npub: this.own?.npub ?? null, port: this.config.port, guard: this.guard, error: this.loadError ?? (this.config.enabled ? this.lastError : undefined) };
   }
 
-  /** Record the guard state; losing it cuts every mesh connection and stops the listener until it is back. */
+  /**
+   * Record the guard state. It takes effect for admission at once (principalFor checks it), and losing it
+   * cuts every mesh connection and stops the listener, through the queue so it cannot race a bind.
+   */
   setGuard(g: { active: boolean; ports: number[]; error?: string }): void {
     this.guard = g;
-    if (!g.active) { this.revalidate(); if (this.server) this.close(); }
+    if (!g.active) { this.revalidate(); void this.serial(async () => { if (!this.guard.active && this.server) this.close(); }); }
   }
+
+  // --- canary --------------------------------------------------------------------------------------
+  private canaryServer: net.Server | null = null;
+  private proven = new WeakMap<Socket, boolean>();
+  /** Port of the canary listener on ::1 (0 until started). */
+  canaryPort = 0;
+
+  /** Listen on a private ::1 port whose connections the guard's canary rule resets. */
+  startCanary(): Promise<number> {
+    if (this.canaryServer) return Promise.resolve(this.canaryPort);
+    return new Promise((resolve) => {
+      const srv = net.createServer((c) => c.destroy());
+      srv.on('error', () => resolve(0));
+      srv.listen({ host: '::1', port: 0, ipv6Only: true }, () => { this.canaryServer = srv; this.canaryPort = (srv.address() as net.AddressInfo).port; resolve(this.canaryPort); });
+    });
+  }
+
+  /** True if the guard table is loaded right now: our own connection to the canary port is reset. */
+  private canaryRefused(): Promise<boolean> {
+    if (!this.canaryPort) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const s = net.connect({ host: '::1', port: this.canaryPort });
+      const done = (v: boolean) => { clearTimeout(t); s.destroy(); resolve(v); };
+      const t = setTimeout(() => done(false), 500);
+      s.once('connect', () => done(false));
+      s.once('error', (e: NodeJS.ErrnoException) => done(e.code === 'ECONNREFUSED' || e.code === 'ECONNRESET'));
+    });
+  }
+
+  /**
+   * Admit a mesh connection only if the guard is confirmed and provably loaded now; the proof is cached per
+   * connection. A failed proof marks the guard inactive (the sync re-applies it).
+   */
+  async proveGuard(socket: Socket): Promise<boolean> {
+    const hit = this.proven.get(socket);
+    if (hit !== undefined) return hit;
+    const ok = this.guard.active && (await this.canaryRefused());
+    this.proven.set(socket, ok);
+    if (!ok && this.guard.active) { this.setGuard({ active: false, ports: [], error: 'guard table missing (was the nftables ruleset flushed?)' }); this.onGuardLost(); }
+    return ok;
+  }
+
+  onGuardLost: () => void = () => {};
+
+  /** Called when the daemon reports a different TUN name, so the guard is re-applied for it. */
+  onTunChange: () => void = () => {};
 
   /**
    * The principal for a connection from a mesh (fd00::/8) source, on any listener, or null if it is not
@@ -202,7 +256,7 @@ export class MeshAccess {
     try {
       const st = await query<{ ipv6_addr?: string; npub?: string; tun_name?: string }>('show_status', undefined, { timeoutMs: 3000 });
       if (st.ipv6_addr && st.npub) this.own = { address: st.ipv6_addr, npub: st.npub };
-      if (st.tun_name) this.tun = st.tun_name;
+      if (st.tun_name && st.tun_name !== this.tun) { this.tun = st.tun_name; this.onTunChange(); }
     } catch (e) {
       if (!this.own) { this.lastError = `daemon unreachable: ${(e as Error).message}`; return; }
     }
