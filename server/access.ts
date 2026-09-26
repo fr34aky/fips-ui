@@ -9,12 +9,13 @@
 // arrives on another interface cannot complete a TCP handshake, because the reply is routed into the mesh
 // to the real owner of that address; the firewall rule this module maintains is a second layer.
 import http from 'node:http';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import type { Socket } from 'node:net';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { isIPv6 } from 'node:net';
+import { expand6, isMeshAddress } from './net6.ts';
 import { query } from './control.ts';
-import { meshAddress } from './admin.ts';
+import { meshAddress, NPUB_RE } from './admin.ts';
 
 export type Role = 'viewer' | 'admin';
 export interface AccessEntry { npub: string; label?: string; role: Role }
@@ -24,21 +25,13 @@ export type Principal =
   | { kind: 'mesh'; role: Role; npub: string; label?: string; address: string };
 
 export const LOCAL: Principal = { kind: 'local', role: 'admin' };
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'access.json');
 
 export class AccessError extends Error {}
 
-/** Full, lowercase, zero-padded form of an IPv6 address so textual variants compare equal. */
-export function expand6(addr: string): string | null {
-  const a = addr.toLowerCase().replace(/%.*$/, '').replace(/^\[|\]$/g, '');
-  if (!isIPv6(a) || a.includes('.')) return null;
-  const [head, tail] = a.includes('::') ? a.split('::') : [a, undefined];
-  const h = head ? head.split(':') : [];
-  const t = tail !== undefined ? (tail ? tail.split(':') : []) : [];
-  const groups = tail !== undefined ? [...h, ...Array(8 - h.length - t.length).fill('0'), ...t] : h;
-  return groups.length === 8 ? groups.map((g) => g.padStart(4, '0')).join(':') : null;
-}
+/** True for an address in fd00::/8, i.e. one that can only have come through the mesh. */
+export const isMeshSource = isMeshAddress;
+export { expand6 };
 
 export function validateAccess(input: unknown): AccessConfig {
   const x = input as Partial<AccessConfig>;
@@ -61,32 +54,62 @@ export function validateAccess(input: unknown): AccessConfig {
 
 export interface MeshStatus { listening: boolean; address: string | null; npub: string | null; port: number; error?: string }
 
+type Entry = AccessEntry & { address: string };
+
 export class MeshAccess {
   config: AccessConfig = { enabled: false, port: 8321, allowed: [] };
-  private byAddress = new Map<string, AccessEntry & { address: string }>();
+  private byAddress = new Map<string, Entry>();
   private server: http.Server | null = null;
   private bound: { address: string; port: number } | null = null;
   private own: { address: string; npub: string } | null = null;
   private lastError: string | undefined;
-  private reconciling: Promise<void> | null = null;
+  /** Every state change (load, save, bind, re-bind) runs through this queue, one at a time. */
+  private queue: Promise<unknown> = Promise.resolve();
+  /** Open connections admitted as a mesh principal, with the grant they were admitted under. */
+  private conns = new Map<Socket, string>();
   private readonly handler: http.RequestListener;
 
   constructor(handler: http.RequestListener) { this.handler = handler; }
 
   get file(): string { return FILE; }
 
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.queue.then(fn);
+    this.queue = p.catch(() => {});
+    return p;
+  }
+
   status(): MeshStatus {
     return { listening: !!this.bound, address: this.bound?.address ?? this.own?.address ?? null, npub: this.own?.npub ?? null, port: this.config.port, error: this.config.enabled ? this.lastError : undefined };
   }
 
-  /** The principal for a connection that arrived on the mesh listener, or null if its address is not allowed. */
+  /**
+   * The principal for a connection from a mesh (fd00::/8) source, on any listener, or null if it is not
+   * admitted. When mesh access is disabled nobody is admitted from the mesh.
+   */
   principalFor(remote: string | undefined): Principal | null {
+    if (!this.config.enabled) return null;
     const key = remote ? expand6(remote) : null;
     const e = key ? this.byAddress.get(key) : undefined;
     return e ? { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address } : null;
   }
 
-  /** Host names a browser may use to reach the mesh listener: this node's fips0 address or any .fips name. */
+  /** Remember a connection admitted as `p`, so a later revocation or role change can cut it. */
+  track(socket: Socket, p: Principal): void {
+    if (p.kind !== 'mesh' || this.conns.has(socket)) return;
+    this.conns.set(socket, `${p.npub}:${p.role}`);
+    socket.once('close', () => this.conns.delete(socket));
+  }
+
+  /** Close every tracked connection whose grant no longer holds (removed, role changed, access disabled). */
+  private revalidate(): void {
+    for (const [socket, grant] of this.conns) {
+      const p = this.principalFor(socket.remoteAddress);
+      if (!p || p.kind !== 'mesh' || `${p.npub}:${p.role}` !== grant) { socket.destroy(); this.conns.delete(socket); }
+    }
+  }
+
+  /** Host names a browser may use to reach this node over the mesh: its fips0 address or any .fips name. */
   hostAllowed(hostname: string | null): boolean {
     if (!hostname) return false;
     if (hostname.endsWith('.fips')) return true;
@@ -94,39 +117,46 @@ export class MeshAccess {
     return !!e && !!this.own && e === expand6(this.own.address);
   }
 
-  async start(): Promise<void> {
-    try { this.config = validateAccess(JSON.parse(await readFile(FILE, 'utf8'))); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') console.warn(`ignoring ${FILE}: ${(e as Error).message}`); }
-    await this.remap().catch((e) => { this.lastError = (e as Error).message; });
-    await this.reconcile();
+  start(): Promise<void> {
     setInterval(() => { void this.reconcile(); }, 15_000).unref();
+    return this.serial(async () => {
+      try {
+        const cfg = validateAccess(JSON.parse(await readFile(FILE, 'utf8')));
+        this.byAddress = await this.buildMap(cfg);
+        this.config = cfg;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') { this.lastError = `ignoring ${FILE}: ${(e as Error).message}`; console.warn(this.lastError); }
+      }
+      await this.reconcileNow();
+    });
   }
 
-  async save(next: AccessConfig): Promise<void> {
-    const cfg = validateAccess(next);
-    const previous = this.config;
-    this.config = cfg;
-    try { await this.remap(); }
-    catch (e) { this.config = previous; await this.remap().catch(() => {}); throw e; }
-    await mkdir(dirname(FILE), { recursive: true, mode: 0o700 });
-    const tmp = `${FILE}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
-    await rename(tmp, FILE);
-    this.bound && (this.bound.port !== cfg.port || !cfg.enabled) && this.close();
-    await this.reconcile();
+  /** Validate, derive addresses, persist, and only then put the new list into effect. */
+  save(input: unknown): Promise<void> {
+    return this.serial(async () => {
+      const cfg = validateAccess(input);
+      const map = await this.buildMap(cfg);
+      await mkdir(dirname(FILE), { recursive: true, mode: 0o700 });
+      const tmp = `${FILE}.${process.pid}.tmp`;
+      try { await writeFile(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, FILE); }
+      catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${FILE}: ${(e as Error).message}`); }
+      const rebind = !cfg.enabled || (this.bound !== null && this.bound.port !== cfg.port);
+      this.config = cfg;
+      this.byAddress = map;
+      this.revalidate();
+      if (rebind) this.close();
+      await this.reconcileNow();
+    });
   }
 
-  private async remap(): Promise<void> {
-    const map = new Map<string, AccessEntry & { address: string }>();
-    for (const e of this.config.allowed) {
-      const address = await meshAddress(e.npub);
-      const key = expand6(address);
-      if (key) map.set(key, { ...e, address });
-    }
-    this.byAddress = map;
+  private async buildMap(cfg: AccessConfig): Promise<Map<string, Entry>> {
+    const resolved = await Promise.all(cfg.allowed.map(async (e) => ({ ...e, address: await meshAddress(e.npub) })));
+    const map = new Map<string, Entry>();
+    for (const e of resolved) { const key = expand6(e.address); if (key) map.set(key, e); }
+    return map;
   }
 
-  private close(): void {
+  close(): void {
     this.server?.close();
     this.server?.closeAllConnections?.();
     this.server = null;
@@ -134,35 +164,31 @@ export class MeshAccess {
   }
 
   /** Bind (or re-bind) the mesh listener to the current fips0 address; tear it down when disabled. */
-  reconcile(): Promise<void> {
-    if (this.reconciling) return this.reconciling;
-    this.reconciling = (async () => {
-      if (!this.config.enabled) { if (this.server) this.close(); this.lastError = undefined; return; }
-      try {
-        const st = await query<{ ipv6_addr?: string; npub?: string }>('show_status', undefined, { timeoutMs: 3000 });
-        if (st.ipv6_addr && st.npub) this.own = { address: st.ipv6_addr, npub: st.npub };
-      } catch (e) {
-        if (!this.own) { this.lastError = `daemon unreachable: ${(e as Error).message}`; return; }
-      }
-      if (!this.own) { this.lastError = 'the daemon did not report a fips0 address'; return; }
-      const want = { address: this.own.address, port: this.config.port };
-      if (this.bound && this.bound.address === want.address && this.bound.port === want.port) return;
-      if (this.server) this.close();
-      const server = http.createServer(this.handler);
-      await new Promise<void>((resolve) => {
-        server.once('error', (e: NodeJS.ErrnoException) => {
-          this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address}` : `${e.code ?? 'error'}: ${e.message}`;
-          resolve();
-        });
-        server.listen({ host: want.address, port: want.port, ipv6Only: true }, () => {
-          this.server = server; this.bound = want; this.lastError = undefined;
-          console.log(`mesh access listening on http://[${want.address}]:${want.port} for ${this.config.allowed.length} npub(s)`);
-          resolve();
-        });
-      });
-    })().finally(() => { this.reconciling = null; });
-    return this.reconciling;
-  }
+  reconcile(): Promise<void> { return this.serial(() => this.reconcileNow()); }
 
-  close_all(): void { this.close(); }
+  private async reconcileNow(): Promise<void> {
+    if (!this.config.enabled) { if (this.server) this.close(); this.lastError = undefined; return; }
+    try {
+      const st = await query<{ ipv6_addr?: string; npub?: string }>('show_status', undefined, { timeoutMs: 3000 });
+      if (st.ipv6_addr && st.npub) this.own = { address: st.ipv6_addr, npub: st.npub };
+    } catch (e) {
+      if (!this.own) { this.lastError = `daemon unreachable: ${(e as Error).message}`; return; }
+    }
+    if (!this.own) { this.lastError = 'the daemon did not report a fips0 address'; return; }
+    const want = { address: this.own.address, port: this.config.port };
+    if (this.bound && this.bound.address === want.address && this.bound.port === want.port) return;
+    if (this.server) this.close();
+    const server = http.createServer(this.handler);
+    await new Promise<void>((resolve) => {
+      server.once('error', (e: NodeJS.ErrnoException) => {
+        this.lastError = e.code === 'EADDRNOTAVAIL' ? `fips0 address ${want.address} is not configured yet` : e.code === 'EADDRINUSE' ? `port ${want.port} is already in use on ${want.address}` : `${e.code ?? 'error'}: ${e.message}`;
+        resolve();
+      });
+      server.listen({ host: want.address, port: want.port, ipv6Only: true }, () => {
+        this.server = server; this.bound = want; this.lastError = undefined;
+        console.log(`mesh access listening on http://[${want.address}]:${want.port} for ${this.config.allowed.length} npub(s)`);
+        resolve();
+      });
+    });
+  }
 }

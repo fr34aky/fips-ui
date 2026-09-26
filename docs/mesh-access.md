@@ -1,7 +1,7 @@
 # Web UI over the mesh
 
 Other FIPS nodes can open this node's dashboard at its mesh address, for example
-`http://[fd14:…]:8321` or `http://<npub>.fips:8321`. Access is granted per npub, with no password.
+`http://[fd97:…]:8321` or `http://<npub>.fips:8321`. Access is granted per npub, with no password.
 
 ## Why no login is needed
 

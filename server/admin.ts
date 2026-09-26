@@ -20,7 +20,7 @@ const HELPER_RESTART_TIMEOUT = 330_000;
 // Readable without privileges; overridable only so tests can point it at a scratch copy.
 const DROPIN_DIR = process.env.FIPS_UI_DROPIN_DIR ?? '/etc/fips/fips.d';
 export const MANAGED_DROPIN = 'fips-ui';
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
+export const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 const DROPIN_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/;
 
 interface HelperResult { code: number; stdout: string; stderr: string }
@@ -118,14 +118,18 @@ export async function renderManagedDropin(rules: FirewallRule[]): Promise<string
   return out.join('\n') + '\n';
 }
 
-export function parseManagedDropin(text: string): FirewallRule[] {
+export function parseManagedDropin(text: string): FirewallRule[] { return parseManagedDropinStrict(text).rules; }
+
+/** Rules plus the number of definitions that no longer validate (which a rewrite would silently drop). */
+export function parseManagedDropinStrict(text: string): { rules: FirewallRule[]; invalid: number } {
   const rules: FirewallRule[] = [];
+  let invalid = 0;
   for (const line of text.split('\n')) {
     const m = /^# fips-ui-rule (\{.*\})\s*$/.exec(line);
     if (!m) continue;
-    try { rules.push(validateRule(JSON.parse(m[1]))); } catch { /* skip a corrupted definition rather than fail the page */ }
+    try { rules.push(validateRule(JSON.parse(m[1]))); } catch { invalid++; }
   }
-  return rules;
+  return { rules, invalid };
 }
 
 async function readDropins(): Promise<{ name: string; content: string; size: number; mtime: number; managed: boolean }[]> {
@@ -330,10 +334,14 @@ export function createAdminHandler(opts: AdminOptions) {
 
   /** Replace the managed rules through a pure function of the current ones (used by mesh access). */
   function updateManagedRules(mutate: (rules: FirewallRule[]) => FirewallRule[]): Promise<Record<string, unknown>> {
+    const busy = opts.busy();
+    if (busy) return Promise.reject(new Error(busy));
     return exclusive(async () => {
       await requireHelper();
       const managed = (await readDropins()).find((d) => d.managed);
-      const next = mutate(managed ? parseManagedDropin(managed.content) : []).map(validateRule);
+      const current = managed ? parseManagedDropinStrict(managed.content) : { rules: [], invalid: 0 };
+      if (current.invalid) throw new Error(`${MANAGED_DROPIN}.nft has ${current.invalid} rule definition(s) that no longer validate; fix them on the Firewall page first so they are not lost`);
+      const next = mutate(current.rules).map(validateRule);
       if (next.length === 0) return managed ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false };
       return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(next));
     });

@@ -9,8 +9,8 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, type FirewallRule } from './admin.ts';
-import { MeshAccess, LOCAL, AccessError, validateAccess, type Principal } from './access.ts';
+import { createAdminHandler, NPUB_RE, type FirewallRule } from './admin.ts';
+import { MeshAccess, LOCAL, AccessError, isMeshSource, expand6, type Principal } from './access.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -81,8 +81,16 @@ function browserChecks(req: Req, method: string, via: 'local' | 'mesh'): string 
   if (method === 'GET' || method === 'HEAD') return null;
   const origin = req.headers.origin;
   if (origin && origin !== 'null') {
-    const o = hostnameOf(origin, true);
-    if (!o || (via === 'mesh' || HOST_CHECK ? !hostOk(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+    if (via === 'mesh') {
+      // Any .fips name is a valid Host, so Origin must be exactly this request's own origin (same host and port):
+      // a page served by another mesh node cannot post here.
+      let same = false;
+      try { same = new URL(origin).host.toLowerCase() === String(req.headers.host ?? '').toLowerCase(); } catch { /* invalid origin */ }
+      if (!same) return `cross-origin request from ${origin} refused`;
+    } else {
+      const o = hostnameOf(origin, true);
+      if (!o || (HOST_CHECK ? !hostOk(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+    }
   } else if (origin === 'null') return 'cross-origin request refused';
   const site = req.headers['sec-fetch-site'];
   if (typeof site === 'string' && site === 'cross-site') return 'cross-site request refused';
@@ -99,7 +107,6 @@ function errToResponse(res: Res, e: unknown) {
   json(res, 500, { error: (e as Error).message ?? 'internal error' });
 }
 
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 /** Resolve a peer identifier (npub, hosts-file name, or live display name) to an npub. */
 async function resolvePeer(id: string): Promise<{ npub: string; display_name?: string }> {
@@ -255,7 +262,8 @@ async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   return ALLOW_SERVICE_CONTROL ? 'direct' : null;
 }
 
-async function route(req: Req, res: Res, via: 'local' | 'mesh' = 'local') {
+async function route(req: Req, res: Res) {
+  const via: 'local' | 'mesh' = principalOf(req).kind;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const p = url.pathname;
   const method = req.method ?? 'GET';
@@ -276,7 +284,9 @@ async function route(req: Req, res: Res, via: 'local' | 'mesh' = 'local') {
   }
 
   if (p === '/api/events') return handleSse(req, res);
+  // Upgrade state (paths, logs, and a refresh that spends the GitHub rate limit) is for admins only.
   if (p.startsWith('/api/upgrade')) {
+    if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' });
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
     // Requests that start an upgrade or rollback are counted before any await, so a node-management change
     // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
@@ -323,9 +333,7 @@ async function route(req: Req, res: Res, via: 'local' | 'mesh' = 'local') {
   const body = await readJsonBody(req);
 
   if (p === '/api/access') {
-    let next;
-    try { next = validateAccess(body); } catch (e) { throw new HttpError(400, (e as Error).message); }
-    try { await mesh.save(next); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
     return json(res, 200, { config: mesh.config, status: mesh.status(), firewall: await syncMeshFirewall() });
   }
 
@@ -367,22 +375,45 @@ async function route(req: Req, res: Res, via: 'local' | 'mesh' = 'local') {
   throw new HttpError(404, 'not found');
 }
 
-const server = http.createServer((req, res) => {
+/**
+ * Every request, on either listener, is attributed by its source address: an fd00::/8 source can only have
+ * come through the mesh and is admitted only as an allowed npub; anything else is the local operator
+ * (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
+ */
+function handle(req: Req, res: Res): void {
+  const remote = req.socket.remoteAddress;
+  if (isMeshSource(remote)) {
+    const pr = mesh.principalFor(remote);
+    if (!pr) { void denyMesh(req, res); return; }
+    mesh.track(req.socket, pr);
+    principals.set(req, pr);
+  }
   route(req, res).catch((e) => errToResponse(res, e));
-});
+}
+const server = http.createServer(handle);
 
 // ---------------------------------------------------------------------------------------------
 // Mesh access
 // ---------------------------------------------------------------------------------------------
 const MESH_TAG = 'mesh-access';
 
+// Identity cache for the denial page, refreshed at most every 30 s so unlisted callers cannot load the daemon.
+let identityCache: { at: number; byAddr: Map<string, string> } | null = null;
+async function npubForAddress(addr: string): Promise<string | undefined> {
+  if (!identityCache || Date.now() - identityCache.at > 30_000) {
+    identityCache = { at: Date.now(), byAddr: identityCache?.byAddr ?? new Map() };
+    try {
+      const idc = await query<{ entries: { ipv6_addr: string; npub: string }[] }>('show_identity_cache', undefined, { timeoutMs: 2000 });
+      identityCache.byAddr = new Map(idc.entries.flatMap((e) => { const k = expand6(e.ipv6_addr); return k ? [[k, e.npub] as [string, string]] : []; }));
+    } catch { /* best effort */ }
+  }
+  const k = expand6(addr);
+  return k ? identityCache.byAddr.get(k) : undefined;
+}
+
 async function denyMesh(req: Req, res: Res): Promise<void> {
   const addr = req.socket.remoteAddress ?? 'unknown';
-  let npub: string | undefined;
-  try {
-    const idc = await query<{ entries: { ipv6_addr: string; npub: string }[] }>('show_identity_cache', undefined, { timeoutMs: 2000 });
-    npub = idc.entries.find((e) => e.ipv6_addr === addr)?.npub;
-  } catch { /* best effort */ }
+  const npub = await npubForAddress(addr);
   const who = npub ? `${npub} (${addr})` : addr;
   if ((req.url ?? '').startsWith('/api/')) return json(res, 403, { error: 'this node does not allow your npub', you: { address: addr, npub } }, true);
   const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
@@ -391,12 +422,7 @@ async function denyMesh(req: Req, res: Res): Promise<void> {
   res.end(html);
 }
 
-const mesh = new MeshAccess((req, res) => {
-  const pr = mesh.principalFor(req.socket.remoteAddress);
-  if (!pr) { void denyMesh(req, res); return; }
-  principals.set(req, pr);
-  route(req, res, 'mesh').catch((e) => errToResponse(res, e));
-});
+const mesh = new MeshAccess(handle);
 
 /** Keep the UI's own firewall rule in step with the allow-list: its port, open only to the allowed npubs. */
 async function syncMeshFirewall(): Promise<{ ok: boolean; skipped?: string; error?: string }> {
@@ -420,4 +446,4 @@ server.listen(PORT, HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close_all(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); process.exit(0); });
