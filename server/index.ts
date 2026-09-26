@@ -29,6 +29,7 @@ const WILDCARD_BIND = ['0.0.0.0', '::', '', '*'].includes(HOST);
 const ALLOWED_HOSTS = new Set<string>(['localhost', '127.0.0.1', '::1', ...(WILDCARD_BIND ? [] : [HOST.toLowerCase()]), ...(process.env.FIPS_UI_ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean)]);
 const HOST_CHECK = !WILDCARD_BIND || ALLOWED_HOSTS.size > 3; // a wildcard bind without an allow-list cannot know its names
 const STATIC_DIR = process.env.FIPS_UI_STATIC ?? path.join(ROOT, 'web', 'dist');
+const UI_VERSION: string = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version ?? '0.0.0'; } catch { return '0.0.0'; } })();
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -254,7 +255,7 @@ async function route(req: Req, res: Res) {
   if (p === '/api/health') {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
-    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: ALLOW_SERVICE_CONTROL && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: ALLOW_SERVICE_CONTROL && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -331,7 +332,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`fips-ui listening on http://${HOST}:${PORT}`);
+  console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);

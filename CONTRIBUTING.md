@@ -144,6 +144,27 @@ PRs are squash-merged. One logical change per PR becomes one commit
 on `main`; the commit message is rewritten at merge time, so in-PR
 history does not need to be pretty.
 
+## Releasing
+
+Versions follow [Semantic Versioning](https://semver.org/): patch for fixes,
+minor for features, major for breaking changes to the API, environment
+variables or the helper protocol. The version lives in the root
+`package.json` (mirrored in `web/package.json`), is served as `uiVersion`
+from `/api/health` and shown in the sidebar. To cut a release:
+
+1. Move the `[Unreleased]` entries in [CHANGELOG.md](CHANGELOG.md) under a
+   new `## [X.Y.Z] - YYYY-MM-DD` heading and update the compare links.
+2. Set `"version"` in `package.json` and `web/package.json`.
+3. Commit as `Release X.Y.Z`, tag it `vX.Y.Z` (annotated), push with tags.
+4. Publish the GitHub release with that changelog section as its notes:
+
+   ```bash
+   gh release create vX.Y.Z --title "fips-ui X.Y.Z" --notes-file <(sed -n '/^## \[X.Y.Z\]/,/^## \[/p' CHANGELOG.md | sed '1d;$d')
+   ```
+
+Deployments made with `deploy/setup-local.sh` run from the checkout, so
+`git pull && npm run build && sudo systemctl restart fips-ui` updates them.
+
 ## AI coding assistant policy
 
 Use of AI coding assistants in preparing a contribution is welcome.

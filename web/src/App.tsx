@@ -64,7 +64,7 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} badge={gwBadge}>
+      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} uiVersion={health?.uiVersion} badge={gwBadge}>
         {body}
       </Shell>
       <TokenDialog open={authNeeded} />

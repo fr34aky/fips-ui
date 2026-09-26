@@ -28,7 +28,7 @@ export function useTheme() {
   return [theme, () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))] as const;
 }
 
-export function Shell({ view, onNav, conn, nodeName, version, children, badge }: { view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; children: ReactNode; badge?: ReactNode }) {
+export function Shell({ view, onNav, conn, nodeName, version, uiVersion, children, badge }: { view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; children: ReactNode; badge?: ReactNode }) {
   const [theme, toggleTheme] = useTheme();
   const [open, setOpen] = useState(false);
   const current = NAV.find((n) => n.id === view)!;
@@ -64,6 +64,7 @@ export function Shell({ view, onNav, conn, nodeName, version, children, badge }:
             <span>{connChip}</span>
             <button className="btn ghost icon sm" onClick={toggleTheme} aria-label="Toggle theme" title="Toggle theme">{theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}</button>
           </div>
+          {uiVersion && <div className="mt-2"><a href="https://github.com/fr34aky/fips-ui/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" className="hover:text-ink" title="Changelog">fips-ui v{uiVersion}</a></div>}
         </div>
       </aside>
       {open && <div className="fixed inset-0 z-30 lg:hidden" style={{ background: 'rgba(3,8,18,0.5)' }} onClick={() => setOpen(false)} />}
