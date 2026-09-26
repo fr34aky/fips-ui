@@ -1,8 +1,14 @@
 # systemd unit for the FIPS web UI.
 #   sudo cp deploy/fips-ui.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now fips-ui
-# Runs as a dedicated unprivileged user that is a member of the "fips" group
-# (that group owns the control socket). Adjust WorkingDirectory/User to taste.
+# Runs as an unprivileged user that is a member of the "fips" group (which owns the
+# control socket) and of "systemd-journal" (for the Logs page). deploy/setup-local.sh
+# installs this file unchanged and overrides User/WorkingDirectory/ExecStart in a
+# drop-in, so edit this file for anything generic.
+#
+# No ProtectSystem/ProtectHome here on purpose: the upgrade helper is spawned from this
+# service via sudo and inherits its sandbox, so a read-only /usr would break installs,
+# and the UI user's home holds the upgrade work dir.
 [Unit]
 Description=FIPS mesh node web UI
 After=network.target fips.service
@@ -14,19 +20,14 @@ User=fips-ui
 Group=fips
 SupplementaryGroups=systemd-journal
 WorkingDirectory=/opt/fips-ui
-ExecStart=/usr/bin/node server/index.ts
-Restart=on-failure
-RestartSec=3
 Environment=NODE_ENV=production
 Environment=FIPS_UI_HOST=127.0.0.1
 Environment=FIPS_UI_PORT=8321
-# Optional hardening knobs; see README.
-#Environment=FIPS_UI_TOKEN=change-me
-#Environment=FIPS_UI_READ_ONLY=1
-#Environment=FIPS_UI_ALLOW_SERVICE_CONTROL=1
-NoNewPrivileges=false
-ProtectSystem=full
-ProtectHome=read-only
+# Optional overrides (FIPS_UI_TOKEN, FIPS_UI_READ_ONLY, ...); keep it mode 0600.
+EnvironmentFile=-/etc/default/fips-ui
+ExecStart=/usr/bin/node server/index.ts
+Restart=on-failure
+RestartSec=3
 PrivateTmp=true
 
 [Install]
