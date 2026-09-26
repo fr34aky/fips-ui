@@ -33,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dir; a successful install removes its stage dir, and the newest three stage
   dirs and two artifacts are kept.
 - A revision with a suffix (`-dirty`) defeated the staging check because the
-  version parser did not capture it.
+  version parser did not capture it. The full token is now kept everywhere so
+  a dirty and a clean build of the same commit are no longer conflated.
+- Non-boolean `dryRun`/`restart` values are rejected with 400 rather than
+  coerced. A 413 now closes the connection so a kept-alive socket is not left
+  mid-body. GitHub 403/429 answers honour `retry-after` and suggest a token.
 
 ## [0.1.2] - 2026-09-26
 

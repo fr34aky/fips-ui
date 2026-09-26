@@ -8,6 +8,7 @@ import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH,
 import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
+import { readJsonBody, BodyError, sendJson } from './http.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -42,23 +43,8 @@ class HttpError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
-function json(res: Res, status: number, body: unknown) {
-  const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
+const json = (res: Res, status: number, body: unknown, close = false) => sendJson(res, status, body, close);
 
-function readBody(req: Req): Promise<Record<string, unknown>> {
-  // Listener-based rather than `for await`: breaking out of the async iterator destroys the request and its
-  // socket, and a 413 written afterwards never reaches the client. Pausing keeps the socket usable.
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0, failed = false;
-    req.on('data', (c: Buffer) => { if (failed) return; size += c.length; if (size > 64 * 1024) { failed = true; req.pause(); reject(new HttpError(413, 'body too large (64 KiB limit)')); return; } chunks.push(c); });
-    req.on('end', () => { if (failed) return; if (!chunks.length) return resolve({}); try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { reject(new HttpError(400, 'invalid JSON body')); } });
-    req.on('error', (e) => { if (!failed) reject(e); });
-  });
-}
 
 function tokenOk(req: Req, url: URL): boolean {
   if (!TOKEN) return true;
@@ -102,6 +88,7 @@ function browserChecks(req: Req, method: string): string | null {
 }
 
 function errToResponse(res: Res, e: unknown) {
+  if (e instanceof BodyError) return json(res, e.status, { error: e.message }, e.status === 413);
   if (e instanceof HttpError) return json(res, e.status, { error: e.message });
   if (e instanceof ControlError) return json(res, e.kind === 'transport' ? 503 : 400, { error: e.message, kind: e.kind });
   console.error(e);
@@ -298,7 +285,7 @@ async function route(req: Req, res: Res) {
   // ---- mutating -----------------------------------------------------------------------------
   if (method !== 'POST') throw new HttpError(404, 'not found');
   if (READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
-  const body = await readBody(req);
+  const body = await readJsonBody(req);
 
   if (p === '/api/connect') {
     const { peer, address, transport } = body as { peer?: string; address?: string; transport?: string };

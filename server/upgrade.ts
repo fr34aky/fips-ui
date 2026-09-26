@@ -43,6 +43,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { join, dirname, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readJsonBody, BodyError, sendJson } from './http.ts'
 import { homedir, arch as osArch, platform as osPlatform } from 'node:os'
 import { connect as netConnect } from 'node:net'
 
@@ -214,7 +215,7 @@ async function isElevatedWindows(): Promise<boolean> { return (await run('net', 
 
 /** Parse "fips 0.6.0-dev (rev 0f0e1dc2bd)\ntarget: ..." */
 export function parseVersionOutput(out: string): { version: string; rev?: string; target?: string } | null {
-  const m = out.match(/^\s*fips\S*\s+(\S+)(?:\s+\(rev\s+([0-9a-f]+)[^)]*\))?/m)
+  const m = out.match(/^\s*fips\S*\s+(\S+)(?:\s+\(rev\s+([0-9a-f]+[^)\s]*)\))?/m)
   if (!m) return null
   const t = out.match(/^target:\s*(\S+)/m)
   return { version: m[1], rev: m[2], target: t?.[1] }
@@ -245,21 +246,7 @@ function controlQuery(socket: string, command: string, timeoutMs = 4000): Promis
   })
 }
 
-class BodyTooLarge extends Error { status = 413; constructor() { super('request body too large (64 KiB limit)') } }
-function readBody(req: IncomingMessage, limit = 64 * 1024): Promise<string> {
-  return new Promise((res, rej) => {
-    let data = ''
-    let failed = false
-    req.on('data', (c) => { if (failed) return; data += c; if (data.length > limit) { failed = true; rej(new BodyTooLarge()); req.pause() } })
-    req.on('end', () => { if (!failed) res(data) }); req.on('error', rej)
-  })
-}
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const s = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(s) })
-  res.end(s)
-}
 
 async function sha256File(path: string): Promise<string> {
   const h = createHash('sha256')
@@ -312,9 +299,16 @@ class GitHub {
           this.cache.set(path, { at: Date.now(), error: err, until: reset && reset > Date.now() ? reset : Date.now() + GITHUB_ERROR_CACHE_MS })
           throw err
         }
+        if (r.status === 429 || r.status === 403) {
+          // Secondary/abuse limits: transient, with a retry-after; a token lifts them.
+          const retry = Number(r.headers.get('retry-after')) * 1000
+          const err = new Error(`GitHub API ${path}: HTTP ${r.status} (temporarily limited; retry in ${retry ? Math.ceil(retry / 1000) : 60} s, or set FIPS_UI_GITHUB_TOKEN)`)
+          this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + (retry > 0 ? retry : GITHUB_ERROR_CACHE_MS) })
+          throw err
+        }
         const err = new Error(`GitHub API ${path}: HTTP ${r.status}`)
-        // 4xx answers are deterministic (no such release, rev not an ancestor of master): retrying every minute
-        // only burns the rate limit, so they are cached as long as a success would be.
+        // Other 4xx answers are deterministic (no such release, rev not an ancestor of master): retrying every
+        // minute only burns the rate limit, so they are cached as long as a success would be.
         if (r.status >= 400 && r.status < 500) this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + ttl })
         throw err
       }
@@ -453,7 +447,7 @@ class Job {
 // Installers: how staged binaries reach the system
 // ---------------------------------------------------------------------------
 
-interface InstallResult { backup_id?: string; restarted?: boolean; installed_version?: string }
+interface InstallResult { backup_id?: string; restarted?: boolean; installed_version?: string; pre_rollback_backup?: string }
 
 interface Installer {
   kind: string
@@ -526,7 +520,7 @@ class WindowsInstaller implements Installer {
     await this.startService(job)
     return { backup_id, restarted: true }
   }
-  async rollback(job: Job, id: string) { await this.backup(job); await this.swap(job, join(this.backupsDir, id)); await this.startService(job); return { restarted: true } }
+  async rollback(job: Job, id: string) { const pre_rollback_backup = await this.backup(job); await this.swap(job, join(this.backupsDir, id)); await this.startService(job); return { pre_rollback_backup, restarted: true } }
   async restart() { const s = await run('sc.exe', ['stop', this.service], { timeout: 60_000 }); await new Promise((r) => setTimeout(r, 2000)); const r = await run('sc.exe', ['start', this.service], { timeout: 60_000 }); if (r.code !== 0) throw new Error(r.stdout.trim()); return `${s.stdout.trim()}\n${r.stdout.trim()}` }
   async listBackups() { return readBackupsDir(this.backupsDir, this.binaries) }
 }
@@ -747,12 +741,16 @@ export class UpgradeManager {
   private publish(job: Job | null): void { if (job) this.current = job; this.starting = false }
   private launch(job: Job, work: () => Promise<void>): Job {
     job.state = 'running'
-    void work().then(() => job.finish(), (e) => job.finish(e)).finally(() => { this.cache.clear(); void this.housekeep(job) })
+    // Housekeeping runs while the job still holds the slot, so it can never delete files of a job started right after.
+    void work().then(
+      async () => { await this.housekeep(job, true); job.finish() },
+      async (e) => { await this.housekeep(job, false); job.finish(e) },
+    ).finally(() => this.cache.clear())
     return job
   }
 
   /** Bound the work dir: drop partial downloads and extract dirs, keep the 3 newest stage dirs and 2 newest artifacts. */
-  private async housekeep(job: Job): Promise<void> {
+  private async housekeep(job: Job, succeeded: boolean): Promise<void> {
     const keepNewest = async (dir: string, keep: number, filter: (name: string) => boolean = () => true) => {
       let names: string[]
       try { names = (await readdir(dir)).filter(filter) } catch { return }
@@ -760,7 +758,7 @@ export class UpgradeManager {
       for (const { n } of withTime.sort((a, b) => b.t - a.t).slice(keep)) await rm(join(dir, n), { recursive: true, force: true }).catch(() => {})
     }
     try {
-      if (!job.dryRun && job.state === 'succeeded' && job.result.stageDir) await rm(job.result.stageDir, { recursive: true, force: true })
+      if (!job.dryRun && succeeded && job.result.stageDir) await rm(job.result.stageDir, { recursive: true, force: true })
       await rm(join(this.workDir, 'extract'), { recursive: true, force: true })
       await keepNewest(join(this.workDir, 'downloads'), 0, (n) => n.endsWith('.part'))
       await keepNewest(join(this.workDir, 'downloads'), 2, (n) => !n.endsWith('.part'))
@@ -769,7 +767,9 @@ export class UpgradeManager {
   }
 
   async start(reqIn: JobRequest): Promise<Job> {
-    // Normalise once: Job treats only `true` as a dry run, so every gate below must see the same value.
+    // Flags must be real booleans: a client that sends "true" or 1 has asked for something and must get a 400,
+    // never a silent flip to the destructive default.
+    for (const k of ['dryRun', 'restart'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
     const req: JobRequest = { ...reqIn, dryRun: reqIn.dryRun === true, restart: reqIn.restart !== false }
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
@@ -884,7 +884,7 @@ export class UpgradeManager {
     const r = await job.runStep('install', () => this.installer.install(job, stageDir, job.restart))
     job.result.backupId = r.backup_id; job.result.restarted = !!r.restarted
     if (!job.restart && !job.result.restarted) { job.skipStep('restart', 'restart disabled by operator'); job.skipStep('confirm', 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
-    await job.runStep('restart', async () => { if (!job.result.restarted) throw new Error('the installer could not restart the service (see the helper output above); binaries are installed but the old daemon is still running') })
+    await job.runStep('restart', async () => { if (!job.result.restarted) throw new Error(await this.restartFailureMessage('binaries are installed')) })
     await job.runStep('confirm', async () => {
       const deadline = Date.now() + 120_000
       while (Date.now() < deadline) {
@@ -892,7 +892,7 @@ export class UpgradeManager {
         if (v?.version && (!before || v.pid !== before.pid)) {
           job.result.runningVersion = v.rev ? `${v.version} (rev ${v.rev})` : v.version
           job.info(`daemon is back: ${job.result.runningVersion} (pid ${v.pid})`)
-          const expectRev = job.result.stagedVersion?.match(/rev ([0-9a-f]+)/)?.[1]
+          const expectRev = job.result.stagedVersion?.match(/rev ([^)\s]+)/)?.[1]
           if (expectRev && v.rev && expectRev !== v.rev) throw new Error(`daemon reports ${job.result.runningVersion}, expected ${job.result.stagedVersion}`)
           return
         }
@@ -941,10 +941,10 @@ export class UpgradeManager {
       const h = await this.installer.check(); if (!h.available) throw new Error(`cannot roll back: ${h.error}`)
       const before = await this.runningVersion()
       const r = await job.runStep('install', () => this.installer.rollback(job, id))
-      const pre = (r as InstallResult & { pre_rollback_backup?: string }).pre_rollback_backup ?? r.backup_id
+      const pre = r.pre_rollback_backup ?? r.backup_id
       if (pre) { job.result.backupId = pre; job.info(`safety backup of the replaced binaries: ${pre}`) }
       job.result.restarted = !!r.restarted; job.emitState()
-      if (!r.restarted) throw new Error('the helper could not restart the service (see its output above); the backup is restored on disk but the old daemon is still running')
+      if (!r.restarted) throw new Error(await this.restartFailureMessage('the backup is restored on disk'))
       await job.runStep('confirm', async () => {
         const deadline = Date.now() + 120_000
         while (Date.now() < deadline) {
@@ -958,6 +958,13 @@ export class UpgradeManager {
   }
 
   restartService(): Promise<string> { return this.installer.restart() }
+
+  /** The helper reports restarted:false both when the unit is unknown and when the restart failed; say which state the daemon is really in. */
+  private async restartFailureMessage(done: string): Promise<string> {
+    const v = await this.runningVersion()
+    const state = v?.version ? `the previously running daemon (${v.rev ? `${v.version} rev ${v.rev}` : v.version}, pid ${v.pid}) is still up` : 'the daemon is not answering on the control socket, so the service is probably down'
+    return `the installer could not restart the service (see the helper output above); ${done} and ${state}`
+  }
 }
 
 async function findDirContaining(root: string, file: string, depth = 3): Promise<string | null> {
@@ -989,7 +996,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
     try {
       if (sub === '/status' && method === 'GET') { sendJson(res, 200, await mgr.status(url.searchParams.get('refresh') === '1')); return true }
       if (sub === '/backups' && method === 'GET') { sendJson(res, 200, { backups: await mgr.installer.listBackups() }); return true }
-      if (sub === '/jobs' && method === 'POST') { const body = JSON.parse((await readBody(req)) || '{}') as JobRequest; sendJson(res, 202, (await mgr.start(body)).summary()); return true }
+      if (sub === '/jobs' && method === 'POST') { const body = (await readJsonBody(req)) as unknown as JobRequest; sendJson(res, 202, (await mgr.start(body)).summary()); return true }
       if (sub === '/jobs/current' && method === 'GET') {
         const j = mgr.job; if (!j) { sendJson(res, 404, { error: 'no job' }); return true }
         sendJson(res, 200, { ...j.summary(), log: j.logSince(Number(url.searchParams.get('since') ?? '0')) }); return true
@@ -1006,11 +1013,11 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
         return true
       }
       if (sub === '/jobs/current/cancel' && method === 'POST') { const j = mgr.job; if (!j) { sendJson(res, 404, { error: 'no job' }); return true } sendJson(res, 200, { cancelled: j.cancel() }); return true }
-      if (sub === '/rollback' && method === 'POST') { const body = JSON.parse((await readBody(req)) || '{}') as { id?: string }; if (!body.id) { sendJson(res, 400, { error: 'id required' }); return true } sendJson(res, 202, (await mgr.rollback(body.id)).summary()); return true }
+      if (sub === '/rollback' && method === 'POST') { const body = (await readJsonBody(req)) as { id?: string }; if (!body.id) { sendJson(res, 400, { error: 'id required' }); return true } sendJson(res, 202, (await mgr.rollback(body.id)).summary()); return true }
       if (sub === '/restart' && method === 'POST') { sendJson(res, 200, { output: await mgr.restartService() }); return true }
       if (sub === '/toolchain/plan' && method === 'GET') { sendJson(res, 200, await mgr.toolchainPlan()); return true }
       sendJson(res, 404, { error: 'not found' }); return true
-    } catch (e) { sendJson(res, e instanceof BodyTooLarge ? 413 : 400, { error: e instanceof Error ? e.message : String(e) }); return true }
+    } catch (e) { if (e instanceof BodyError) sendJson(res, e.status, { error: e.message }, e.status === 413); else sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) }); return true }
   }
   return Object.assign(handler, { manager: mgr })
 }

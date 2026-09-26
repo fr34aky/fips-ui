@@ -17,14 +17,16 @@ export function Upgrade() {
   const forceRef = useRef(false);
   const { data: st, error, refresh } = usePoll(() => { const f = forceRef.current; forceRef.current = false; return upgradeApi.status(f); }, [], 15000);
   const forceRefresh = () => { forceRef.current = true; refresh(); };
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  // The job this tab launched (id + start time); it only bridges the gap until the next status poll sees it.
+  const [active, setActive] = useState<{ id: string; startedAt: number } | null>(null);
+  const activeJobId = active?.id ?? null;
+  const setActiveJobId = (j: JobSummary | null) => setActive(j ? { id: j.id, startedAt: j.startedAt } : null);
   const [dismissedId, setDismissedId] = useState<string | null>(null);
   // The server keeps its last job indefinitely, so "dismiss" has to be remembered client-side.
-  const serverJobId = st?.job && st.job.id !== dismissedId ? st.job.id : null;
-  // Job ids are timestamps, so lexical order is start order: a newer job reported by the server (started from
-  // another tab or curl) supersedes the one this tab launched; the local id only bridges the gap until the
-  // next status poll sees it.
-  const followId = serverJobId && (!activeJobId || serverJobId > activeJobId) ? serverJobId : activeJobId ?? serverJobId;
+  const serverJob = st?.job && st.job.id !== dismissedId ? st.job : null;
+  // A newer job reported by the server (started from another tab or curl) supersedes the one this tab launched.
+  // Compared by start time, not id, so an id-format change across a backend upgrade cannot pin an old job.
+  const followId = serverJob && (!active || serverJob.startedAt > active.startedAt || serverJob.id === active.id) ? serverJob.id : activeJobId ?? serverJob?.id ?? null;
   const { job: liveJob, log } = useUpgradeJob(followId);
   const candidate = liveJob ?? st?.job ?? null;
   const job = candidate && candidate.id !== dismissedId ? candidate : null;
@@ -41,7 +43,7 @@ export function Upgrade() {
 
   const launch = async (fn: () => Promise<JobSummary | null>) => {
     setActionErr(null);
-    try { const j = await fn(); if (j) { setDismissedId(null); setActiveJobId(j.id); refresh(); } }
+    try { const j = await fn(); if (j) { setDismissedId(null); setActiveJobId(j); refresh(); } }
     catch (e) { setActionErr((e as Error).message); }
   };
 
