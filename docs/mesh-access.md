@@ -49,7 +49,8 @@ An npub is a node, not a person: **everything that leaves the listed node under 
 including every local user of that node and, if it runs `fips-gateway`, every LAN client behind it. List
 only nodes whose users you would all trust with that role. This node's own npub cannot be listed (any local
 user could use it to get around `FIPS_UI_TOKEN`). Browsers must address the node by its fips0 address,
-`<its npub>.fips`, or a name that `/etc/fips/hosts` maps to its npub.
+`<its npub>.fips`, or a name that this node's own `/etc/fips/hosts` maps to its npub (a name that only exists
+in the visiting node's hosts file is refused; use the npub name or the address).
 
 The local listener (loopback) is always admin. Mesh access requires helper v5 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
 listener only; over the mesh the npub is the credential.

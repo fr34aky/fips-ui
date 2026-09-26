@@ -63,7 +63,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
           <Globe size={16} className="text-ink-3" />
           {!saved.enabled ? <Chip>off</Chip> : st.listening ? <Chip tone="good">listening</Chip> : <Chip tone="crit">not listening</Chip>}
           {saved.enabled && <Chip tone={st.guard?.active ? 'good' : 'crit'} title="Kernel rule that only lets mesh source addresses reach the UI through the FIPS interface">{st.guard?.active ? 'spoofing guard on' : 'spoofing guard off'}</Chip>}
-          {saved.enabled && st.error && <span className="text-crit text-xs">{st.error}</span>}
+          {saved.enabled && (st.error || st.guard?.error) && <span className="text-crit text-xs">{st.error ?? st.guard?.error}</span>}
           {you.kind === 'mesh' && <span className="text-xs text-ink-3 ml-auto">you: {you.label || shortKey(you.npub, 10, 4)} · {you.role}</span>}
         </div>
         {saved.enabled && urls.length > 0 && <div className="grid gap-1">{urls.map((u) => <Copyable key={u} text={u} className="text-xs rounded-md bg-surface-2 px-2.5 py-1.5 w-fit max-w-full" />)}</div>}
@@ -96,7 +96,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
-        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
+        {draft.enabled && (!data.firewallManaged || /helper v5/.test(st.guard?.error ?? '')) && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 
         {!readOnly && (
           <div className="flex justify-end gap-2">

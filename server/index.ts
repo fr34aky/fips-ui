@@ -396,7 +396,9 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   if (isMeshAddress(remote) && (listener === 'mesh' || mesh.config.enabled)) {
     // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
     // principal is read only after that, so a revocation during the proof takes effect.
-    if (!(await mesh.provenAtAccept(req.socket))) return denyMesh(req, res, 'the spoofing guard was not loaded for this connection; try again');
+    const proof = await mesh.provenAtAccept(req.socket);
+    if (proof === 'retry') { res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1', connection: 'close' }); res.end(JSON.stringify({ error: 'the spoofing guard was just reloaded; retry in a second' })); return; }
+    if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection; try again');
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
     mesh.track(req.socket, pr);
@@ -477,7 +479,7 @@ function syncMesh(): Promise<MeshSyncResult> {
     const keeps = () => !!ports && mesh.guard.active && samePorts(mesh.guard.ports, ports) && mesh.guard.tun === tun;
     try {
       const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
-      if (g.ok) mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] });
+      if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }
       else { result.ok = false; result.guard = g.error ?? 'failed'; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
@@ -493,14 +495,10 @@ function syncMesh(): Promise<MeshSyncResult> {
   return meshSync.running;
 }
 
-/**
- * Every 30 s while mesh access is on, confirm the guard is really loaded (something outside the UI, such as
- * restarting nftables.service, can flush it). Read-only; only the guard is touched, never the firewall rule.
- * If it is gone, admission stops at once and the guard is re-applied.
- */
 /** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
 function reapplyGuard(): Promise<MeshSyncResult> {
-  if (meshSync.running) return meshSync.running.then(() => reapplyGuard());
+  // If a sync is running it applies the guard itself; only re-apply afterwards if the guard is still not right.
+  if (meshSync.running) return meshSync.running.then(() => (mesh.guard.active && mesh.guard.tun === mesh.tunName ? { ok: true } : reapplyGuard()));
   meshSync.running = (async (): Promise<MeshSyncResult> => {
     if (!mesh.config.enabled) return { ok: true };
     if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); return { ok: false, guard: 'no canary' }; }
