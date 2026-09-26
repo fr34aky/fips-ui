@@ -14,6 +14,17 @@
 #   rollback <backup-id>
 #   restart
 #   list-backups
+#   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted
+#   config-apply [--no-restart]    <- new fips.yaml on stdin; redacted placeholders are restored from
+#                                     the current file; backed up, installed, daemon restarted and
+#                                     rolled back automatically if it does not come up healthy
+#   config-backups                 -> JSON list of config backups
+#   config-restore <backup-id>     -> reinstall a config backup, restart with the same health check
+#   firewall-status                -> JSON: unit state, whether table inet fips is loaded, live ruleset
+#   dropin-apply <name>            <- nftables drop-in on stdin; validated with `nft -c` against the
+#                                     full baseline before /etc/fips/fips.d/<name>.nft is written
+#   dropin-delete <name>
+#   service <action> <unit>        -> start|stop|restart|reload|enable|disable for fips units (systemd)
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -25,7 +36,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=2
+HELPER_VERSION=3
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -182,6 +193,112 @@ install_package() {
   esac
 }
 
+# ---------------------------------------------------------------- node management (v3)
+FIPS_CONFIG=/etc/fips/fips.yaml
+FIPS_NFT=/etc/fips/fips.nft
+DROPIN_DIR=/etc/fips/fips.d
+CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DIR")/config-backups"
+PLACEHOLDER='"<redacted>"'
+MAX_CONFIG_BYTES=262144
+MAX_DROPIN_BYTES=65536
+# Keys whose values never leave this script (matched case-insensitively as the whole key).
+SECRET_KEYS='nsec|secret|secret_key|private_key|password|passphrase|token|api_key'
+# Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
+# management verbs at scratch files so the whole flow can be exercised without touching /etc.
+if [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]]; then
+  FIPS_CONFIG=${FIPS_TEST_CONFIG:-$FIPS_CONFIG}; FIPS_NFT=${FIPS_TEST_NFT:-$FIPS_NFT}; DROPIN_DIR=${FIPS_TEST_DROPIN_DIR:-$DROPIN_DIR}
+fi
+
+# Print a file with secret values replaced by the placeholder. Line-based and awk-portable (no gawk captures).
+redact() {
+  awk -v keys="^(${SECRET_KEYS})$" -v ph="$PLACEHOLDER" '
+    { line=$0; body=line; sub(/^[ \t]*-?[ \t]*/, "", body); c=index(body, ":")
+      if (c > 1) { k=tolower(substr(body, 1, c-1)); v=substr(body, c+1); gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (k ~ keys && v != "" && v !~ /^#/) { print substr(line, 1, length(line)-length(body)) substr(body, 1, c) " " ph; next } }
+      print line }' "$1"
+}
+
+# restore_secrets <original> <new> <out>: replace placeholder values in <new> with the original values, matched
+# by key name and occurrence order. Fails if a placeholder has no original counterpart.
+restore_secrets() {
+  awk -v keys="^(${SECRET_KEYS})$" -v ph="$PLACEHOLDER" '
+    function keyof(s,   b, c) { b=s; sub(/^[ \t]*-?[ \t]*/, "", b); c=index(b, ":"); return c > 1 ? tolower(substr(b, 1, c-1)) : "" }
+    FNR==NR { k=keyof($0); if (k ~ keys) { b=$0; sub(/^[ \t]*-?[ \t]*/, "", b); orig[k, ++n[k]]=substr(b, index(b, ":")+1) }; next }
+    { k=keyof($0); if (k ~ keys) { b=$0; sub(/^[ \t]*-?[ \t]*/, "", b); v=substr(b, index(b, ":")+1); t=v; gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t == ph) { i=++m[k]; if (!((k, i) in orig)) { printf "no original value for redacted key %s (occurrence %d)\n", k, i > "/dev/stderr"; bad=1; next }
+          print substr($0, 1, length($0)-length(b)) substr(b, 1, index(b, ":")-1) ":" orig[k, i]; next } } }
+    { print }
+    END { exit bad }' "$1" "$2" > "$3"
+}
+
+read_stdin_limited() { # <dest> <max-bytes>
+  head -c "$(( $2 + 1 ))" > "$1"
+  local n; n=$(wc -c < "$1" | tr -d ' ')
+  (( n <= $2 )) || die "input larger than $2 bytes"
+  (( n > 0 )) || die "empty input"
+}
+
+journal_tail_json() { # <unit> <since-epoch>
+  local out; out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  json_escape "$out"
+}
+
+# The daemon is healthy when the unit is active and its control socket answers, three checks in a row.
+wait_fips_healthy() {
+  local deadline=$(( $(date +%s) + ${1:-25} )) ok=0
+  sleep 2
+  while (( $(date +%s) < deadline )); do
+    if systemctl is-active --quiet "$SERVICE" && fipsctl show status >/dev/null 2>&1; then ok=$((ok + 1)); (( ok >= 3 )) && return 0
+    else ok=0; fi
+    sleep 1
+  done
+  return 1
+}
+
+require_systemd() { [[ "$SM" == systemd ]] || die "node management verbs need systemd (found $SM)"; }
+valid_id() { [[ "$1" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid backup id"; }
+
+backup_config() {
+  mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+  local id; id=$(date +%Y%m%d-%H%M%S); local f="$CONFIG_BACKUPS_DIR/$id.yaml" i=1
+  while [[ -e "$f" ]]; do i=$((i + 1)); f="$CONFIG_BACKUPS_DIR/$id-$i.yaml"; done
+  install -m 0600 -o 0 -g 0 "$FIPS_CONFIG" "$f"
+  local d n=0; for d in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do n=$((n + 1)); (( n > 20 )) && rm -f -- "$d"; done
+  basename "$f" .yaml
+}
+
+# install_config_and_restart <file> <backup-id> <restart:true|false>
+install_config_and_restart() {
+  install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG"
+  if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
+  local start; start=$(date +%s)
+  systemctl restart "$SERVICE" || true
+  if wait_fips_healthy 25; then
+    printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":true}\n' "$(json_escape "$2")"; return
+  fi
+  local log; log=$(journal_tail_json "$SERVICE" "$start")
+  log "daemon unhealthy with the new config; restoring backup $2"
+  install -m 0600 -o 0 -g 0 "$CONFIG_BACKUPS_DIR/$2.yaml" "$FIPS_CONFIG"
+  systemctl restart "$SERVICE" || true
+  local back=false; wait_fips_healthy 25 && back=true
+  printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"
+}
+
+valid_dropin() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "invalid drop-in name (a-z, 0-9, _ and -, up to 41 characters)"; }
+
+# check_ruleset <dir-with-candidate-dropins>: validate the baseline plus drop-ins without loading anything.
+check_ruleset() {
+  local t; t=$(mktemp -d); cp -a "$1/." "$t/" 2>/dev/null || true
+  sed "s#include \"$DROPIN_DIR/\*\.nft\"#include \"$t/*.nft\"#" "$FIPS_NFT" > "$t/.baseline"
+  grep -qF "include \"$t/*.nft\"" "$t/.baseline" || { rm -rf "$t"; printf '%s' "$FIPS_NFT does not contain the standard include \"$DROPIN_DIR/*.nft\" line; refusing to validate"; return 1; }
+  local out; out=$(nft -c -f "$t/.baseline" 2>&1); local rc=$?
+  rm -rf "$t"; printf '%s' "$out"; return $rc
+}
+
+firewall_reload_if_active() {
+  if systemctl is-active --quiet fips-firewall.service; then systemctl reload-or-restart fips-firewall.service && echo true || echo false; else echo false; fi
+}
+
 # ---------------------------------------------------------------- commands
 cmd=${1:-}
 case "$cmd" in
@@ -236,6 +353,84 @@ case "$cmd" in
     printf '{"ok":true,"restarted":%s}\n' "$restarted"
     ;;
 
+  config-show)
+    [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
+    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"; redact "$f"
+    else redact "$FIPS_CONFIG"; fi
+    ;;
+
+  config-apply)
+    require_systemd
+    restart=true; [[ "${2:-}" == "--no-restart" ]] && restart=false
+    [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
+    tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
+    read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
+    restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" || die "cannot restore redacted values; keep the \"<redacted>\" lines under their original keys"
+    grep -qF "$PLACEHOLDER" "$tmp2" && die "a redacted placeholder is still present"
+    if cmp -s "$tmp2" "$FIPS_CONFIG"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
+    id=$(backup_config)
+    install_config_and_restart "$tmp2" "$id" "$restart"
+    ;;
+
+  config-backups)
+    mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+    printf '['; first=true
+    for f in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do
+      $first || printf ','; first=false
+      printf '{"id":%s,"size":%s,"mtime":%s}' "$(json_escape "$(basename "$f" .yaml)")" "$(wc -c < "$f" | tr -d ' ')" "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")"
+    done
+    printf ']\n'
+    ;;
+
+  config-restore)
+    require_systemd
+    valid_id "${2:-}"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"
+    id=$(backup_config)
+    install_config_and_restart "$f" "$id" true
+    ;;
+
+  firewall-status)
+    require_systemd
+    active=false; systemctl is-active --quiet fips-firewall.service && active=true
+    enabled=$(systemctl is-enabled fips-firewall.service 2>/dev/null || true)
+    ruleset=null; loaded=false
+    if command -v nft >/dev/null 2>&1 && out=$(nft -j list table inet fips 2>/dev/null) && [[ -n "$out" ]]; then ruleset=$out; loaded=true; fi
+    printf '{"ok":true,"unit_active":%s,"unit_enabled":%s,"table_loaded":%s,"ruleset":%s}\n' "$active" "$(json_escape "${enabled:-unknown}")" "$loaded" "$ruleset"
+    ;;
+
+  dropin-apply)
+    require_systemd
+    name=${2:-}; valid_dropin "$name"
+    command -v nft >/dev/null 2>&1 || die "nft not found"
+    [[ -f "$FIPS_NFT" ]] || die "$FIPS_NFT not found"
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    read_stdin_limited "$tmp/new" "$MAX_DROPIN_BYTES"
+    mkdir "$tmp/d"; cp -a "$DROPIN_DIR/." "$tmp/d/" 2>/dev/null || true; cp "$tmp/new" "$tmp/d/$name.nft"
+    if ! err=$(check_ruleset "$tmp/d"); then printf '{"ok":false,"error":"nft rejected the ruleset","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
+    mkdir -p "$DROPIN_DIR"
+    install -m 0644 -o 0 -g 0 "$tmp/new" "$DROPIN_DIR/$name.nft"
+    printf '{"ok":true,"file":%s,"reloaded":%s}\n' "$(json_escape "$DROPIN_DIR/$name.nft")" "$(firewall_reload_if_active)"
+    ;;
+
+  dropin-delete)
+    require_systemd
+    name=${2:-}; valid_dropin "$name"
+    [[ -f "$DROPIN_DIR/$name.nft" ]] || die "drop-in $name not found"
+    rm -f -- "$DROPIN_DIR/$name.nft"
+    printf '{"ok":true,"reloaded":%s}\n' "$(firewall_reload_if_active)"
+    ;;
+
+  service)
+    require_systemd
+    action=${2:-}; unit=${3:-}
+    case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
+    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
+    systemctl cat "$unit.service" >/dev/null 2>&1 || die "$unit.service is not installed"
+    if [[ "$action" == reload ]]; then systemctl reload-or-restart "$unit.service"; else systemctl "$action" "$unit.service"; fi
+    a=false; systemctl is-active --quiet "$unit.service" && a=true
+    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
+    ;;
+
   list-backups)
     ensure_backups_dir
     printf '['
@@ -250,6 +445,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>}"
     ;;
 esac

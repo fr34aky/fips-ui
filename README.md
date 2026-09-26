@@ -21,6 +21,8 @@ reachability probes, and (optionally) upgrade the node.
 | **Diagnostics** | Staged reachability probes (bloom → discovery → path → session → RTT) against any npub or hosts-file name, with path visualisation and a run history. |
 | **Access** | Peer ACL state, firewall exposure of local listeners, the `/etc/fips/hosts` table (one-click probe), identity file facts. |
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
+| **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. See [docs/node-management.md](docs/node-management.md). |
+| **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
 | **Upgrade** | Install the latest GitHub release (checksum-verified) or build any ref from source with cargo, with backups and rollback. Root steps go through a tiny helper you install once from a shell. See [docs/upgrade.md](docs/upgrade.md). |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
@@ -57,7 +59,7 @@ Everything is via environment variables.
 | `FIPS_UI_ALLOWED_HOSTS` | – | Comma-separated hostnames browsers may use to reach the UI, in addition to loopback and the bind address, e.g. `htpc.lan,node.fips`. Requests with any other `Host` are refused (DNS-rebinding protection). |
 | `FIPS_UI_TOKEN` | – | When set, every API call needs `Authorization: Bearer <token>`; the UI prompts for it once and stores it in the browser. Put it in `/etc/default/fips-ui` (mode 0600), not in the unit file. |
 | `FIPS_UI_READ_ONLY` | – | `1` disables every mutating action (connect, disconnect, probe, service control, upgrade). |
-| `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | `1` enables restart/start buttons for the fips units. Requires the UI user to be allowed to run `systemctl restart fips.service` (polkit rule or running as root). |
+| `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | Legacy: `1` enables service buttons through plain `systemctl` (polkit rule or root) when the helper is not installed. With helper v3 they work without it. |
 | `FIPS_UI_POLL_MS` | `2000` | How often the backend polls the daemon while at least one browser is connected. |
 | `FIPS_SOCKET` | auto | Control socket path override (`/run/fips/control.sock`). |
 | `FIPS_GATEWAY_SOCKET` | auto | Gateway control socket override. |
@@ -93,7 +95,7 @@ address and open the port in the fips firewall to reach it from other mesh nodes
 
 - The backend only ever speaks the documented [control-socket protocol](https://github.com/jmcorgan/fips/blob/master/docs/reference/control-socket.md) and shells out to `journalctl`/`systemctl`. It runs unprivileged.
 - Read queries are proxied through an allow-list; only `connect`, `disconnect` and the probe triplet are mutating, plus service control and upgrade when explicitly enabled/installed.
-- The web UI never asks for a sudo password. The only root-capable path is the upgrade helper, installed by an administrator from a shell with a single-command sudoers rule ([docs/upgrade.md](docs/upgrade.md#privilege-model)).
+- The web UI never asks for a sudo password. The only root-capable path is the helper, installed by an administrator from a shell with a single-command sudoers rule ([docs/upgrade.md](docs/upgrade.md#privilege-model)). With it, the UI can upgrade the node and manage its configuration, firewall and services ([docs/node-management.md](docs/node-management.md)); on a host shared with other users, set `FIPS_UI_TOKEN`.
 - Bind to loopback (default) or set `FIPS_UI_TOKEN`.
 
 ## API
