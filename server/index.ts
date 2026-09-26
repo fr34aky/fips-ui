@@ -244,9 +244,13 @@ function serveStatic(url: URL, res: Res) {
 // ---------------------------------------------------------------------------------------------
 const startedAt = Date.now();
 let upgradeStarting = 0;
+/** Sentinel for a request no listener attributed: a viewer that route() refuses outright. */
+const NOBODY: Principal = { kind: 'mesh', role: 'viewer', npub: '', address: '' };
 /** Who is making each request: the loopback listener is the local operator; the mesh listener an allowed npub. */
 const principals = new WeakMap<Req, Principal>();
-const principalOf = (req: Req): Principal => principals.get(req) ?? LOCAL;
+const mainRequests = new WeakSet<Req>();
+/** The recorded principal, or the local operator for requests the main listener accepted; otherwise nobody. */
+const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequests.has(req) ? LOCAL : NOBODY);
 const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
@@ -264,6 +268,7 @@ async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
 }
 
 async function route(req: Req, res: Res) {
+  if (principalOf(req) === NOBODY) return json(res, 403, { error: 'no identity for this request' }, true);
   const via: 'local' | 'mesh' = principalOf(req).kind;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const p = url.pathname;
@@ -341,7 +346,9 @@ async function route(req: Req, res: Res) {
     // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
     for (let i = 0; meshSync.running && i < 3; i++) await meshSync.running.catch(() => {});
     meshSync.dirty = true;
-    const firewall = await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
+    const firewall = meshSync.running
+      ? { ok: false, skipped: 'another sync is still running; this change is applied within 15 seconds' }
+      : await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
     await mesh.reconcile();
     return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
   }
@@ -404,7 +411,8 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
     // principal is read only after that, so a revocation during the proof takes effect.
     const proof = await mesh.provenAtAccept(req.socket);
     if (proof === 'retry') { res.setHeader('retry-after', '1'); return json(res, 503, { error: 'the spoofing guard was just reloaded; retry in a second' }, true); }
-    if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection; try again');
+    if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection');
+    if (!mesh.ready()) { res.setHeader('retry-after', '5'); return json(res, 503, { error: 'mesh access is not ready (guard or node identity missing); retry shortly' }, true); }
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
     mesh.track(req.socket, pr);
@@ -412,7 +420,7 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   }
   return route(req, res);
 }
-const server = http.createServer((req, res) => { handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
+const server = http.createServer((req, res) => { mainRequests.add(req); handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
 
 
 // ---------------------------------------------------------------------------------------------
@@ -489,9 +497,6 @@ function syncMesh(): Promise<MeshSyncResult> {
       meshSync.dirty = true;
       return { ok: false, guard: 'no canary' };
     }
-    // Only a failed re-apply of exactly the guard already confirmed (same ports, same interface) keeps it; the
-    // per-connection canary proof catches a real loss. Anything else stops admission.
-    const keeps = () => !!ports && mesh.guard.active && samePorts(mesh.guard.ports, ports) && mesh.guard.tun === tun;
     // A guard already confirmed for exactly these ports and this interface is left alone (no reload): the
     // per-connection canary and the 30 s check notice if it disappears.
     const confirmed = !!ports && mesh.guard.active && mesh.guard.tun === tun && samePorts(mesh.guard.ports, ports);
@@ -500,9 +505,9 @@ function syncMesh(): Promise<MeshSyncResult> {
     } else try {
       const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
       if (g.ok && tun !== mesh.tunName) { result.ok = false; result.guard = 'interface changed while applying'; meshGuardDirty = true; }
-      else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }
-      else { result.ok = false; result.guard = g.error ?? 'failed'; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
-    } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+      else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }, { reloaded: true }); meshGuardDirty = false; }
+      else { result.ok = false; result.guard = g.error ?? 'failed'; mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+    } catch (e) { result.ok = false; result.guard = (e as Error).message; mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     try {
       const r = await applyMeshRule(cfg);
       if (!r.ok) { result.ok = false; result.rule = String(r.error ?? 'rejected'); }
@@ -517,13 +522,14 @@ function syncMesh(): Promise<MeshSyncResult> {
 /** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
 function reapplyGuard(): Promise<MeshSyncResult> {
   // If a sync is running it applies the guard itself; only re-apply afterwards if the guard is still not right.
-  if (meshSync.running) return meshSync.running.then(() => reapplyGuard());
+  // After a running sync, re-apply only if the guard is still not right for the current ports and interface.
+  if (meshSync.running) return meshSync.running.then(() => (mesh.guard.active && mesh.guard.tun === mesh.tunName && samePorts(mesh.guard.ports, guardPorts(mesh.config)) ? { ok: true } : reapplyGuard()));
   meshSync.running = (async (): Promise<MeshSyncResult> => {
     if (!mesh.config.enabled) return { ok: true };
     if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); return { ok: false, guard: 'no canary' }; }
     const want = guardPorts(mesh.config), tun = mesh.tunName;
     const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
-    if (g.ok && tun === mesh.tunName) mesh.setGuard({ active: true, ports: want, tun });
+    if (g.ok && tun === mesh.tunName) mesh.setGuard({ active: true, ports: want, tun }, { reloaded: true });
     else { mesh.setGuard({ active: false, ports: [], error: g.ok ? 'interface changed while applying' : g.error }); meshGuardDirty = true; }
     return { ok: g.ok, guard: g.ok ? undefined : g.error };
   })().finally(() => { meshSync.running = null; });

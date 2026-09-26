@@ -81,11 +81,12 @@ const live = (() => {
       set({ conn: 'reconnecting' });
       const probe = () => fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => r.status, () => 0);
       const reopen = (ms: number) => setTimeout(() => { if (refs > 0 && !es) open(); }, ms);
-      // A non-200 answer closes an EventSource permanently: reopen it ourselves. 401 needs a token (the dialog
-      // reconnects); 403 may be temporary (guard reloading, list being edited), so retry slowly.
+      // A non-200 answer closes an EventSource permanently: reopen it ourselves, unless access is refused for
+      // good (401 needs a token and the dialog reconnects; 403 means this client is not allowed). Temporary
+      // states (guard reloading, node identity unknown) are answered 503 by the server.
       if (es && es.readyState === EventSource.CLOSED) {
         es = null;
-        void probe().then((st) => { if (st === 401) authStore.setNeeded(true); else reopen(st === 403 ? 30_000 : 3000); });
+        void probe().then((st) => { if (st === 401) authStore.setNeeded(true); else if (st !== 403) reopen(3000); });
         return;
       }
       // Still reconnecting on its own; probe once to detect an expired token.

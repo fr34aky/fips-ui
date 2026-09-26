@@ -110,10 +110,11 @@ export class MeshAccess {
    * Record the guard state. It takes effect for admission at once (principalFor checks it), and losing it
    * cuts every mesh connection and stops the listener, through the queue so it cannot race a bind.
    */
-  setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }): void {
-    // Every successful (re)load counts, not only inactive-to-active: a reload after an unnoticed flush is one too.
+  setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }, opts: { reloaded?: boolean } = {}): void {
     const prev = this.guard;
-    const transition = !prev.active || !g.active || prev.tun !== g.tun || prev.ports.join() !== g.ports.join();
+    // A real change of state, or any actual reload of the table by the helper (after a flush that went unnoticed,
+    // a reload is exactly when queued forged handshakes must be discarded).
+    const transition = prev.active !== g.active || (g.active && (!!opts.reloaded || prev.tun !== g.tun || prev.ports.join() !== g.ports.join()));
     this.guard = g;
     this.guardGen++;
     if (!transition) return; // the same confirmed guard: nothing to do
@@ -166,7 +167,9 @@ export class MeshAccess {
   proveOnAccept(socket: Socket): void {
     const acceptedAt = performance.now();
     const p = (async (): Promise<Proof> => {
-      if (!this.guard.active || this.guard.tun !== this.tun) return 'fail';
+      if (!this.guard.active || this.guard.tun !== this.tun) return 'retry';
+      // The connection must have arrived on a port the loaded guard covers.
+      if (!this.guard.ports.includes(socket.localPort ?? -1)) return 'fail';
       // A handshake that completed while the table was missing can be accepted just after it is re-loaded;
       // connections accepted within a second of a (re)load are answered "retry" instead of admitted.
       if (acceptedAt - this.guardSince < 1000) return 'retry';
@@ -185,6 +188,9 @@ export class MeshAccess {
 
   /** Called when the daemon reports a different TUN name, so the guard is re-applied for it. */
   onTunChange: () => void = () => {};
+
+  /** Whether admission is possible at all right now (false while the guard or the node's identity is missing). */
+  ready(): boolean { return this.config.enabled && this.guard.active && !!this.own && this.guard.tun === this.tun; }
 
   /**
    * The principal for a connection from a mesh (fd00::/8) source on the mesh listener, or null if it is not

@@ -29,13 +29,14 @@ guard, including its canary, still matches (one read-only sudo call, visible in 
 Mesh identities are admitted on the mesh listener only. While mesh access is on, an `fd00::/8` source on
 the main listener is refused, so if you expose the main listener on a LAN that itself uses `fd` ULA
 addresses, those clients need IPv4 or a non-`fd` address while mesh access is on. With mesh access off,
-nothing changes for them. Each time the guard is (re)loaded, the mesh listener is closed and rebound, which
-discards any connection that was queued while the guard was missing, and connections accepted in the first
-second after that are answered "retry" rather than admitted.
+nothing changes for them. Whenever the guard is actually (re)loaded (it was missing, its ports or interface changed, or the helper
+reloaded it), the mesh listener is closed and rebound, which discards any connection that queued while the
+guard was missing, and connections accepted in the first second after that are answered "retry" (503)
+rather than admitted. Saving the allow-list does not reload a guard that is already confirmed.
 
 As a further layer, the UI keeps a rule in its managed firewall drop-in that opens the mesh port on fips0
-only to the allowed npubs. Both are updated right after every change to the allow-list and retried every
-15 seconds until they succeed.
+only to the allowed npubs. The firewall rule is updated right after every change to the allow-list, the guard whenever it is
+missing or no longer matches, and both are retried every 15 seconds until they succeed.
 
 Removing an npub or changing its role closes its open connections, including live event streams. An
 operation it had already started, such as a configuration apply, still completes.
