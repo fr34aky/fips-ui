@@ -82,6 +82,7 @@ export class MeshAccess {
   guard: { active: boolean; ports: number[]; tun?: string; error?: string } = { active: false, ports: [] };
   /** Bumped on every guard state change, so a check that started earlier can tell it is stale. */
   guardGen = 0;
+  private rebindGen = 0;
   /** When the guard was last (re)loaded, on a monotonic clock: connections accepted right after are refused. */
   private guardSince = 0;
   /** Set when access.json exists but could not be loaded; saving is refused until it loads, so it is never overwritten. */
@@ -111,18 +112,19 @@ export class MeshAccess {
    */
   setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }): void {
     // Every successful (re)load counts, not only inactive-to-active: a reload after an unnoticed flush is one too.
-    const wasActive = this.guard.active;
-    if (g.active) this.guardSince = performance.now();
+    const prev = this.guard;
+    const transition = !prev.active || !g.active || prev.tun !== g.tun || prev.ports.join() !== g.ports.join();
     this.guard = g;
     this.guardGen++;
-    // Losing the guard cuts every mesh connection and stops the listener. Getting it back (inactive to active)
-    // closes and rebinds the listener, discarding any handshake that queued in the backlog while it was
-    // missing. Re-applying a guard that was already active (every save) leaves connections alone.
-    if (wasActive && g.active) return;
-    const gen = this.guardGen;
-    if (!g.active) this.revalidate();
+    if (!transition) return; // the same confirmed guard: nothing to do
+    // Losing the guard cuts every mesh connection and stops the listener. Getting it (back) starts the grace
+    // window and closes and rebinds the listener, discarding any handshake that queued in the backlog while
+    // it was missing. The rebind has its own counter, so unrelated guard updates cannot cancel it.
+    if (g.active) this.guardSince = performance.now();
+    else this.revalidate();
+    const rebind = ++this.rebindGen;
     void this.serial(async () => {
-      if (gen !== this.guardGen) return;
+      if (rebind !== this.rebindGen) return;
       if (this.server) this.close();
       if (this.guard.active) await this.reconcileNow();
     });

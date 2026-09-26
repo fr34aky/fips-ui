@@ -337,9 +337,9 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access') {
     try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
-    // Syncs already in flight (or chained on them) were built from the previous list: wait until none is
-    // running, then start this save's own full sync before yielding.
-    while (meshSync.running) await meshSync.running.catch(() => {});
+    // Syncs already in flight (or chained on them) were built from the previous list: wait for a few of them,
+    // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
+    for (let i = 0; meshSync.running && i < 3; i++) await meshSync.running.catch(() => {});
     meshSync.dirty = true;
     const firewall = await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
     await mesh.reconcile();
@@ -492,7 +492,12 @@ function syncMesh(): Promise<MeshSyncResult> {
     // Only a failed re-apply of exactly the guard already confirmed (same ports, same interface) keeps it; the
     // per-connection canary proof catches a real loss. Anything else stops admission.
     const keeps = () => !!ports && mesh.guard.active && samePorts(mesh.guard.ports, ports) && mesh.guard.tun === tun;
-    try {
+    // A guard already confirmed for exactly these ports and this interface is left alone (no reload): the
+    // per-connection canary and the 30 s check notice if it disappears.
+    const confirmed = !!ports && mesh.guard.active && mesh.guard.tun === tun && samePorts(mesh.guard.ports, ports);
+    if (confirmed) {
+      meshGuardDirty = false;
+    } else try {
       const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
       if (g.ok && tun !== mesh.tunName) { result.ok = false; result.guard = 'interface changed while applying'; meshGuardDirty = true; }
       else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }

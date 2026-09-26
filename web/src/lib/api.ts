@@ -79,17 +79,17 @@ const live = (() => {
     es.onopen = () => set({ conn: state.snapshot ? 'live' : 'connecting' });
     es.onerror = () => {
       set({ conn: 'reconnecting' });
-      // A non-200 answer closes an EventSource permanently. Reopen it after a transient refusal (503 while the
-      // guard reloads), but not when access is denied (401 needs a token, 403 means this npub is not allowed).
+      const probe = () => fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => r.status, () => 0);
+      const reopen = (ms: number) => setTimeout(() => { if (refs > 0 && !es) open(); }, ms);
+      // A non-200 answer closes an EventSource permanently: reopen it ourselves. 401 needs a token (the dialog
+      // reconnects); 403 may be temporary (guard reloading, list being edited), so retry slowly.
       if (es && es.readyState === EventSource.CLOSED) {
         es = null;
-        fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} })
-          .then((r) => { if (r.status === 401) authStore.setNeeded(true); else if (r.status !== 403) setTimeout(() => { if (refs > 0) open(); }, 3000); })
-          .catch(() => setTimeout(() => { if (refs > 0) open(); }, 3000));
+        void probe().then((st) => { if (st === 401) authStore.setNeeded(true); else reopen(st === 403 ? 30_000 : 3000); });
         return;
       }
-      // EventSource can't surface the HTTP status; probe a cheap authenticated route to detect a 401.
-      fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => { if (r.status === 401) authStore.setNeeded(true); }).catch(() => {});
+      // Still reconnecting on its own; probe once to detect an expired token.
+      void probe().then((st) => { if (st === 401) authStore.setNeeded(true); });
     };
   }
   function close() { es?.close(); es = null; }
