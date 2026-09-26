@@ -10,7 +10,7 @@ import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, t
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, type FirewallRule } from './admin.ts';
-import { MeshAccess, LOCAL, AccessError, isMeshSource, expand6, type Principal } from './access.ts';
+import { MeshAccess, LOCAL, AccessError, expand6, type Principal, type AccessConfig } from './access.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -333,8 +333,9 @@ async function route(req: Req, res: Res) {
   const body = await readJsonBody(req);
 
   if (p === '/api/access') {
-    try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
-    return json(res, 200, { config: mesh.config, status: mesh.status(), firewall: await syncMeshFirewall() });
+    let firewall: unknown;
+    try { firewall = await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
   }
 
   if (p === '/api/connect') {
@@ -376,21 +377,24 @@ async function route(req: Req, res: Res) {
 }
 
 /**
- * Every request, on either listener, is attributed by its source address: an fd00::/8 source can only have
- * come through the mesh and is admitted only as an allowed npub; anything else is the local operator
- * (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
+ * Every request is attributed by where it really came from. A source that the kernel routes through the
+ * FIPS TUN device is a mesh identity (see server/access.ts) and is admitted only as an allowed npub, on
+ * either listener. The mesh listener admits nothing else. On the main listener any other source is the
+ * local operator (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
  */
-function handle(req: Req, res: Res): void {
+async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<void> {
   const remote = req.socket.remoteAddress;
-  if (isMeshSource(remote)) {
+  if (await mesh.isMeshRouted(remote)) {
     const pr = mesh.principalFor(remote);
-    if (!pr) { void denyMesh(req, res); return; }
+    if (!pr) return denyMesh(req, res);
     mesh.track(req.socket, pr);
     principals.set(req, pr);
+  } else if (listener === 'mesh') {
+    return denyMesh(req, res, 'not a mesh connection');
   }
-  route(req, res).catch((e) => errToResponse(res, e));
+  return route(req, res);
 }
-const server = http.createServer(handle);
+const server = http.createServer((req, res) => { handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
 
 // ---------------------------------------------------------------------------------------------
 // Mesh access
@@ -411,8 +415,9 @@ async function npubForAddress(addr: string): Promise<string | undefined> {
   return k ? identityCache.byAddr.get(k) : undefined;
 }
 
-async function denyMesh(req: Req, res: Res): Promise<void> {
+async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
   const addr = req.socket.remoteAddress ?? 'unknown';
+  if (reason) return json(res, 403, { error: `refused: ${reason}` }, true);
   const npub = await npubForAddress(addr);
   const who = npub ? `${npub} (${addr})` : addr;
   if ((req.url ?? '').startsWith('/api/')) return json(res, 403, { error: 'this node does not allow your npub', you: { address: addr, npub } }, true);
@@ -422,20 +427,28 @@ async function denyMesh(req: Req, res: Res): Promise<void> {
   res.end(html);
 }
 
-const mesh = new MeshAccess(handle);
+const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
 
 /** Keep the UI's own firewall rule in step with the allow-list: its port, open only to the allowed npubs. */
-async function syncMeshFirewall(): Promise<{ ok: boolean; skipped?: string; error?: string }> {
+/** Runs inside the access queue after every load and save, so rule and allow-list cannot drift apart. */
+async function syncMeshFirewall(cfg: AccessConfig): Promise<{ ok: boolean; skipped?: string; error?: string }> {
   if (!(await admin.helperInfo()).managementCapable) return { ok: false, skipped: 'helper v3 not installed; open the port in the firewall yourself' };
-  const cfg = mesh.config;
   const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
     ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
     : null;
-  try {
-    const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
-    return r.ok ? { ok: true } : { ok: false, error: String(r.error ?? 'rejected') };
-  } catch (e) { return { ok: false, error: (e as Error).message }; }
+  // Another node-management change may hold the lock for a while (a config apply can take minutes): wait for it.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
+      return r.ok ? { ok: true } : { ok: false, error: String(r.error ?? 'rejected') };
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (attempt < 90 && /in progress|upgrade job is running/.test(msg)) { await new Promise((r) => setTimeout(r, 2000)); continue; }
+      return { ok: false, error: msg };
+    }
+  }
 }
+mesh.onChange = syncMeshFirewall;
 void mesh.start();
 
 server.listen(PORT, HOST, () => {
