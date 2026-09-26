@@ -9,11 +9,14 @@ import { spawn, execFile } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { isIPv6 } from 'node:net';
+import { isMeshPrefix } from './net6.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { unitStates } from './system.ts';
 
 export const MIN_HELPER_VERSION = 3;
+// Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
+// The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
+const HELPER_RESTART_TIMEOUT = 330_000;
 // Readable without privileges; overridable only so tests can point it at a scratch copy.
 const DROPIN_DIR = process.env.FIPS_UI_DROPIN_DIR ?? '/etc/fips/fips.d';
 export const MANAGED_DROPIN = 'fips-ui';
@@ -56,14 +59,6 @@ export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?:
 export interface FirewallRule { proto: 'tcp' | 'udp'; ports: string; sources: RuleSource[]; comment?: string; tag?: string }
 
 const PORTS_RE = /^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/;
-/** An fd00::/8 address with an optional /8../128 prefix length: the only sources the mesh ever carries. */
-function isMeshPrefix(s: string): boolean {
-  const [addr, len, extra] = s.split('/');
-  if (extra !== undefined || !isIPv6(addr) || !/^fd/i.test(addr)) return false;
-  if (len === undefined) return true;
-  const n = Number(len);
-  return /^\d{1,3}$/.test(len) && n >= 8 && n <= 128;
-}
 
 function cleanComment(s: string | undefined): string { return (s ?? '').replace(/[^A-Za-z0-9 ._:@,/-]/g, '').slice(0, 60).trim(); }
 
@@ -95,6 +90,7 @@ export async function meshAddress(npub: string): Promise<string> {
   if (!NPUB_RE.test(npub)) throw new BodyError(400, `invalid npub '${npub}'`);
   const hit = addrCache.get(npub);
   if (hit) return hit;
+  if (addrCache.size >= 1000) addrCache.delete(addrCache.keys().next().value!);
   const addr = await new Promise<string>((resolve, reject) => execFile('fipsctl', ['address', npub], { timeout: 5000 }, (err, out) => err ? reject(new Error(`fipsctl address failed: ${err.message}`)) : resolve(String(out).trim())));
   if (!/^fd[0-9a-f:]+$/i.test(addr)) throw new Error(`fipsctl address returned '${addr}'`);
   addrCache.set(npub, addr.toLowerCase());
@@ -190,15 +186,12 @@ export function createAdminHandler(opts: AdminOptions) {
     return value;
   }
 
-  // One privileged change at a time.
-  let chain: Promise<unknown> = Promise.resolve();
+  // One privileged change at a time from this process (the helper also takes a system-wide lock).
   let pending = false;
   function exclusive<T>(fn: () => Promise<T>): Promise<T> {
     if (pending) return Promise.reject(new BodyError(400, 'another node-management change is in progress'));
     pending = true;
-    const p = chain.then(fn).finally(() => { pending = false; });
-    chain = p.catch(() => {});
-    return p;
+    return fn().finally(() => { pending = false; });
   }
 
   async function requireHelper(): Promise<void> {
@@ -264,20 +257,21 @@ export function createAdminHandler(opts: AdminOptions) {
       if (!opts.authorize(req)) { sendJson(res, 403, { error: 'not allowed to change node state' }); return true; }
       const busy = opts.busy();
       if (busy) { sendJson(res, 409, { error: busy }); return true; }
-      const body = await readJsonBody(req);
+      // fips.yaml may be up to 256 KiB, which JSON escaping can roughly double.
+      const body = await readJsonBody(req, sub === '/config' ? 1024 * 1024 : undefined);
 
       if (sub === '/config') {
         const yaml = body.yaml;
         if (typeof yaml !== 'string' || !yaml.trim()) throw new BodyError(400, 'yaml (non-empty string) required');
         if (Buffer.byteLength(yaml) > 256 * 1024) throw new BodyError(400, 'configuration larger than 256 KiB');
         if (body.restart !== undefined && typeof body.restart !== 'boolean') throw new BodyError(400, 'restart must be a boolean');
-        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : [])], yaml.endsWith('\n') ? yaml : yaml + '\n', 120_000));
+        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : [])], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/config/restore') {
         const id = body.id;
         if (typeof id !== 'string' || !/^[0-9]{8}-[0-9]{6}(-[0-9]+)?$/.test(id)) throw new BodyError(400, 'id (backup id string) required');
-        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-restore', id], undefined, 120_000));
+        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-restore', id], undefined, HELPER_RESTART_TIMEOUT));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/firewall/rules') {
@@ -315,5 +309,10 @@ export function createAdminHandler(opts: AdminOptions) {
     }
   };
 
-  return Object.assign(handler, { helperInfo, serviceAction: (unit: string, action: string) => exclusive(() => serviceAction(unit, action)) });
+  return Object.assign(handler, {
+    helperInfo,
+    /** True while a node-management change is running (upgrades must not start then). */
+    changePending: () => pending,
+    serviceAction: (unit: string, action: string) => { const b = opts.busy(); return b ? Promise.reject(new Error(b)) : exclusive(() => serviceAction(unit, action)); },
+  });
 }

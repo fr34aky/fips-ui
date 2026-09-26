@@ -267,7 +267,10 @@ async function route(req: Req, res: Res) {
   }
 
   if (p === '/api/events') return handleSse(req, res);
-  if (p.startsWith('/api/upgrade')) { if (await upgrade(req, res)) return; }
+  if (p.startsWith('/api/upgrade')) {
+    if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
+    if (await upgrade(req, res)) return;
+  }
   if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 

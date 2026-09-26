@@ -14,7 +14,8 @@
 #   rollback <backup-id>
 #   restart
 #   list-backups
-#   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted
+#   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted as
+#                                     numbered placeholders bound to their key and parent line
 #   config-apply [--no-restart]    <- new fips.yaml on stdin; redacted placeholders are restored from
 #                                     the current file; backed up, installed, daemon restarted and
 #                                     rolled back automatically if it does not come up healthy
@@ -197,39 +198,108 @@ install_package() {
 FIPS_CONFIG=/etc/fips/fips.yaml
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
-CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DIR")/config-backups"
-PLACEHOLDER='"<redacted>"'
+# Fixed per OS and deliberately not derived from FIPS_UI_BACKUPS, which sudo forwards from the caller.
+CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DEFAULT")/config-backups"
+LOCK_FILE=/var/run/fips-ui-helper.lock
 MAX_CONFIG_BYTES=262144
 MAX_DROPIN_BYTES=65536
-# Keys whose values never leave this script (matched case-insensitively as the whole key).
-SECRET_KEYS='nsec|secret|secret_key|private_key|password|passphrase|token|api_key'
+# Keys whose values never leave this script, matched case-insensitively against the whole key.
+SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
 # Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
 # management verbs at scratch files so the whole flow can be exercised without touching /etc.
 if [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]]; then
   FIPS_CONFIG=${FIPS_TEST_CONFIG:-$FIPS_CONFIG}; FIPS_NFT=${FIPS_TEST_NFT:-$FIPS_NFT}; DROPIN_DIR=${FIPS_TEST_DROPIN_DIR:-$DROPIN_DIR}
+  CONFIG_BACKUPS_DIR=${FIPS_TEST_CONFIG_BACKUPS:-$CONFIG_BACKUPS_DIR}; LOCK_FILE=${FIPS_TEST_LOCK:-$LOCK_FILE}
 fi
 
-# Print a file with secret values replaced by the placeholder. Line-based and awk-portable (no gawk captures).
-redact() {
-  awk -v keys="^(${SECRET_KEYS})$" -v ph="$PLACEHOLDER" '
-    { line=$0; body=line; sub(/^[ \t]*-?[ \t]*/, "", body); c=index(body, ":")
-      if (c > 1) { k=tolower(substr(body, 1, c-1)); v=substr(body, c+1); gsub(/^[ \t]+|[ \t]+$/, "", v)
-        if (k ~ keys && v != "" && v !~ /^#/) { print substr(line, 1, length(line)-length(body)) substr(body, 1, c) " " ph; next } }
-      print line }' "$1"
+# One privileged change at a time, across every caller (UI, upgrade jobs, a second tab, a shell).
+take_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || die "another privileged operation is in progress"
 }
 
-# restore_secrets <original> <new> <out>: replace placeholder values in <new> with the original values, matched
-# by key name and occurrence order. Fails if a placeholder has no original counterpart.
-restore_secrets() {
-  awk -v keys="^(${SECRET_KEYS})$" -v ph="$PLACEHOLDER" '
-    function keyof(s,   b, c) { b=s; sub(/^[ \t]*-?[ \t]*/, "", b); c=index(b, ":"); return c > 1 ? tolower(substr(b, 1, c-1)) : "" }
-    FNR==NR { k=keyof($0); if (k ~ keys) { b=$0; sub(/^[ \t]*-?[ \t]*/, "", b); orig[k, ++n[k]]=substr(b, index(b, ":")+1) }; next }
-    { k=keyof($0); if (k ~ keys) { b=$0; sub(/^[ \t]*-?[ \t]*/, "", b); v=substr(b, index(b, ":")+1); t=v; gsub(/^[ \t]+|[ \t]+$/, "", t)
-        if (t == ph) { i=++m[k]; if (!((k, i) in orig)) { printf "no original value for redacted key %s (occurrence %d)\n", k, i > "/dev/stderr"; bad=1; next }
-          print substr($0, 1, length($0)-length(b)) substr(b, 1, index(b, ":")-1) ":" orig[k, i]; next } } }
-    { print }
-    END { exit bad }' "$1" "$2" > "$3"
+# Secret redaction, as one awk program with two modes. Both modes walk YAML lines keeping a stack of
+# (indent, text) so every line knows its parent: the nearest earlier content line with less indentation.
+#
+#   redact:  secret scalar values become "<redacted #N>"; a secret line that is a block scalar (| >), a flow
+#            collection, or carries an anchor/tag/alias, and any line with a secret key inside a flow mapping,
+#            becomes the comment "# <redacted #N>" (block scalar continuation lines are dropped with it).
+#   restore: (original, new) every placeholder #N in the new file must sit under the same key and the same
+#            parent line as #N in the original, and be used once; it is replaced by the original text.
+#            Deleting an entry drops its secret; moving or re-parenting a placeholder is refused.
+SECRETS_AWK='
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function indent(s,   i) { i = match(s, /[^ ]/); return i ? i - 1 : length(s) }
+function body(s,   b) { b = s; sub(/^[ \t]*(-[ \t]+)?/, "", b); return b }
+function keyof(s,   b, c, k) { b = body(s); c = index(b, ":"); if (c < 2) return ""; k = substr(b, 1, c - 1); gsub(/^["\047]|["\047]$/, "", k); return tolower(k) }
+function valof(s,   b) { b = body(s); return trim(substr(b, index(b, ":") + 1)) }
+function secretkey(k) { return k ~ ("^(" KEYS ")$") }
+function flowsecret(s) { return tolower(s) ~ ("[{,][ \t]*[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") }
+function depth(s,   t, o, c) { t = s; o = gsub(/[{[]/, "", t); t = s; c = gsub(/[]}]/, "", t); return o - c }
+function parentof(ind) { while (sp > 0 && pind[sp] >= ind) sp--; return sp > 0 ? ptext[sp] : "" }
+function push(ind, s) { sp++; pind[sp] = ind; ptext[sp] = trim(s) }
+function spaces(n,   r) { r = ""; while (n-- > 0) r = r " "; return r }
+# walk(line) classifies one line; sets W_KIND ("skip" swallowed, "plain", "scalar", "line"), W_KEY, W_PARENT, W_IND
+function walk(s,   ind, k, v) {
+  if (swallow_ind >= 0) { if (s ~ /^[ \t]*$/ || indent(s) > swallow_ind) { W_KIND = "skip"; return } swallow_ind = -1 }
+  if (flow_depth > 0) { flow_depth += depth(s); W_KIND = "skip"; return }
+  if (s ~ /^[ \t]*(#.*)?$/) { W_KIND = "plain"; return }
+  ind = indent(s); W_IND = ind; W_PARENT = parentof(ind); k = keyof(s); W_KEY = k
+  if (secretkey(k) || flowsecret(s)) {
+    v = valof(s)
+    if (flowsecret(s) || v ~ /^[|>{\[&!*]/) {
+      W_KIND = "line"
+      if (v ~ /^[|>]/) swallow_ind = ind
+      d = depth(s); if (d > 0) flow_depth = d
+      return
+    }
+    if (v != "" && v !~ /^#/) { W_KIND = "scalar"; return }
+  }
+  push(ind, s); W_KIND = "plain"
 }
+BEGIN { sp = 0; swallow_ind = -1; flow_depth = 0; n = 0 }
+MODE == "redact" {
+  walk($0)
+  if (W_KIND == "skip") next
+  if (W_KIND == "line") { n++; print spaces(W_IND) "# <redacted #" n ">"; next }
+  if (W_KIND == "scalar") { n++; b = body($0); print substr($0, 1, length($0) - length(b)) substr(b, 1, index(b, ":")) " \"<redacted #" n ">\""; next }
+  print; next
+}
+MODE == "restore" && FNR == NR {
+  walk($0)
+  if (W_KIND == "skip") { otext[n] = otext[n] "\n" $0; next }
+  if (W_KIND == "line" || W_KIND == "scalar") { n++; okind[n] = W_KIND; okey[n] = W_KEY; oparent[n] = W_PARENT; oind[n] = W_IND; otext[n] = $0
+    b = body($0); oval[n] = substr(b, index(b, ":") + 1) }
+  next
+}
+MODE == "restore" && FNR == 1 { sp = 0; swallow_ind = -1; flow_depth = 0 }
+MODE == "restore" {
+  if ($0 ~ /^[ \t]*# <redacted #[0-9]+>[ \t]*$/) {
+    id = $0; gsub(/[^0-9]/, "", id); ind = indent($0); par = parentof(ind)
+    if (!(id in okind) || okind[id] != "line") { printf "placeholder #%s does not exist\n", id > "/dev/stderr"; bad = 1; next }
+    if (used[id]++) { printf "placeholder #%s is used twice\n", id > "/dev/stderr"; bad = 1; next }
+    if (par != oparent[id] || ind != oind[id]) { printf "redacted secret #%s was moved or its parent line (%s) changed; put it back where it was\n", id, oparent[id] > "/dev/stderr"; bad = 1; next }
+    print otext[id]; next
+  }
+  if ($0 ~ /"<redacted #[0-9]+>"/) {
+    id = $0; sub(/.*"<redacted #/, "", id); sub(/>".*/, "", id)
+    if (trim(valof($0)) != "\"<redacted #" id ">\"") { printf "placeholder #%s must be the whole value of its key\n", id > "/dev/stderr"; bad = 1; next }
+    ind = indent($0); par = parentof(ind); k = keyof($0)
+    if (!(id in okind) || okind[id] != "scalar") { printf "placeholder #%s does not exist\n", id > "/dev/stderr"; bad = 1; next }
+    if (used[id]++) { printf "placeholder #%s is used twice\n", id > "/dev/stderr"; bad = 1; next }
+    if (k != okey[id] || par != oparent[id]) { printf "redacted secret #%s (%s) was moved or its parent line (%s) changed; put it back where it was\n", id, okey[id], oparent[id] > "/dev/stderr"; bad = 1; next }
+    b = body($0); print substr($0, 1, length($0) - length(b)) substr(b, 1, index(b, ":") - 1) ":" oval[id]
+    push(ind, $0); next
+  }
+  if ($0 ~ /<redacted/) { printf "line %d mentions a redaction placeholder in an unexpected form\n", FNR > "/dev/stderr"; bad = 1; next }
+  if ($0 !~ /^[ \t]*(#.*)?$/) push(indent($0), $0)
+  print
+}
+END { exit bad }
+'
+redact() { awk -v MODE=redact -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1"; }
+restore_secrets() { awk -v MODE=restore -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1" "$2" > "$3"; }
 
 read_stdin_limited() { # <dest> <max-bytes>
   head -c "$(( $2 + 1 ))" > "$1"
@@ -243,13 +313,23 @@ journal_tail_json() { # <unit> <since-epoch>
   json_escape "$out"
 }
 
-# The daemon is healthy when the unit is active and its control socket answers, three checks in a row.
+fipsctl_bin() { [[ -x "$BIN_DIR/fipsctl" ]] && echo "$BIN_DIR/fipsctl" || echo fipsctl; }
+
+# Healthy = the unit stays active without systemd restarting it, and the control socket (at the path the new
+# config sets, if any) answers, for 8 consecutive seconds within a 45 s budget.
 wait_fips_healthy() {
-  local deadline=$(( $(date +%s) + ${1:-25} )) ok=0
-  sleep 2
+  local deadline=$(( $(date +%s) + 45 )) ok=0 restarts sock args=()
+  sock=$(awk '/^[ \t]*socket_path[ \t]*:/ { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$FIPS_CONFIG" 2>/dev/null || true)
+  [[ -n "$sock" && "$sock" == /* ]] && args=(-s "$sock")
+  sleep 3
+  restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
   while (( $(date +%s) < deadline )); do
-    if systemctl is-active --quiet "$SERVICE" && fipsctl show status >/dev/null 2>&1; then ok=$((ok + 1)); (( ok >= 3 )) && return 0
-    else ok=0; fi
+    if systemctl is-active --quiet "$SERVICE" && [[ "$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)" == "$restarts" ]] \
+       && "$(fipsctl_bin)" "${args[@]}" show status >/dev/null 2>&1; then
+      ok=$((ok + 1)); (( ok >= 8 )) && return 0
+    else
+      ok=0; restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+    fi
     sleep 1
   done
   return 1
@@ -258,41 +338,65 @@ wait_fips_healthy() {
 require_systemd() { [[ "$SM" == systemd ]] || die "node management verbs need systemd (found $SM)"; }
 valid_id() { [[ "$1" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid backup id"; }
 
+# backup_config [keep-id]: never prunes <keep-id> (the backup about to be restored).
 backup_config() {
   mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
   local id; id=$(date +%Y%m%d-%H%M%S); local f="$CONFIG_BACKUPS_DIR/$id.yaml" i=1
   while [[ -e "$f" ]]; do i=$((i + 1)); f="$CONFIG_BACKUPS_DIR/$id-$i.yaml"; done
   install -m 0600 -o 0 -g 0 "$FIPS_CONFIG" "$f"
-  local d n=0; for d in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do n=$((n + 1)); (( n > 20 )) && rm -f -- "$d"; done
+  local d n=0; for d in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do
+    n=$((n + 1)); (( n > 20 )) && [[ "$(basename "$d" .yaml)" != "${1:-}" ]] && rm -f -- "$d"
+  done
   basename "$f" .yaml
 }
 
 # install_config_and_restart <file> <backup-id> <restart:true|false>
+# Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
 install_config_and_restart() {
+  trap '' INT TERM HUP
   install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG"
   if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
   local start; start=$(date +%s)
   systemctl restart "$SERVICE" || true
-  if wait_fips_healthy 25; then
+  if wait_fips_healthy; then
     printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":true}\n' "$(json_escape "$2")"; return
   fi
   local log; log=$(journal_tail_json "$SERVICE" "$start")
   log "daemon unhealthy with the new config; restoring backup $2"
   install -m 0600 -o 0 -g 0 "$CONFIG_BACKUPS_DIR/$2.yaml" "$FIPS_CONFIG"
   systemctl restart "$SERVICE" || true
-  local back=false; wait_fips_healthy 25 && back=true
+  local back=false; wait_fips_healthy && back=true
   printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"
 }
 
 valid_dropin() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "invalid drop-in name (a-z, 0-9, _ and -, up to 41 characters)"; }
 
+# A drop-in is included inside the `inbound` chain, so it may only hold rule statements: no include/define
+# (which could read other files), no table or chain commands, no `;`, and braces balanced on every line
+# (so it cannot close the chain and act on the rest of the host's ruleset).
+check_dropin_content() {
+  awk '
+    { line = $0; t = line; gsub(/"[^"]*"/, "\"\"", t); sub(/#.*/, "", t); gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == "") next
+      split(t, w, /[ \t]+/); first = tolower(w[1])
+      if (first ~ /^(include|define|redefine|undefine|table|chain|flush|delete|add|create|insert|replace|reset|list|rename|monitor|export|import|describe|flowtable|destroy)$/) { printf "line %d: \"%s\" is not allowed in a drop-in\n", NR, w[1]; bad = 1; next }
+      if (t ~ /[;$]/) { printf "line %d: \";\" and \"$\" are not allowed in a drop-in\n", NR; bad = 1; next }
+      d = 0; for (i = 1; i <= length(t); i++) { ch = substr(t, i, 1); if (ch == "{") d++; else if (ch == "}") { d--; if (d < 0) break } }
+      if (d != 0) { printf "line %d: braces must balance within the line\n", NR; bad = 1 }
+    }
+    END { exit bad }' "$1"
+}
+
 # check_ruleset <dir-with-candidate-dropins>: validate the baseline plus drop-ins without loading anything.
+# Only nft's error summaries are returned (never the echoed source lines).
 check_ruleset() {
   local t; t=$(mktemp -d); cp -a "$1/." "$t/" 2>/dev/null || true
   sed "s#include \"$DROPIN_DIR/\*\.nft\"#include \"$t/*.nft\"#" "$FIPS_NFT" > "$t/.baseline"
   grep -qF "include \"$t/*.nft\"" "$t/.baseline" || { rm -rf "$t"; printf '%s' "$FIPS_NFT does not contain the standard include \"$DROPIN_DIR/*.nft\" line; refusing to validate"; return 1; }
   local out; out=$(nft -c -f "$t/.baseline" 2>&1); local rc=$?
-  rm -rf "$t"; printf '%s' "$out"; return $rc
+  rm -rf "$t"
+  printf '%s' "$out" | grep -E 'Error:' | sed -E "s#^.*/([a-z0-9_-]+\.nft|\.baseline):#\1:#" | head -n 20
+  return $rc
 }
 
 firewall_reload_if_active() {
@@ -310,6 +414,7 @@ case "$cmd" in
     ;;
 
   install)
+    take_lock
     stage=${2:-}
     [[ -n "$stage" ]] || die "usage: install <stagedir> [--no-restart]"
     [[ "$stage" == /* ]] || die "stage dir must be an absolute path"
@@ -336,6 +441,7 @@ case "$cmd" in
     ;;
 
   rollback)
+    take_lock
     id=${2:-}
     [[ "$id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || die "invalid backup id"
     dir="$BACKUPS_DIR/$id"
@@ -349,6 +455,7 @@ case "$cmd" in
     ;;
 
   restart)
+    take_lock
     restarted=$(restart_services)
     printf '{"ok":true,"restarted":%s}\n' "$restarted"
     ;;
@@ -360,13 +467,13 @@ case "$cmd" in
     ;;
 
   config-apply)
-    require_systemd
+    require_systemd; take_lock
     restart=true; [[ "${2:-}" == "--no-restart" ]] && restart=false
     [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
     tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
     read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
-    restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" || die "cannot restore redacted values; keep the \"<redacted>\" lines under their original keys"
-    grep -qF "$PLACEHOLDER" "$tmp2" && die "a redacted placeholder is still present"
+    if ! err=$(restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" 2>&1); then die "$(printf '%s' "$err" | head -n 3 | tr '\n' ' ')"; fi
+    grep -q '<redacted #' "$tmp2" && die "a redaction placeholder is still present"
     if cmp -s "$tmp2" "$FIPS_CONFIG"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
     id=$(backup_config)
     install_config_and_restart "$tmp2" "$id" "$restart"
@@ -383,10 +490,11 @@ case "$cmd" in
     ;;
 
   config-restore)
-    require_systemd
+    require_systemd; take_lock
     valid_id "${2:-}"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"
-    id=$(backup_config)
-    install_config_and_restart "$f" "$id" true
+    tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; cp -p "$f" "$tmp"
+    id=$(backup_config "$2")
+    install_config_and_restart "$tmp" "$id" true
     ;;
 
   firewall-status)
@@ -399,12 +507,13 @@ case "$cmd" in
     ;;
 
   dropin-apply)
-    require_systemd
+    require_systemd; take_lock
     name=${2:-}; valid_dropin "$name"
     command -v nft >/dev/null 2>&1 || die "nft not found"
     [[ -f "$FIPS_NFT" ]] || die "$FIPS_NFT not found"
     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
     read_stdin_limited "$tmp/new" "$MAX_DROPIN_BYTES"
+    if ! err=$(check_dropin_content "$tmp/new"); then printf '{"ok":false,"error":"the drop-in contains statements that are not allowed","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
     mkdir "$tmp/d"; cp -a "$DROPIN_DIR/." "$tmp/d/" 2>/dev/null || true; cp "$tmp/new" "$tmp/d/$name.nft"
     if ! err=$(check_ruleset "$tmp/d"); then printf '{"ok":false,"error":"nft rejected the ruleset","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
     mkdir -p "$DROPIN_DIR"
@@ -413,7 +522,7 @@ case "$cmd" in
     ;;
 
   dropin-delete)
-    require_systemd
+    require_systemd; take_lock
     name=${2:-}; valid_dropin "$name"
     [[ -f "$DROPIN_DIR/$name.nft" ]] || die "drop-in $name not found"
     rm -f -- "$DROPIN_DIR/$name.nft"
@@ -421,7 +530,7 @@ case "$cmd" in
     ;;
 
   service)
-    require_systemd
+    require_systemd; take_lock
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
     case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac

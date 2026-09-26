@@ -8,7 +8,8 @@ import { usePoll } from '../lib/api';
 import { diffStats, lineDiff, withContext, type DiffLine } from '../lib/diff';
 import { fmtAgo, fmtBytes } from '../lib/format';
 
-const REDACTED = '"<redacted>"';
+const REDACTED = '"<redacted #N>"';
+const PLACEHOLDER_RE = /<redacted #\d+>/g;
 
 
 export default function Config({ readOnly }: { readOnly: boolean }) {
@@ -39,7 +40,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
       if (!js || typeof js !== 'object' || Array.isArray(js)) errors.push({ line: 1, message: 'the top level must be a mapping (node:, transports:, peers: …)' });
       else if (!('node' in js) && !('transports' in js)) warnings.push('neither node: nor transports: is present; is this the right file?');
     }
-    const origRedacted = (original.match(/"<redacted>"/g) ?? []).length, nowRedacted = (text.match(/"<redacted>"/g) ?? []).length;
+    const origRedacted = (original.match(PLACEHOLDER_RE) ?? []).length, nowRedacted = (text.match(PLACEHOLDER_RE) ?? []).length;
     if (nowRedacted < origRedacted) warnings.push(`${origRedacted - nowRedacted} redacted secret line(s) were removed or changed; that secret will be deleted from the file.`);
     return { errors, warnings };
   }, [text, original]);
@@ -73,7 +74,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   return (
     <div className="grid gap-4 fade-in">
       <div className="flex flex-wrap items-center gap-3">
-        <p className="text-ink-2 text-sm max-w-3xl">Edit <code>/etc/fips/fips.yaml</code>. Secret values stay on the node: they are shown as <code>{REDACTED}</code> and restored on save. Applying backs up the current file, restarts the daemon and <b>rolls back automatically</b> if it does not stay up. See the <a className="underline hover:text-ink" href="https://github.com/jmcorgan/fips/blob/master/docs/reference/configuration.md" target="_blank" rel="noreferrer">configuration reference</a>.</p>
+        <p className="text-ink-2 text-sm max-w-3xl">Edit <code>/etc/fips/fips.yaml</code>. Secret values stay on the node: they are shown as <code>{REDACTED}</code> placeholders, and restored on save as long as each stays under its key and entry. Applying backs up the current file, restarts the daemon and <b>rolls back automatically</b> if it does not stay up. See the <a className="underline hover:text-ink" href="https://github.com/jmcorgan/fips/blob/master/docs/reference/configuration.md" target="_blank" rel="noreferrer">configuration reference</a>.</p>
         {!readOnly && helper?.managementCapable && <button className="btn ml-auto" disabled={busy} onClick={() => setConfirm('restart')}><Power size={15} />Restart node</button>}
       </div>
 
