@@ -442,7 +442,6 @@ async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
 
 const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
 
-/** Keep the UI's own firewall rule in step with the allow-list: its port, open only to the allowed npubs. */
 /**
  * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the
  * access queue; a failed or refused step leaves `dirty` set and is retried on the next 15 s tick.
@@ -468,8 +467,9 @@ function syncMesh(): Promise<MeshSyncResult> {
     const ports = cfg.enabled ? guardPorts(cfg) : null;
     const tun = mesh.tunName;
     const result: MeshSyncResult = { ok: true };
-    if (ports && !mesh.canaryPort) {
+    if (ports && !mesh.canaryPort && !(await mesh.startCanary())) {
       mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]; mesh access needs IPv6 loopback' });
+      meshSync.dirty = true;
       return { ok: false, guard: 'no canary' };
     }
     // Only a failed re-apply of exactly the guard already confirmed (same ports, same interface) keeps it; the
@@ -498,30 +498,50 @@ function syncMesh(): Promise<MeshSyncResult> {
  * restarting nftables.service, can flush it). Read-only; only the guard is touched, never the firewall rule.
  * If it is gone, admission stops at once and the guard is re-applied.
  */
-function verifyGuard(): Promise<unknown> {
-  if (!mesh.config.enabled || meshSync.running) return Promise.resolve();
-  // Shares the single-flight slot with syncMesh, so a concurrent save cannot be undone by a stale check.
+/** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
+function reapplyGuard(): Promise<MeshSyncResult> {
+  if (meshSync.running) return meshSync.running.then(() => reapplyGuard());
   meshSync.running = (async (): Promise<MeshSyncResult> => {
-    const st = await admin.meshGuardStatus().catch(() => null);
-    if (st === null || !mesh.config.enabled) return { ok: true };
+    if (!mesh.config.enabled) return { ok: true };
+    if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); return { ok: false, guard: 'no canary' }; }
     const want = guardPorts(mesh.config), tun = mesh.tunName;
-    const ok = st.active && want.every((p) => st.ports.includes(p)) && st.tun === tun && st.canary === mesh.canaryPort;
-    if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want, tun }); return { ok: true }; }
-    mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports, interface or canary' : 'guard not loaded (was the nftables ruleset flushed?)' });
     const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
-    if (g.ok && mesh.config.enabled) mesh.setGuard({ active: true, ports: want, tun });
-    else if (!g.ok) { mesh.setGuard({ active: false, ports: [], error: g.error }); meshSync.dirty = true; }
-    return { ok: g.ok };
+    if (g.ok) mesh.setGuard({ active: true, ports: want, tun });
+    else { mesh.setGuard({ active: false, ports: [], error: g.error }); meshGuardDirty = true; }
+    return { ok: g.ok, guard: g.ok ? undefined : g.error };
   })().finally(() => { meshSync.running = null; });
   return meshSync.running;
 }
 
+/**
+ * Every 30 s while mesh access is on, confirm the guard (ports, interface, canary) is really loaded. Read-only;
+ * a mismatch stops admission at once and re-applies only the guard. A result from a check that started before
+ * any other guard change is discarded.
+ */
+function verifyGuard(): Promise<unknown> {
+  if (!mesh.config.enabled || meshSync.running) return Promise.resolve();
+  const gen = mesh.guardGen;
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    const st = await admin.meshGuardStatus().catch(() => null);
+    if (st === null || !mesh.config.enabled || mesh.guardGen !== gen) return { ok: true };
+    const want = guardPorts(mesh.config), tun = mesh.tunName;
+    const ok = mesh.canaryPort > 0 && st.active && want.every((p) => st.ports.includes(p)) && st.tun === tun && st.canary === mesh.canaryPort;
+    if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want, tun }); return { ok: true }; }
+    mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports, interface or canary' : 'guard not loaded (was the nftables ruleset flushed?)' });
+    meshGuardDirty = true;
+    return { ok: false };
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
+}
+
+let meshGuardDirty = false;
 mesh.onChange = async () => { meshSync.dirty = true; };
-mesh.onTunChange = () => { meshSync.dirty = true; };
-mesh.onGuardLost = () => { meshSync.dirty = true; void syncMesh().then(() => mesh.reconcile()); };
+mesh.onTunChange = () => { meshGuardDirty = true; };
+mesh.onGuardLost = () => { void reapplyGuard().then(() => mesh.reconcile()); };
 let meshTicks = 0;
 setInterval(() => {
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
+  else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
   else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
 }, 15_000).unref();
 void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());

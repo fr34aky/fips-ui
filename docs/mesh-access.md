@@ -16,7 +16,7 @@ someone's `fd00::/8` address, and with a forged router advertisement even comple
 the privileged helper loads a small kernel rule, table `inet fips_ui_guard`, that drops TCP from
 `fd00::/8` to the UI's ports unless it arrives on `lo` or the FIPS TUN device. The kernel applies it to
 every packet, the handshake included. The UI trusts `fd00::/8` sources only while it has confirmed the
-guard is loaded; without it (for example before helper v4 is installed) nobody is admitted from the mesh.
+guard is loaded; without it (for example before helper v5 is installed) nobody is admitted from the mesh.
 Something outside the UI (restarting `nftables.service`, for example) can flush the whole ruleset, so the
 guard's presence is proven for every mesh connection at the moment it is accepted, without privileges: the
 same table holds a canary rule that resets TCP to a private port on `::1` where the UI listens. On accept
@@ -45,7 +45,13 @@ operation it had already started, such as a configuration apply, still completes
 | viewer | Everything read-only: dashboards, peers, metrics, logs, topology. No Configuration, Firewall or Upgrade pages, no connect, disconnect or probe, and no view of the access list. |
 | admin | The same as someone at this machine, including changing the node's configuration and firewall as root and upgrading it. Grant it only to keys you trust as much as this host's own login. |
 
-The local listener (loopback) is always admin. Mesh access requires helper v4 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
+An npub is a node, not a person: **everything that leaves the listed node under its npub gets its role**,
+including every local user of that node and, if it runs `fips-gateway`, every LAN client behind it. List
+only nodes whose users you would all trust with that role. This node's own npub cannot be listed (any local
+user could use it to get around `FIPS_UI_TOKEN`). Browsers must address the node by its fips0 address,
+`<its npub>.fips`, or a name that `/etc/fips/hosts` maps to its npub.
+
+The local listener (loopback) is always admin. Mesh access requires helper v5 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
 listener only; over the mesh the npub is the credential.
 
 ## Configuration

@@ -26,6 +26,7 @@ import { dirname, join } from 'node:path';
 import { expand6, isMeshAddress as isMeshSource } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
+import { readHosts } from './system.ts';
 
 export type Role = 'viewer' | 'admin';
 export interface AccessEntry { npub: string; label?: string; role: Role }
@@ -78,6 +79,10 @@ export class MeshAccess {
   private tun = 'fips0';
   /** Whether the kernel guard for the current ports is loaded (set by the sync in server/index.ts). */
   guard: { active: boolean; ports: number[]; tun?: string; error?: string } = { active: false, ports: [] };
+  /** Bumped on every guard state change, so a check that started earlier can tell it is stale. */
+  guardGen = 0;
+  /** When the guard last became active: connections accepted right after a (re)load are refused. */
+  private guardSince = 0;
   /** Set when access.json exists but could not be loaded; saving is refused until it loads, so it is never overwritten. */
   private loadError: string | undefined;
   private loaded = false;
@@ -104,7 +109,9 @@ export class MeshAccess {
    * cuts every mesh connection and stops the listener, through the queue so it cannot race a bind.
    */
   setGuard(g: { active: boolean; ports: number[]; tun?: string; error?: string }): void {
+    if (g.active && !this.guard.active) this.guardSince = Date.now();
     this.guard = g;
+    this.guardGen++;
     if (!g.active) { this.revalidate(); void this.serial(async () => { if (!this.guard.active && this.server) this.close(); }); }
   }
 
@@ -142,8 +149,12 @@ export class MeshAccess {
    * that actually accepts (not a timeout) marks the guard lost.
    */
   proveOnAccept(socket: Socket): void {
+    const acceptedAt = Date.now();
     const p = (async () => {
       if (!this.guard.active) return false;
+      // A handshake that completed while the table was missing can be accepted just after it is re-loaded;
+      // refuse connections accepted within a second of (re)activation. Browsers simply retry.
+      if (acceptedAt - this.guardSince < 1000) return false;
       const r = await this.canary();
       if (r === 'missing' && this.guard.active) { this.setGuard({ active: false, ports: [], error: 'guard table missing (was the nftables ruleset flushed?)' }); this.onGuardLost(); }
       return r === 'loaded';
@@ -167,6 +178,8 @@ export class MeshAccess {
   principalFor(remote: string | undefined): Principal | null {
     if (!this.config.enabled || !this.guard.active) return null;
     const key = remote ? expand6(remote) : null;
+    // This node's own address arrives over lo from any local process; it must never act as an npub.
+    if (key && this.own && key === expand6(this.own.address)) return null;
     const e = key ? this.byAddress.get(key) : undefined;
     return e ? { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address } : null;
   }
@@ -187,11 +200,13 @@ export class MeshAccess {
   }
 
   /** Host names a browser may use to reach this node over the mesh: its fips0 address or any .fips name. */
+  /** Names a browser may use for this node over the mesh: its fips0 address, <own npub>.fips, hosts-file aliases of it. */
+  private ownNames = new Set<string>();
   hostAllowed(hostname: string | null): boolean {
-    if (!hostname) return false;
-    if (hostname.endsWith('.fips')) return true;
+    if (!hostname || !this.own) return false;
+    if (hostname.endsWith('.fips')) return this.ownNames.has(hostname) || hostname === `${this.own.npub.toLowerCase()}.fips`;
     const e = expand6(hostname);
-    return !!e && !!this.own && e === expand6(this.own.address);
+    return !!e && e === expand6(this.own.address);
   }
 
   /** Called after every successful load or save, inside the queue (keeps the firewall rule in step). */
@@ -226,6 +241,7 @@ export class MeshAccess {
     return this.serial(async () => {
       if (!this.loaded) throw new AccessError(this.loadError ?? 'the saved access list has not loaded yet');
       const cfg = validateAccess(input);
+      if (this.own && cfg.allowed.some((e) => e.npub === this.own!.npub)) throw new AccessError('this node\'s own npub cannot be on the list: any local user could use it to bypass the token');
       const map = await this.buildMap(cfg);
       await mkdir(dirname(FILE), { recursive: true, mode: 0o700 });
       const tmp = `${FILE}.${process.pid}.tmp`;
@@ -263,7 +279,11 @@ export class MeshAccess {
     if (!this.config.enabled) { if (this.server) this.close(); this.lastError = undefined; return; }
     try {
       const st = await query<{ ipv6_addr?: string; npub?: string; tun_name?: string }>('show_status', undefined, { timeoutMs: 3000 });
-      if (st.ipv6_addr && st.npub) this.own = { address: st.ipv6_addr, npub: st.npub };
+      if (st.ipv6_addr && st.npub) {
+        this.own = { address: st.ipv6_addr, npub: st.npub };
+        const hosts = await readHosts().catch(() => ({ entries: [] as { hostname: string; npub: string }[] }));
+        this.ownNames = new Set(hosts.entries.filter((h) => h.npub === st.npub).map((h) => `${h.hostname.toLowerCase()}.fips`));
+      }
       if (st.tun_name && st.tun_name !== this.tun) { this.tun = st.tun_name; this.onTunChange(); }
     } catch (e) {
       if (!this.own) { this.lastError = `daemon unreachable: ${(e as Error).message}`; return; }

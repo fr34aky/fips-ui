@@ -91,12 +91,12 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
               <button className="btn"><Plus size={14} />Add</button>
             </form>
           )}
-          <p className="text-xs text-ink-3"><b>Viewer</b>: everything read-only, no configuration, firewall or upgrade pages. <b>Admin</b>: the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to npubs whose keys you trust as much as this host's own login.</p>
+          <p className="text-xs text-ink-3"><b>Viewer</b>: everything read-only, no configuration, firewall or upgrade pages. <b>Admin</b>: the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to npubs whose keys you trust as much as this host's own login. An npub is a whole node: all of its local users and, if it runs fips-gateway, its LAN clients share the grant.</p>
         </div>
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
-        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v4): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
+        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 
         {!readOnly && (
           <div className="flex justify-end gap-2">

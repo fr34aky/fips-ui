@@ -350,7 +350,7 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
   async function meshGuard(ports: number[] | null, tun: string, canary?: number): Promise<{ ok: boolean; error?: string }> {
     const h = await helperInfo();
-    if (!h.available || (h.version ?? 0) < 4) return { ok: false, error: `mesh access needs helper v4 or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
+    if (!h.available || (h.version ?? 0) < 5) return { ok: false, error: `mesh access needs helper v5 or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
     const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun, ...(canary ? [String(canary)] : [])], undefined, 30_000);
     if (r.code !== 0) return { ok: false, error: helperError(r) };
     return lastJson<{ ok: boolean; error?: string }>(r.stdout);
@@ -359,7 +359,7 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Read-only: is the guard loaded, and for which ports and interface? */
   async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string; canary: number } | null> {
     const h = await helperInfo();
-    if (!h.available || (h.version ?? 0) < 4) return null;
+    if (!h.available || (h.version ?? 0) < 5) return null;
     const r = await runHelper(helperPath, ['mesh-guard', 'status'], undefined, 15_000);
     if (r.code !== 0) return null;
     try { const j = lastJson<{ active: boolean; ports?: string; tun?: string; canary?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '', canary: Number(j.canary ?? 0) }; }
