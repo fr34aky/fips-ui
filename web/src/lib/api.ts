@@ -79,6 +79,8 @@ const live = (() => {
     es.onopen = () => set({ conn: state.snapshot ? 'live' : 'connecting' });
     es.onerror = () => {
       set({ conn: 'reconnecting' });
+      // A non-200 answer (e.g. 503 while the guard reloads) closes an EventSource permanently: reopen it.
+      if (es && es.readyState === EventSource.CLOSED) { es = null; setTimeout(() => { if (refs > 0) open(); }, 3000); }
       // EventSource can't surface the HTTP status; probe a cheap authenticated route to detect a 401.
       fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => { if (r.status === 401) authStore.setNeeded(true); }).catch(() => {});
     };

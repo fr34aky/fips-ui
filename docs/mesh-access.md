@@ -26,10 +26,12 @@ a handshake and this check, well under a millisecond, during which someone else 
 guard for a forged connection to pass. In addition the UI asks the helper every 30 seconds whether the
 guard, including its canary, still matches (one read-only sudo call, visible in the auth log).
 
-While mesh access is on, `fd00::/8` sources are treated as mesh identities on the main listener too. If you
-expose the main listener on a LAN that itself uses `fd` ULA addresses, those clients cannot use it over IPv6
-while mesh access is on (the guard drops them); use IPv4 or a non-`fd` address. With mesh access off,
-nothing changes for them.
+Mesh identities are admitted on the mesh listener only. While mesh access is on, an `fd00::/8` source on
+the main listener is refused, so if you expose the main listener on a LAN that itself uses `fd` ULA
+addresses, those clients need IPv4 or a non-`fd` address while mesh access is on. With mesh access off,
+nothing changes for them. Each time the guard is (re)loaded, the mesh listener is closed and rebound, which
+discards any connection that was queued while the guard was missing, and connections accepted in the first
+second after that are answered "retry" rather than admitted.
 
 As a further layer, the UI keeps a rule in its managed firewall drop-in that opens the mesh port on fips0
 only to the allowed npubs. Both are updated right after every change to the allow-list and retried every

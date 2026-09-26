@@ -350,6 +350,8 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
   async function meshGuard(ports: number[] | null, tun: string, canary?: number): Promise<{ ok: boolean; error?: string }> {
     const h = await helperInfo();
+    // A helper older than v5 cannot have loaded the guard, so "off" is trivially satisfied.
+    if (!(ports && ports.length) && (h.version ?? 0) < 5) return { ok: true };
     if (!h.available || (h.version ?? 0) < 5) return { ok: false, error: `mesh access needs helper v5 or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
     const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun, ...(canary ? [String(canary)] : [])], undefined, 30_000);
     if (r.code !== 0) return { ok: false, error: helperError(r) };

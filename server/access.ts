@@ -114,7 +114,15 @@ export class MeshAccess {
     if (g.active) this.guardSince = performance.now();
     this.guard = g;
     this.guardGen++;
-    if (!g.active) { this.revalidate(); void this.serial(async () => { if (!this.guard.active && this.server) this.close(); }); }
+    // Losing the guard cuts every mesh connection and stops the listener. (Re)loading it closes and rebinds
+    // the listener, discarding any handshake that completed and queued in the backlog while it was missing.
+    const gen = this.guardGen;
+    if (!g.active) this.revalidate();
+    void this.serial(async () => {
+      if (gen !== this.guardGen) return;
+      if (this.server) this.close();
+      if (this.guard.active) await this.reconcileNow();
+    });
   }
 
   // --- canary --------------------------------------------------------------------------------------
@@ -153,7 +161,7 @@ export class MeshAccess {
   proveOnAccept(socket: Socket): void {
     const acceptedAt = performance.now();
     const p = (async (): Promise<Proof> => {
-      if (!this.guard.active) return 'fail';
+      if (!this.guard.active || this.guard.tun !== this.tun) return 'fail';
       // A handshake that completed while the table was missing can be accepted just after it is re-loaded;
       // connections accepted within a second of a (re)load are answered "retry" instead of admitted.
       if (acceptedAt - this.guardSince < 1000) return 'retry';
@@ -179,11 +187,11 @@ export class MeshAccess {
    */
   principalFor(remote: string | undefined): Principal | null {
     // Without the node's own identity the own address cannot be excluded, so nobody is admitted until it is known.
-    if (!this.config.enabled || !this.guard.active || !this.own) return null;
+    if (!this.config.enabled || !this.guard.active || !this.own || this.guard.tun !== this.tun) return null;
     const key = remote ? expand6(remote) : null;
     // This node's own address arrives over lo from any local process; it must never act as an npub.
     if (!key || key === expand6(this.own.address)) return null;
-    const e = key ? this.byAddress.get(key) : undefined;
+    const e = this.byAddress.get(key);
     if (!e || e.npub === this.own.npub) return null;
     return { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address };
   }

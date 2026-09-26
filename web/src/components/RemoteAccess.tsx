@@ -9,7 +9,7 @@ type Role = 'viewer' | 'admin';
 interface Entry { npub: string; label?: string; role: Role }
 interface Config { enabled: boolean; port: number; allowed: Entry[] }
 interface Status { listening: boolean; address: string | null; npub: string | null; port: number; guard?: { active: boolean; ports: number[]; error?: string }; error?: string }
-interface AccessResponse { config?: Config; status?: Status; file?: string; you: Principal; firewallManaged?: boolean }
+interface AccessResponse { config?: Config; status?: Status; file?: string; you: Principal; firewallManaged?: boolean; helperVersion?: number | null; guardHelperVersion?: number }
 interface SaveResponse { config: Config; status: Status; firewall: { ok: boolean; skipped?: string; guard?: string; rule?: string } }
 
 export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
@@ -96,7 +96,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
-        {draft.enabled && (!data.firewallManaged || /helper v5/.test(st.guard?.error ?? '')) && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
+        {draft.enabled && (data.helperVersion ?? 0) < (data.guardHelperVersion ?? 5) && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 
         {!readOnly && (
           <div className="flex justify-end gap-2">

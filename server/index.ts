@@ -313,7 +313,8 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access' && method === 'GET') {
     const you = principalOf(req);
-    return json(res, 200, you.role === 'admin' ? { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: (await admin.helperInfo()).managementCapable } : { you });
+    const h = await admin.helperInfo();
+    return json(res, 200, you.role === 'admin' ? { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: 5 } : { you });
   }
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
@@ -391,25 +392,26 @@ async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<vo
   const remote = req.socket.remoteAddress;
   // A connection that is already gone reports no address; never attribute that to anyone.
   if (!remote) return denyMesh(req, res, 'unknown peer address');
-  // With mesh access off, fd00::/8 sources on the main listener are whatever they were before this feature
-  // existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN); with it on they are mesh identities.
-  if (isMeshAddress(remote) && (listener === 'mesh' || mesh.config.enabled)) {
+  // Mesh identities are admitted on the mesh listener only. With mesh access on, an fd00::/8 source on the main
+  // listener is refused (it would bypass the guard, which covers the mesh port); with it off such sources are
+  // what they were before this feature existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN).
+  if (listener === 'main' && isMeshAddress(remote) && mesh.config.enabled) return denyMesh(req, res, 'use the mesh address and port for access over the mesh');
+  if (listener === 'mesh') {
+    if (!isMeshAddress(remote)) return denyMesh(req, res, 'not a mesh connection');
     // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
     // principal is read only after that, so a revocation during the proof takes effect.
     const proof = await mesh.provenAtAccept(req.socket);
-    if (proof === 'retry') { res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1', connection: 'close' }); res.end(JSON.stringify({ error: 'the spoofing guard was just reloaded; retry in a second' })); return; }
+    if (proof === 'retry') { res.setHeader('retry-after', '1'); return json(res, 503, { error: 'the spoofing guard was just reloaded; retry in a second' }, true); }
     if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection; try again');
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
     mesh.track(req.socket, pr);
     principals.set(req, pr);
-  } else if (listener === 'mesh') {
-    return denyMesh(req, res, 'not a mesh connection');
   }
   return route(req, res);
 }
 const server = http.createServer((req, res) => { handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
-server.on('connection', (sock) => { if (isMeshAddress(sock.remoteAddress) && mesh.config.enabled) mesh.proveOnAccept(sock); });
+
 
 // ---------------------------------------------------------------------------------------------
 // Mesh access
@@ -451,7 +453,8 @@ const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) =
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 type MeshSyncResult = { ok: boolean; guard?: string; rule?: string; skipped?: string };
 const meshSync = { dirty: true, running: null as Promise<MeshSyncResult> | null };
-function guardPorts(cfg: AccessConfig): number[] { return [...new Set([cfg.port, ...(LOOPBACK_HOSTS.has(HOST) ? [] : [PORT])])]; }
+// Only the mesh listener admits mesh identities, so only its port needs the guard.
+function guardPorts(cfg: AccessConfig): number[] { return [cfg.port]; }
 const samePorts = (a: number[], b: number[]) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
 
 /** Full sync after a change: guard and managed firewall rule. */
@@ -479,7 +482,8 @@ function syncMesh(): Promise<MeshSyncResult> {
     const keeps = () => !!ports && mesh.guard.active && samePorts(mesh.guard.ports, ports) && mesh.guard.tun === tun;
     try {
       const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
-      if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }
+      if (g.ok && tun !== mesh.tunName) { result.ok = false; result.guard = 'interface changed while applying'; meshGuardDirty = true; }
+      else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }); meshGuardDirty = false; }
       else { result.ok = false; result.guard = g.error ?? 'failed'; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     } catch (e) { result.ok = false; result.guard = (e as Error).message; if (!keeps()) mesh.setGuard({ active: false, ports: [], error: result.guard }); }
     const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
@@ -489,7 +493,8 @@ function syncMesh(): Promise<MeshSyncResult> {
       const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
       if (!r.ok) { result.ok = false; result.rule = String(r.error ?? 'rejected'); }
     } catch (e) { result.ok = false; result.rule = (e as Error).message; }
-    if (!result.ok) meshSync.dirty = true;
+    // A failed guard needs the full sync again; a failed rule alone is retried without touching the guard.
+    if (result.guard) meshSync.dirty = true; else if (result.rule) meshRuleDirty = true; else meshRuleDirty = false;
     return result;
   })().finally(() => { meshSync.running = null; });
   return meshSync.running;
@@ -498,14 +503,14 @@ function syncMesh(): Promise<MeshSyncResult> {
 /** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
 function reapplyGuard(): Promise<MeshSyncResult> {
   // If a sync is running it applies the guard itself; only re-apply afterwards if the guard is still not right.
-  if (meshSync.running) return meshSync.running.then(() => (mesh.guard.active && mesh.guard.tun === mesh.tunName ? { ok: true } : reapplyGuard()));
+  if (meshSync.running) return meshSync.running.then(() => reapplyGuard());
   meshSync.running = (async (): Promise<MeshSyncResult> => {
     if (!mesh.config.enabled) return { ok: true };
     if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); return { ok: false, guard: 'no canary' }; }
     const want = guardPorts(mesh.config), tun = mesh.tunName;
     const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
-    if (g.ok) mesh.setGuard({ active: true, ports: want, tun });
-    else { mesh.setGuard({ active: false, ports: [], error: g.error }); meshGuardDirty = true; }
+    if (g.ok && tun === mesh.tunName) mesh.setGuard({ active: true, ports: want, tun });
+    else { mesh.setGuard({ active: false, ports: [], error: g.ok ? 'interface changed while applying' : g.error }); meshGuardDirty = true; }
     return { ok: g.ok, guard: g.ok ? undefined : g.error };
   })().finally(() => { meshSync.running = null; });
   return meshSync.running;
@@ -533,6 +538,18 @@ function verifyGuard(): Promise<unknown> {
 }
 
 let meshGuardDirty = false;
+let meshRuleDirty = false;
+
+/** Retry only the managed firewall rule (the guard is fine). */
+async function syncRule(): Promise<void> {
+  if (meshSync.running) return;
+  const cfg = mesh.config;
+  const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
+    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
+    : null;
+  try { const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]); meshRuleDirty = !r.ok; }
+  catch { meshRuleDirty = true; }
+}
 mesh.onChange = async () => { meshSync.dirty = true; };
 mesh.onTunChange = () => { meshGuardDirty = true; };
 mesh.onGuardLost = () => { void reapplyGuard().then(() => mesh.reconcile()); };
@@ -540,7 +557,10 @@ let meshTicks = 0;
 setInterval(() => {
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
   else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
-  else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
+  else {
+    if (meshRuleDirty) void syncRule();
+    if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
+  }
 }, 15_000).unref();
 void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 
