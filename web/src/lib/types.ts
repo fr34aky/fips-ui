@@ -64,7 +64,8 @@ export interface Snapshot {
 
 export interface LogLine { ts: number; level: 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'unknown'; target?: string; message: string; raw: string; cursor?: string }
 
-export interface Health { ok: boolean; auth: 'token' | 'none'; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string }
+export type Principal = { kind: 'local'; role: 'admin' } | { kind: 'mesh'; role: 'viewer' | 'admin'; npub: string; label?: string; address: string };
+export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string }
 
 export interface MetricDef { name: string; scope: 'node' | 'peer'; unit: string }
 export interface Series { metric: string; unit: string; granularity_seconds: number; values: (number | null)[] }

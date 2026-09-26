@@ -26,6 +26,9 @@
 #                                     full baseline before /etc/fips/fips.d/<name>.nft is written
 #   dropin-delete <name>
 #   service <action> <unit>        -> start|stop|restart|reload|enable|disable for fips units (systemd)
+#   mesh-guard <ports|off|status> [tun] [canary] -> load, remove or inspect table inet fips_ui_guard: TCP from fd00::/8 to the
+#                                     web UI's ports is dropped unless it arrives on lo or the FIPS TUN, so
+#                                     a mesh source address can be trusted as the npub it derives from
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -37,7 +40,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=4
+HELPER_VERSION=5
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -1007,6 +1010,46 @@ case "$cmd" in
     printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
     ;;
 
+  mesh-guard)
+    ports=${2:-}; tun=${3:-fips0}; canary=${4:-}
+    [[ "$tun" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid interface name"
+    [[ -z "$canary" || ( "$canary" =~ ^[0-9]{1,5}$ && "$canary" -ge 1024 && "$canary" -le 65535 ) ]] || die "invalid canary port"
+    command -v nft >/dev/null 2>&1 || die "nft not found"
+    if [[ "$ports" == status ]]; then
+      if out=$(nft list table inet fips_ui_guard 2>/dev/null) && grep -q "iifname" <<<"$out"; then
+        p=$(grep -E 'saddr fd00::/8' <<<"$out" | grep -oE 'dport \{? ?[0-9, ]+\}?' | grep -oE '[0-9]+' | paste -sd, -)
+        t=$(grep -oE 'iifname \{ [^}]* \}' <<<"$out" | grep -oE '"[^"]+"' | tr -d '"' | grep -vx lo | head -n 1)
+        c=$(grep -E 'canary' <<<"$out" | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | head -n 1)
+        printf '{"ok":true,"active":true,"ports":%s,"tun":%s,"canary":%s}\n' "$(json_escape "$p")" "$(json_escape "$t")" "$(json_escape "$c")"
+      else printf '{"ok":true,"active":false}\n'; fi
+      exit 0
+    fi
+    take_lock
+    if [[ "$ports" == off ]]; then
+      nft delete table inet fips_ui_guard 2>/dev/null || true
+      printf '{"ok":true,"active":false}\n'; exit 0
+    fi
+    [[ "$ports" =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,3}$ ]] || die "ports must be a comma-separated list of up to 4 ports"
+    for p in ${ports//,/ }; do (( p >= 1 && p <= 65535 )) || die "port $p out of range"; done
+    canary_rule=""
+    [[ -n "$canary" ]] && canary_rule="iifname \"lo\" ip6 daddr ::1 tcp dport $canary reject with tcp reset comment \"fips-ui canary: proves this table is loaded\""
+    # Priority -5 runs before the fips baseline; only fd00::/8 sources to these ports are affected.
+    if ! err=$(nft -f - 2>&1 <<NFT
+add table inet fips_ui_guard
+flush table inet fips_ui_guard
+table inet fips_ui_guard {
+  chain input {
+    type filter hook input priority -5; policy accept;
+    ${canary_rule}
+    iifname { "lo", "$tun" } return
+    ip6 saddr fd00::/8 tcp dport { ${ports//,/, } } counter drop comment "fips-ui: mesh source addresses only via $tun"
+  }
+}
+NFT
+    ); then printf '{"ok":false,"error":%s}\n' "$(json_escape "$(printf '%s' "$err" | grep -E 'Error:' | head -n 3)")"; exit 0; fi
+    printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$ports")" "$(json_escape "$tun")"
+    ;;
+
   list-backups)
     ensure_backups_dir
     printf '['
@@ -1021,6 +1064,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off|status> [tun] [canary]}"
     ;;
 esac

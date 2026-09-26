@@ -19,7 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   click, and edit other drop-ins. All changes are validated with `nft -c`
   against the full ruleset before being written.
 - Service buttons work through the helper, without polkit rules.
-- Helper v4 with `config-*`, `firewall-status`, `dropin-*` and `service`
+- **Web UI over the mesh**: a second listener on this node's fips0 address,
+  admitting only allowed npubs with viewer or admin roles. The mesh
+  authenticates the source address of every connection, so no password is
+  involved; the UI also opens its port in the firewall for exactly those
+  npubs. Managed on the Access page; see `docs/mesh-access.md`.
+- Helper v5 (`mesh-guard`) on top of v4's `config-*`, `firewall-status`, `dropin-*` and `service`
   verbs. Re-run `deploy/setup-local.sh` to install it.
 
 ## [0.1.3] - 2026-09-26

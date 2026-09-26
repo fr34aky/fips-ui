@@ -14,13 +14,15 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { unitStates } from './system.ts';
 
 export const MIN_HELPER_VERSION = 4;
+/** The helper version that can load the mesh-access spoofing guard. */
+export const GUARD_HELPER_VERSION = 5;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
 // Readable without privileges; overridable only so tests can point it at a scratch copy.
 const DROPIN_DIR = process.env.FIPS_UI_DROPIN_DIR ?? '/etc/fips/fips.d';
 export const MANAGED_DROPIN = 'fips-ui';
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
+export const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 const DROPIN_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/;
 
 interface HelperResult { code: number; stdout: string; stderr: string }
@@ -118,14 +120,18 @@ export async function renderManagedDropin(rules: FirewallRule[]): Promise<string
   return out.join('\n') + '\n';
 }
 
-export function parseManagedDropin(text: string): FirewallRule[] {
+export function parseManagedDropin(text: string): FirewallRule[] { return parseManagedDropinStrict(text).rules; }
+
+/** Rules plus the number of definitions that no longer validate (which a rewrite would silently drop). */
+export function parseManagedDropinStrict(text: string): { rules: FirewallRule[]; invalid: number } {
   const rules: FirewallRule[] = [];
+  let invalid = 0;
   for (const line of text.split('\n')) {
     const m = /^# fips-ui-rule (\{.*\})\s*$/.exec(line);
     if (!m) continue;
-    try { rules.push(validateRule(JSON.parse(m[1]))); } catch { /* skip a corrupted definition rather than fail the page */ }
+    try { rules.push(validateRule(JSON.parse(m[1]))); } catch { invalid++; }
   }
-  return rules;
+  return { rules, invalid };
 }
 
 async function readDropins(): Promise<{ name: string; content: string; size: number; mtime: number; managed: boolean }[]> {
@@ -166,7 +172,7 @@ export interface AdminOptions {
   busy: () => string | null;
 }
 
-export type HelperInfo = { available: boolean; version: number | null; error?: string; managementCapable: boolean };
+export type HelperInfo = { installed: boolean; available: boolean; version: number | null; error?: string; managementCapable: boolean };
 
 export function createAdminHandler(opts: AdminOptions) {
   const helperPath = opts.helperPath ?? process.env.FIPS_UI_HELPER ?? '/usr/local/libexec/fips-ui-helper';
@@ -183,13 +189,13 @@ export function createAdminHandler(opts: AdminOptions) {
 
   async function checkHelper(): Promise<HelperInfo> {
     let value: HelperInfo;
-    if (!existsSync(helperPath)) value = { available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
+    if (!existsSync(helperPath)) value = { installed: false, available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
     else {
       const r = await runHelper(helperPath, ['check'], undefined, 15_000);
-      if (r.code !== 0) value = { available: false, version: null, error: helperError(r), managementCapable: false };
+      if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false };
       else {
-        try { const j = lastJson<{ ok: boolean; version: number }>(r.stdout); value = { available: j.ok, version: j.version, managementCapable: j.ok && j.version >= MIN_HELPER_VERSION, error: j.version < MIN_HELPER_VERSION ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh` : undefined }; }
-        catch { value = { available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false }; }
+        try { const j = lastJson<{ ok: boolean; version: number }>(r.stdout); value = { installed: true, available: j.ok, version: j.version, managementCapable: j.ok && j.version >= MIN_HELPER_VERSION, error: j.version < MIN_HELPER_VERSION ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh` : undefined }; }
+        catch { value = { installed: true, available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false }; }
       }
     }
     helperCache = { at: Date.now(), value };
@@ -293,7 +299,11 @@ export function createAdminHandler(opts: AdminOptions) {
       }
       if (sub === '/firewall/rules') {
         if (!Array.isArray(body.rules)) throw new BodyError(400, 'rules (array) required');
-        const rules = body.rules.map(validateRule);
+        // Tagged rules (mesh access) belong to the UI itself: whatever a possibly stale page sends for them is
+        // replaced by the rules currently on disk.
+        const managed = (await readDropins()).find((d) => d.managed);
+        const kept = managed ? parseManagedDropinStrict(managed.content).rules.filter((r) => r.tag) : [];
+        const rules = [...body.rules.map(validateRule).filter((r: FirewallRule) => !r.tag), ...kept];
         const result = await (rules.length === 0
           ? (existsSync(join(DROPIN_DIR, `${MANAGED_DROPIN}.nft`)) ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false })
           : helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(rules)));
@@ -328,8 +338,50 @@ export function createAdminHandler(opts: AdminOptions) {
     }
   };
 
+  /** Replace the managed rules through a pure function of the current ones (used by mesh access). */
+  function updateManagedRules(mutate: (rules: FirewallRule[]) => FirewallRule[]): Promise<Record<string, unknown>> {
+    const busy = opts.busy();
+    if (busy) return Promise.reject(new Error(busy));
+    return exclusive(async () => {
+      await requireHelper();
+      const managed = (await readDropins()).find((d) => d.managed);
+      const current = managed ? parseManagedDropinStrict(managed.content) : { rules: [], invalid: 0 };
+      if (current.invalid) throw new Error(`${MANAGED_DROPIN}.nft has ${current.invalid} rule definition(s) that no longer validate; fix them on the Firewall page first so they are not lost`);
+      const next = mutate(current.rules).map(validateRule);
+      if (next.length === 0) return managed ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false };
+      const content = await renderManagedDropin(next);
+      // Unchanged rules need no write and no firewall reload.
+      if (managed && managed.content === content) return { ok: true, reloaded: false, unchanged: true };
+      return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], content);
+    });
+  }
+
+  /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
+  async function meshGuard(ports: number[] | null, tun: string, canary?: number): Promise<{ ok: boolean; error?: string }> {
+    const h = await helperInfo();
+    // A helper older than the guard cannot have loaded it, so "off" is trivially satisfied.
+    if (!(ports && ports.length) && (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: true };
+    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: false, error: `mesh access needs helper v${GUARD_HELPER_VERSION} or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
+    const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun, ...(canary ? [String(canary)] : [])], undefined, 30_000);
+    if (r.code !== 0) return { ok: false, error: helperError(r) };
+    return lastJson<{ ok: boolean; error?: string }>(r.stdout);
+  }
+
+  /** Read-only: is the guard loaded, and for which ports and interface? */
+  async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string; canary: number } | null> {
+    const h = await helperInfo();
+    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return null;
+    const r = await runHelper(helperPath, ['mesh-guard', 'status'], undefined, 15_000);
+    if (r.code !== 0) return null;
+    try { const j = lastJson<{ active: boolean; ports?: string; tun?: string; canary?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '', canary: Number(j.canary ?? 0) }; }
+    catch { return null; }
+  }
+
   return Object.assign(handler, {
     helperInfo,
+    meshGuard,
+    meshGuardStatus,
+    updateManagedRules,
     /** True while a node-management change is running (upgrades must not start then). */
     changePending: () => pending,
     serviceAction: (unit: string, action: string) => { const b = opts.busy(); return b ? Promise.reject(new Error(b)) : exclusive(() => serviceAction(unit, action)); },

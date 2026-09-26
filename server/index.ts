@@ -9,7 +9,9 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler } from './admin.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, type FirewallRule } from './admin.ts';
+import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
+import { expand6, isMeshAddress } from './net6.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -70,16 +72,26 @@ function hostnameOf(value: string | undefined, isUrl = false): string | null {
  * same-site Origin when the browser sends one, must not be flagged cross-site by Sec-Fetch-Site, and must
  * be JSON, which HTML forms cannot produce and cross-origin fetches cannot send without a CORS preflight.
  */
-function browserChecks(req: Req, method: string): string | null {
-  if (HOST_CHECK) {
+function browserChecks(req: Req, method: string, via: 'local' | 'mesh'): string | null {
+  // On the mesh listener the names are this node's fips0 address and .fips names; locally the configured set.
+  const hostOk = (h: string | null) => (via === 'mesh' ? mesh.hostAllowed(h) : !!h && ALLOWED_HOSTS.has(h));
+  if (via === 'mesh' || HOST_CHECK) {
     const host = hostnameOf(req.headers.host);
-    if (!host || !ALLOWED_HOSTS.has(host)) return `host '${req.headers.host ?? ''}' is not allowed (set FIPS_UI_ALLOWED_HOSTS)`;
+    if (!hostOk(host)) return `host '${req.headers.host ?? ''}' is not allowed${via === 'local' ? ' (set FIPS_UI_ALLOWED_HOSTS)' : ''}`;
   }
   if (method === 'GET' || method === 'HEAD') return null;
   const origin = req.headers.origin;
   if (origin && origin !== 'null') {
-    const o = hostnameOf(origin, true);
-    if (!o || (HOST_CHECK ? !ALLOWED_HOSTS.has(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+    if (via === 'mesh') {
+      // Several names are valid Hosts (address, <npub>.fips, hosts-file aliases), so Origin must be exactly this
+      // request's own origin (same host and port): a page served by another mesh node cannot post here.
+      let same = false;
+      try { same = new URL(origin).host.toLowerCase() === String(req.headers.host ?? '').toLowerCase(); } catch { /* invalid origin */ }
+      if (!same) return `cross-origin request from ${origin} refused`;
+    } else {
+      const o = hostnameOf(origin, true);
+      if (!o || (HOST_CHECK ? !hostOk(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+    }
   } else if (origin === 'null') return 'cross-origin request refused';
   const site = req.headers['sec-fetch-site'];
   if (typeof site === 'string' && site === 'cross-site') return 'cross-site request refused';
@@ -96,7 +108,6 @@ function errToResponse(res: Res, e: unknown) {
   json(res, 500, { error: (e as Error).message ?? 'internal error' });
 }
 
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 /** Resolve a peer identifier (npub, hosts-file name, or live display name) to an npub. */
 async function resolvePeer(id: string): Promise<{ npub: string; display_name?: string }> {
@@ -233,12 +244,20 @@ function serveStatic(url: URL, res: Res) {
 // ---------------------------------------------------------------------------------------------
 const startedAt = Date.now();
 let upgradeStarting = 0;
+/** Sentinel for a request no listener attributed: a viewer that route() refuses outright. */
+const NOBODY: Principal = { kind: 'mesh', role: 'viewer', npub: '', address: '' };
+/** Who is making each request: the loopback listener is the local operator; the mesh listener an allowed npub. */
+const principals = new WeakMap<Req, Principal>();
+const mainRequests = new WeakSet<Req>();
+/** The recorded principal, or the local operator for requests the main listener accepted; otherwise nobody. */
+const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequests.has(req) ? LOCAL : NOBODY);
+const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
-const upgrade = createUpgradeHandler({ authorize: () => !READ_ONLY, controlSocket: SOCKET_PATH });
+const upgrade = createUpgradeHandler({ authorize: (req) => canChange(req), controlSocket: SOCKET_PATH });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
-  authorize: () => !READ_ONLY,
+  authorize: (req) => canChange(req),
   busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
 });
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
@@ -249,26 +268,31 @@ async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
 }
 
 async function route(req: Req, res: Res) {
+  if (principalOf(req) === NOBODY) return json(res, 403, { error: 'no identity for this request' }, true);
+  const via: 'local' | 'mesh' = principalOf(req).kind;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const p = url.pathname;
   const method = req.method ?? 'GET';
 
   if (!p.startsWith('/api/')) return serveStatic(url, res);
 
-  const refused = browserChecks(req, method);
+  const refused = browserChecks(req, method, via);
   if (refused) return json(res, 403, { error: refused });
 
-  // Auth: when a token is configured, every API call needs it (mutations always, reads too).
-  if (p !== '/api/health' && !tokenOk(req, url)) return json(res, 401, { error: 'unauthorized', auth: 'token' });
+  // Auth: locally, a configured token is required for every API call. Over the mesh the npub is the credential.
+  if (via === 'local' && p !== '/api/health' && !tokenOk(req, url)) return json(res, 401, { error: 'unauthorized', auth: 'token' });
 
   if (p === '/api/health') {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
-    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: (await serviceControlMode()) !== null, nodeManagement: (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    const pr = principalOf(req);
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
+  // Upgrade state (paths, logs, and a refresh that spends the GitHub rate limit) is for admins only.
   if (p.startsWith('/api/upgrade')) {
+    if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' });
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
     // Requests that start an upgrade or rollback are counted before any await, so a node-management change
     // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
@@ -276,7 +300,8 @@ async function route(req: Req, res: Res) {
     if (starts) upgradeStarting++;
     try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
   }
-  if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
+  // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
+  if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 
   // Generic read-only proxy: /api/q/show_peers, /api/q/show_stats_history?metric=bytes_in&window=1h
@@ -291,6 +316,12 @@ async function route(req: Req, res: Res) {
     throw new HttpError(404, `unknown or non-read-only command '${cmd}'`);
   }
 
+  if (p === '/api/access' && method === 'GET') {
+    const you = principalOf(req);
+    if (you.role !== 'admin') return json(res, 200, { you });
+    const h = await admin.helperInfo();
+    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
+  }
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {
@@ -306,7 +337,25 @@ async function route(req: Req, res: Res) {
   // ---- mutating -----------------------------------------------------------------------------
   if (method !== 'POST') throw new HttpError(404, 'not found');
   if (READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
+  if (principalOf(req).role !== 'admin') throw new HttpError(403, 'your npub has viewer access; changes need admin');
   const body = await readJsonBody(req);
+
+  if (p === '/api/access') {
+    const want = body as Partial<AccessConfig>;
+    // The mesh listener binds this node's fips0 address, which the main listener already holds on its port when it
+    // is bound to every IPv6 address or to that address itself.
+    if (want?.enabled === true && mainHoldsMeshPort(Number(want.port))) throw new HttpError(400, `port ${want.port} is already used by the main listener (FIPS_UI_HOST=${HOST}); choose another port for mesh access`);
+    try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    // Syncs already in flight (or chained on them) were built from the previous list: wait for a few of them,
+    // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
+    for (let i = 0; meshSync.running && i < 3; i++) await meshSync.running.catch(() => {});
+    meshSync.dirty = true;
+    const firewall = meshSync.running
+      ? { ok: false, skipped: 'another sync is still running; this change is applied within 15 seconds' }
+      : await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
+    await mesh.reconcile();
+    return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
+  }
 
   if (p === '/api/connect') {
     const { peer, address, transport } = body as { peer?: string; address?: string; transport?: string };
@@ -346,9 +395,211 @@ async function route(req: Req, res: Res) {
   throw new HttpError(404, 'not found');
 }
 
-const server = http.createServer((req, res) => {
-  route(req, res).catch((e) => errToResponse(res, e));
-});
+/**
+ * Every request is attributed by its source address and listener. On the mesh listener only fd00::/8 sources
+ * are accepted, each admitted only as an allowed npub while the kernel guard is proven (see server/access.ts).
+ * On the main listener every source is the local operator (loopback, or whatever FIPS_UI_HOST exposes, where
+ * FIPS_UI_TOKEN applies), except fd00::/8 sources while mesh access is on, which are refused.
+ */
+async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<void> {
+  const remote = req.socket.remoteAddress;
+  // A connection that is already gone reports no address; never attribute that to anyone.
+  if (!remote) return denyMesh(req, res, 'unknown peer address');
+  // Mesh identities are admitted on the mesh listener only. With mesh access on, an fd00::/8 source on the main
+  // listener is refused (it would bypass the guard, which covers the mesh port); with it off such sources are
+  // what they were before this feature existed (LAN ULA clients, governed by FIPS_UI_HOST and FIPS_UI_TOKEN).
+  if (listener === 'main' && isMeshAddress(remote) && mesh.meshSourcesReserved) return denyMesh(req, res, 'use the mesh address and port for access over the mesh');
+  if (listener === 'mesh') {
+    if (!isMeshAddress(remote)) return denyMesh(req, res, 'not a mesh connection');
+    // The guard must have been loaded for this connection's handshake (proven when it was accepted), and the
+    // principal is read only after that, so a revocation during the proof takes effect.
+    const proof = await mesh.provenAtAccept(req.socket);
+    if (proof === 'unlisted') return denyMesh(req, res);
+    if (proof === 'retry') { res.setHeader('retry-after', '1'); return json(res, 503, { error: 'the spoofing guard was just reloaded; retry in a second' }, true); }
+    if (proof !== 'ok') return denyMesh(req, res, 'the spoofing guard was not loaded for this connection');
+    if (!mesh.ready()) { res.setHeader('retry-after', '5'); return json(res, 503, { error: 'mesh access is not ready (guard or node identity missing); retry shortly' }, true); }
+    const pr = mesh.principalFor(remote);
+    if (!pr) return denyMesh(req, res);
+    mesh.track(req.socket, pr);
+    principals.set(req, pr);
+  }
+  return route(req, res);
+}
+const server = http.createServer((req, res) => { mainRequests.add(req); handle(req, res, 'main').catch((e) => errToResponse(res, e)); });
+/** Whether the main listener holds `port` on this node's fips0 address (bound to [::] or to that address). */
+function mainHoldsMeshPort(port: number): boolean {
+  const a = server.address();
+  if (!a || typeof a !== 'object' || a.port !== port) return false;
+  const own = mesh.status().address;
+  return a.address === '::' || (!!own && expand6(a.address) === expand6(own));
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Mesh access
+// ---------------------------------------------------------------------------------------------
+const MESH_TAG = 'mesh-access';
+
+// Identity cache for the denial page, refreshed at most every 30 s so unlisted callers cannot load the daemon.
+let identityCache: { at: number; byAddr: Map<string, string> } | null = null;
+async function npubForAddress(addr: string): Promise<string | undefined> {
+  if (!identityCache || Date.now() - identityCache.at > 30_000) {
+    identityCache = { at: Date.now(), byAddr: identityCache?.byAddr ?? new Map() };
+    try {
+      const idc = await query<{ entries: { ipv6_addr: string; npub: string }[] }>('show_identity_cache', undefined, { timeoutMs: 2000 });
+      identityCache.byAddr = new Map(idc.entries.flatMap((e) => { const k = expand6(e.ipv6_addr); return k ? [[k, e.npub] as [string, string]] : []; }));
+    } catch { /* best effort */ }
+  }
+  const k = expand6(addr);
+  return k ? identityCache.byAddr.get(k) : undefined;
+}
+
+async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
+  const addr = req.socket.remoteAddress ?? 'unknown';
+  if (reason) return json(res, 403, { error: `refused: ${reason}` }, true);
+  const npub = await npubForAddress(addr);
+  const who = npub ? `${npub} (${addr})` : addr;
+  if ((req.url ?? '').startsWith('/api/')) return json(res, 403, { error: 'this node does not allow your npub', you: { address: addr, npub } }, true);
+  const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+  const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Access denied</title><body style="font:16px system-ui;padding:2rem;max-width:40rem;margin:auto;background:#0a1220;color:#e6edf7"><h1 style="font-size:1.4rem">This FIPS node's dashboard is private</h1><p>Your connection came from <code style="word-break:break-all">${esc(who)}</code>, which is not on its allow-list.</p><p style="color:#a3b3ca">Ask the operator to add your npub under <b>Access → Web UI over the mesh</b>.</p>`;
+  res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', connection: 'close' });
+  res.end(html);
+}
+
+const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
+
+/**
+ * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the
+ * access queue; a failed or refused step leaves `dirty` set and is retried on the next 15 s tick.
+ */
+type MeshSyncResult = { ok: boolean; guard?: string; rule?: string; skipped?: string };
+const meshSync = { dirty: true, running: null as Promise<MeshSyncResult> | null };
+// Only the mesh listener admits mesh identities, so only its port needs the guard.
+function guardPorts(cfg: AccessConfig): number[] { return [cfg.port]; }
+
+/** The managed firewall rule for mesh access: the mesh port on fips0, open to exactly the allowed npubs. */
+function meshRule(cfg: AccessConfig): FirewallRule | null {
+  return cfg.enabled && cfg.allowed.length
+    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
+    : null;
+}
+function applyMeshRule(cfg: AccessConfig): Promise<Record<string, unknown>> {
+  const rule = meshRule(cfg);
+  return admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
+}
+const samePorts = (a: number[], b: number[]) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+
+/** Full sync after a change: guard and managed firewall rule. */
+function syncMesh(): Promise<MeshSyncResult> {
+  if (meshSync.running) return meshSync.running;
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    meshSync.dirty = false;
+    const cfg: AccessConfig = mesh.config;
+    const helper = await admin.helperInfo().catch(() => null);
+    // With access off there is nothing to remove when the helper is known not to have a guard: not installed, or
+    // answering as too old for it. A helper check that failed may hide a loaded guard, so that case is retried.
+    const noGuardPossible = helper !== null && (helper.available ? (helper.version ?? 0) < GUARD_HELPER_VERSION : !helper.installed);
+    if (!cfg.enabled && noGuardPossible) return { ok: true, skipped: 'no guard to remove' };
+    if (!helper?.managementCapable) {
+      mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
+      meshSync.dirty = true;
+      return { ok: false, skipped: 'helper not installed' };
+    }
+    const ports = cfg.enabled ? guardPorts(cfg) : null;
+    const tun = mesh.tunName;
+    const result: MeshSyncResult = { ok: true };
+    if (ports && !mesh.canaryPort && !(await mesh.startCanary())) {
+      mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]; mesh access needs IPv6 loopback' });
+      meshSync.dirty = true;
+      return { ok: false, guard: 'no canary' };
+    }
+    // A guard already confirmed for exactly these ports and this interface is left alone (no reload): the
+    // per-connection canary and the 30 s check notice if it disappears.
+    const confirmed = !!ports && mesh.guard.active && mesh.guard.tun === tun && samePorts(mesh.guard.ports, ports);
+    // Changing an active guard: stop admitting first, so nothing is admitted on a port while the kernel covers another.
+    if (!confirmed && mesh.guard.active) mesh.setGuard({ active: false, ports: [], error: 'reloading the guard' });
+    if (confirmed) {
+      meshGuardDirty = false;
+    } else try {
+      const g = await admin.meshGuard(ports, tun, mesh.canaryPort);
+      if (g.ok && tun !== mesh.tunName) { result.ok = false; result.guard = 'interface changed while applying'; meshGuardDirty = true; }
+      else if (g.ok) { mesh.setGuard(ports ? { active: true, ports, tun } : { active: false, ports: [] }, { reloaded: true }); meshGuardDirty = false; }
+      else { result.ok = false; result.guard = g.error ?? 'failed'; mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+    } catch (e) { result.ok = false; result.guard = (e as Error).message; mesh.setGuard({ active: false, ports: [], error: result.guard }); }
+    try {
+      const r = await applyMeshRule(cfg);
+      if (!r.ok) { result.ok = false; result.rule = String(r.error ?? 'rejected'); }
+    } catch (e) { result.ok = false; result.rule = (e as Error).message; }
+    // A failed guard needs the full sync again; a failed rule alone is retried without touching the guard.
+    if (result.guard) meshSync.dirty = true; else if (result.rule) meshRuleDirty = true; else meshRuleDirty = false;
+    return result;
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
+}
+
+/** Re-apply only the guard (after a loss or a TUN rename); the firewall rule is unaffected. */
+function reapplyGuard(): Promise<MeshSyncResult> {
+  // After a running sync, re-apply only if the guard is still not right for the current ports and interface.
+  if (meshSync.running) return meshSync.running.then(() => (mesh.guard.active && mesh.guard.tun === mesh.tunName && samePorts(mesh.guard.ports, guardPorts(mesh.config)) ? { ok: true } : reapplyGuard()));
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    if (!mesh.config.enabled) return { ok: true };
+    if (!mesh.canaryPort && !(await mesh.startCanary())) { mesh.setGuard({ active: false, ports: [], error: 'the guard canary could not listen on [::1]' }); meshGuardDirty = true; return { ok: false, guard: 'no canary' }; }
+    const want = guardPorts(mesh.config), tun = mesh.tunName;
+    if (mesh.guard.active && !(mesh.guard.tun === tun && samePorts(mesh.guard.ports, want))) mesh.setGuard({ active: false, ports: [], error: 'reloading the guard' });
+    const g = await admin.meshGuard(want, tun, mesh.canaryPort).catch((e) => ({ ok: false, error: (e as Error).message }));
+    if (g.ok && tun === mesh.tunName) mesh.setGuard({ active: true, ports: want, tun }, { reloaded: true });
+    else { mesh.setGuard({ active: false, ports: [], error: g.ok ? 'interface changed while applying' : g.error }); meshGuardDirty = true; }
+    return { ok: g.ok, guard: g.ok ? undefined : g.error };
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
+}
+
+/**
+ * Every 30 s while mesh access is on, confirm the guard (ports, interface, canary) is really loaded. Read-only;
+ * a mismatch stops admission at once and re-applies only the guard. A result from a check that started before
+ * any other guard change is discarded.
+ */
+function verifyGuard(): Promise<unknown> {
+  if (!mesh.config.enabled) return Promise.resolve();
+  // A sync or rule retry holding the slot delays the check instead of skipping it (once; a sync reloads the guard anyway).
+  if (meshSync.running) return meshSync.running.catch(() => {}).then(() => (meshSync.running ? undefined : verifyGuard()));
+  const gen = mesh.guardGen;
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    const st = await admin.meshGuardStatus().catch(() => null);
+    if (st === null || !mesh.config.enabled || mesh.guardGen !== gen) return { ok: true };
+    const want = guardPorts(mesh.config), tun = mesh.tunName;
+    const ok = mesh.canaryPort > 0 && st.active && want.every((p) => st.ports.includes(p)) && st.tun === tun && st.canary === mesh.canaryPort;
+    if (ok) { if (!mesh.guard.active) mesh.setGuard({ active: true, ports: want, tun }); return { ok: true }; }
+    mesh.setGuard({ active: false, ports: [], error: st.active ? 'guard loaded for other ports, interface or canary' : 'guard not loaded (was the nftables ruleset flushed?)' });
+    meshGuardDirty = true;
+    return { ok: false };
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
+}
+
+let meshGuardDirty = false;
+let meshRuleDirty = false;
+
+/** Retry only the managed firewall rule (the guard is fine), in the same slot as the other syncs. */
+function syncRule(): Promise<unknown> {
+  if (meshSync.running) return Promise.resolve();
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    try { const r = await applyMeshRule(mesh.config); meshRuleDirty = !r.ok; return { ok: !!r.ok }; } catch (e) { meshRuleDirty = true; return { ok: false, rule: (e as Error).message }; }
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
+}
+mesh.onChange = async () => { meshSync.dirty = true; };
+mesh.onTunChange = () => { meshGuardDirty = true; };
+mesh.onGuardLost = () => { void reapplyGuard().then(() => mesh.reconcile()); };
+let meshTicks = 0;
+setInterval(() => {
+  if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
+  else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
+  // The 30 s guard check always gets its tick; a failing rule retry cannot starve it.
+  else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
+  else if (meshRuleDirty) void syncRule();
+}, 15_000).unref();
+void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 
 server.listen(PORT, HOST, () => {
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
@@ -358,4 +609,4 @@ server.listen(PORT, HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); process.exit(0); });
