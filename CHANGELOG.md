@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
 ### Added
 
 - **Configuration** page: edit `/etc/fips/fips.yaml` with YAML validation,
@@ -221,7 +223,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fr34aky/fips-ui/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fr34aky/fips-ui/compare/v0.1.0...v0.1.1
