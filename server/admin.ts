@@ -30,12 +30,14 @@ function runHelper(helperPath: string, args: string[], input?: string, timeoutMs
   const [cmd, argv] = isRoot ? [helperPath, args] : ['sudo', ['-n', helperPath, ...args]];
   return new Promise((resolve) => {
     const child = spawn(cmd, argv, { stdio: [input !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '';
+    // Collect bytes and decode once, so a multi-byte character split across pipe chunks survives.
+    const out: Buffer[] = [], err: Buffer[] = [];
     const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-    child.stdout.on('data', (c) => { stdout += c; });
-    child.stderr.on('data', (c) => { stderr += c; });
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: 127, stdout, stderr: e.message }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr }); });
+    child.stdout.on('data', (c: Buffer) => out.push(c));
+    child.stderr.on('data', (c: Buffer) => err.push(c));
+    const text = (b: Buffer[]) => Buffer.concat(b).toString('utf8');
+    child.on('error', (e) => { clearTimeout(timer); resolve({ code: 127, stdout: text(out), stderr: e.message }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, stdout: text(out), stderr: text(err) }); });
     if (input !== undefined && child.stdin) { child.stdin.on('error', () => {}); child.stdin.end(input); }
   });
 }
@@ -272,7 +274,7 @@ export function createAdminHandler(opts: AdminOptions) {
         if (Buffer.byteLength(yaml) > 256 * 1024) throw new BodyError(400, 'configuration larger than 256 KiB');
         if (body.restart !== undefined && typeof body.restart !== 'boolean') throw new BodyError(400, 'restart must be a boolean');
         if (typeof body.base !== 'string' || !/^[0-9a-f]{64}$/.test(body.base)) throw new BodyError(400, 'base (the hash returned with the configuration) required');
-        const result = await helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : []), '--base', body.base], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT);
+        const result = await helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : []), '--base', body.base], yaml, HELPER_RESTART_TIMEOUT);
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/config/restore') {

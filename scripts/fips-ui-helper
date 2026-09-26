@@ -268,7 +268,7 @@ def read(path):
     return data, (text[1:] if bom else text), (BOM if bom else '')
 
 def looks_secret(value):
-    return value.strip().lower() not in NOT_SECRET and not value.startswith('cookie:') and len(value) >= 4
+    return value.strip().lower() not in NOT_SECRET
 
 def occurs(value, text):
     return re.search(r'(?<![A-Za-z0-9_])' + re.escape(value) + r'(?![A-Za-z0-9_])', text) is not None
@@ -342,12 +342,23 @@ def secrets(text, root):
                 walk(v, p)
         elif isinstance(n, nodes.SequenceNode):
             for i, v in enumerate(n.value):
-                walk(v, path + [i])
-        elif isinstance(n, nodes.ScalarNode) and NSEC.search(n.value):
-            raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
+                walk(v, path + [itemsig(v, i)])
+        elif isinstance(n, nodes.ScalarNode):
+            if NSEC.search(n.value):
+                raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
+            if HEXKEY.search(n.value.replace('\n', '').replace(' ', '')):
+                raise Refuse(f'line {line(n)}: a 64-character hex value (possibly a private key) outside a secret key')
     if root is not None:
         walk(root, [])
     return found
+
+def itemsig(v, i):
+    """A list item's identity: its own non-secret scalar entries (so deleting or reordering other items keeps it)."""
+    if isinstance(v, nodes.MappingNode):
+        own = tuple(sorted((k.value, x.value) for k, x in v.value if isinstance(k, nodes.ScalarNode) and isinstance(x, nodes.ScalarNode) and k.value.strip().lower() not in KEYS))
+        if own:
+            return ('item', own)
+    return i
 
 def flatten(n, seen=None):
     seen = seen if seen is not None else set()
@@ -371,7 +382,7 @@ def ph(i):
     return f'"<redacted #{i}>"'
 
 def fmt(path):
-    return '.'.join(str(x) for x in path) or 'the top level'
+    return '.'.join((('[' + ', '.join(f'{k}={v}' for k, v in x[1][:2]) + ']') if isinstance(x, tuple) else str(x)) for x in path) or 'the top level'
 
 def redact(path):
     data, text, bom = read(path)
@@ -381,37 +392,66 @@ def redact(path):
     found = secrets(text, root)
     out = splice(text, [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)])
     # Whatever the form, no secret may survive anywhere in what is shown (comments, copies, other keys).
+    secret_ids = {id(v) for _, _, v in found}
+    others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids]
     for _, name, v in found:
-        if looks_secret(v.value) and occurs(v.value, out):
+        if not looks_secret(v.value):
+            continue
+        raw = text[v.start_mark.index:v.end_mark.index]
+        forms = {v.value, raw, raw.strip('"\'')}
+        long_enough = [f for f in forms if len(f) >= 6]
+        copy = any(x.value == v.value or (len(v.value) >= 6 and v.value in x.value) for x in others) \
+            or any(f in out for f in long_enough) or occurs(v.value, out)
+        if copy:
             raise Refuse(f'the value of {name} also appears elsewhere in the file (a comment or another key)')
     if NSEC.search(out):
         raise Refuse('an nsec value appears outside a secret key (for example in a comment)')
     if HEXKEY.search(out):
         raise Refuse('a 64-character hex value (possibly a private key) appears outside a secret key')
-    # A commented-out secret line ("#   nsec: ...", "# - password: ..."), not prose that mentions a key.
-    keyed = re.compile(r'^\s*#[\s#]*(?:-\s+)?[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*:\s*\S', re.I)
+    # A secret key with a value anywhere in a comment (old or rotated secrets, "key=value", flow style), except
+    # documentation placeholders such as "password:<secret>".
+    keyed = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*[:=]\s*(?![<\s"\']*[<$])[^\s,}\]]', re.I)
     for no, ln in enumerate(out.splitlines(), 1):
-        if keyed.search(ln):
-            raise Refuse(f'line {no}: a comment contains a secret key with a value (a commented-out secret?)')
+        c = comment_of(ln)
+        if c and keyed.search(c):
+            raise Refuse(f'line {no}: a comment contains a secret key with a value (an old or commented-out secret?)')
     return 'base ' + hashlib.sha256(data).hexdigest() + '\n' + bom + out
+
+def comment_of(ln):
+    """The comment part of a YAML line: from a '#' at the start or after whitespace, outside quotes."""
+    q = None
+    for i, ch in enumerate(ln):
+        if q:
+            if ch == q and (q == "'" or ln[i - 1] != '\\'):
+                q = None
+        elif ch in '"\'' and (i == 0 or ln[i - 1] in ' \t:[{,'):
+            q = ch
+        elif ch == '#' and (i == 0 or ln[i - 1] in ' \t'):
+            return ln[i:]
+    return ''
 
 def get(root, path):
     n = root
     for p in path:
         if isinstance(n, nodes.MappingNode) and isinstance(p, str):
             n = next((v for k, v in n.value if isinstance(k, nodes.ScalarNode) and k.value == p), None)
-        elif isinstance(n, nodes.SequenceNode) and isinstance(p, int) and p < len(n.value):
-            n = n.value[p]
+        elif isinstance(n, nodes.SequenceNode):
+            n = next((v for i, v in enumerate(n.value) if itemsig(v, i) == p), None)
         else:
             return None
         if n is None:
             return None
     return n
 
-def restore(orig_path, new_path):
-    _, otext, _ = read(orig_path)
+def restore(orig_path, new_path, base):
+    odata, otext, _ = read(orig_path)
+    if hashlib.sha256(odata).hexdigest() != base:
+        raise Refuse('fips.yaml changed since you loaded it; reload the page and make your edit again')
     orig = secrets(otext, compose(otext, 'the current file'))
     _, ntext, nbom = read(new_path)
+    # Browsers submit LF; keep a CRLF file CRLF.
+    if '\r\n' in otext and '\r\n' not in ntext:
+        ntext = ntext.replace('\n', '\r\n')
     nroot = compose(ntext, 'the new file')
     if any(c > 1 for c in uses(nroot).values()):
         raise Refuse('the new file uses YAML aliases (*name), which this editor does not support')
@@ -429,7 +469,7 @@ def restore(orig_path, new_path):
                 walk(v, path + [k.value if isinstance(k, nodes.ScalarNode) else '?'], k, seen)
         elif isinstance(n, nodes.SequenceNode):
             for i, v in enumerate(n.value):
-                walk(v, path + [i], None, seen)
+                walk(v, path + [itemsig(v, i)], None, seen)
         elif isinstance(n, nodes.ScalarNode):
             m = PH.fullmatch(n.value)
             if not m:
@@ -460,7 +500,7 @@ def restore(orig_path, new_path):
         if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
             raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
         if looks_secret(ov.value):
-            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and occurs(ov.value, x.value)]
+            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and (x.value == ov.value or (len(ov.value) >= 6 and ov.value in x.value))]
             if len(places) != 1:
                 raise Refuse(f'redacted secret #{i} ({oname}) would appear in more than one place')
     return nbom + out
@@ -470,7 +510,7 @@ try:
         sys.stdout.buffer.write(redact(sys.argv[3]).encode('utf-8'))
     elif MODE == 'restore':
         with open(sys.argv[5], 'wb') as f:
-            f.write(restore(sys.argv[3], sys.argv[4]).encode('utf-8'))
+            f.write(restore(sys.argv[3], sys.argv[4], sys.argv[6]).encode('utf-8'))
     else:
         raise Refuse('unknown mode')
 except Refuse as e:
@@ -481,7 +521,7 @@ except (OSError, UnicodeDecodeError) as e:
     sys.exit(3)
 PY
 redact() { python3 -I -c "$REDACT_PY" redact "$SECRET_KEYS" "$1"; }
-restore_secrets() { python3 -I -c "$REDACT_PY" restore "$SECRET_KEYS" "$1" "$2" "$3"; }
+restore_secrets() { python3 -I -c "$REDACT_PY" restore "$SECRET_KEYS" "$1" "$2" "$3" "$4"; }
 
 read_stdin_limited() { # <dest> <max-bytes>
   head -c "$(( $2 + 1 ))" > "$1"
@@ -677,8 +717,8 @@ case "$cmd" in
     [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
     tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
     read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
-    if [[ -n "$base" && "$(sha256sum "$FIPS_CONFIG" | cut -d' ' -f1)" != "$base" ]]; then die "fips.yaml changed since you loaded it; reload the page and make your edit again"; fi
-    if ! err=$(restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" 2>&1); then die "$(printf '%s' "$err" | head -n 3 | tr '\n' ' ')"; fi
+    # The restorer checks --base against the exact bytes it reads, so nothing can change in between.
+    if ! err=$(restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" "$base" 2>&1); then die "$(printf '%s' "$err" | head -n 3 | tr '\n' ' ')"; fi
     grep -q '<redacted #' "$tmp2" && die "a redaction placeholder is still present"
     if cmp -s "$tmp2" "$FIPS_CONFIG"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
     id=$(backup_config)
