@@ -36,7 +36,8 @@ export function parseJournalEntry(entry: Record<string, unknown>): LogLine {
 }
 
 export function recentLogs(lines = 300, since?: string): Promise<LogLine[]> {
-  const args = ['-u', UNIT, '-o', 'json', '--no-pager', '-n', String(Math.min(Math.max(lines, 1), 5000))];
+  const n = Number.isFinite(lines) ? Math.min(Math.max(Math.floor(lines), 1), 5000) : 300;
+  const args = ['-u', UNIT, '-o', 'json', '--no-pager', '-n', String(n)];
   if (since) args.push('--since', since);
   return new Promise((resolve) => {
     const child = spawn('journalctl', args, { stdio: ['ignore', 'pipe', 'ignore'] });

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-26
+
+### Fixed
+
+- Regression in 0.1.1: `systemctl show --timestamp=unix` is rejected by
+  systemd older than 251, which left the Services card empty there. The
+  flag is now probed once and the monotonic fallback actually runs.
+- Regression in 0.1.1: rebuilding a ref that was already built (dry run
+  then real run, or a retry) failed at staging because cargo does not relink
+  fresh binaries. Staged binaries are now validated by the revision they
+  report against the commit that was built, which also catches leftovers.
+- GitHub negative caching only worked for the first minute; an expired
+  error entry no longer blocks a fresh one.
+- A stale hashed asset URL fell through to `index.html` and was served with
+  a one-year immutable cache header; missing assets now return 404 and the
+  SPA fallback is never marked immutable.
+- A tab that had launched an earlier job did not follow a newer job started
+  elsewhere; the newer server-side job now supersedes it.
+- A refused start (helper missing) was briefly published as a job and then
+  withdrawn, which the page reported as a backend restart. The slot is now
+  reserved without publishing until the job actually launches.
+- Reconnecting event streams probed the full snapshot route to detect an
+  expired token; they now use a cheap `HEAD` request.
+- The Upgrade page used its own modal instead of the shared component.
+- `GET /api/logs?lines=<non-number>` produced `journalctl -n NaN` and an
+  empty result; the value is validated.
+- Oversized upgrade request bodies caused a connection reset instead of a
+  413 response.
+
 ## [0.1.1] - 2026-09-26
 
 ### Added
@@ -125,6 +154,7 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/fr34aky/fips-ui/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fr34aky/fips-ui/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/fr34aky/fips-ui/releases/tag/v0.1.0

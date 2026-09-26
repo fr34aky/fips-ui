@@ -4,7 +4,7 @@ import {
   GitCommitHorizontal, Hammer, KeyRound, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, SkipForward, Terminal, X, XCircle,
 } from 'lucide-react';
 import { usePoll } from '../lib/api';
-import { Copyable } from '../components/ui';
+import { Copyable, Modal } from '../components/ui';
 import { fmtAgo, fmtBytes, fmtDuration, fmtTime } from '../lib/format';
 import { upgradeApi, useUpgradeJob, type Backup, type JobSummary, type StepInfo, type UpgradeSource, type UpgradeStatus } from '../lib/upgrade';
 
@@ -21,7 +21,11 @@ export function Upgrade() {
   const [dismissedId, setDismissedId] = useState<string | null>(null);
   // The server keeps its last job indefinitely, so "dismiss" has to be remembered client-side.
   const serverJobId = st?.job && st.job.id !== dismissedId ? st.job.id : null;
-  const { job: liveJob, log } = useUpgradeJob(activeJobId ?? serverJobId);
+  // Job ids are timestamps, so lexical order is start order: a newer job reported by the server (started from
+  // another tab or curl) supersedes the one this tab launched; the local id only bridges the gap until the
+  // next status poll sees it.
+  const followId = serverJobId && (!activeJobId || serverJobId > activeJobId) ? serverJobId : activeJobId ?? serverJobId;
+  const { job: liveJob, log } = useUpgradeJob(followId);
   const candidate = liveJob ?? st?.job ?? null;
   const job = candidate && candidate.id !== dismissedId ? candidate : null;
   const busy = job?.state === 'running' || job?.state === 'queued';
@@ -121,7 +125,7 @@ export function Upgrade() {
 
       {/* ---- dialogs ------------------------------------------------------- */}
       {confirm && (
-        <Modal onClose={() => setConfirm(null)} title={confirm.label}>
+        <Modal open onClose={() => setConfirm(null)} title={confirm.label} width="max-w-md">
           <div className="grid gap-3 text-sm">
             {confirm.ref?.startsWith('rollback:') ? (
               <p>The current binaries are backed up first, then the selected backup is restored and the service restarted.</p>
@@ -375,21 +379,5 @@ function JobPanel({ job, log, onCancel, onDismiss }: { job: JobSummary; log: { s
         </div>
       </div>
     </section>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Dialogs
-// ---------------------------------------------------------------------------
-
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
-  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div role="dialog" aria-modal="true" className="card w-full max-w-md p-5 grid gap-3 fade-in">
-        <div className="flex items-center justify-between"><h2 className="font-semibold">{title}</h2><button className="btn ghost icon sm" onClick={onClose} aria-label="Close"><X size={15} /></button></div>
-        {children}
-      </div>
-    </div>
   );
 }

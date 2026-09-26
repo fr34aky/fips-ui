@@ -238,11 +238,13 @@ function controlQuery(socket: string, command: string, timeoutMs = 4000): Promis
   })
 }
 
+class BodyTooLarge extends Error { status = 413; constructor() { super('request body too large (64 KiB limit)') } }
 function readBody(req: IncomingMessage, limit = 64 * 1024): Promise<string> {
   return new Promise((res, rej) => {
     let data = ''
-    req.on('data', (c) => { data += c; if (data.length > limit) { rej(new Error('body too large')); req.destroy() } })
-    req.on('end', () => res(data)); req.on('error', rej)
+    let failed = false
+    req.on('data', (c) => { if (failed) return; data += c; if (data.length > limit) { failed = true; rej(new BodyTooLarge()); req.pause() } })
+    req.on('end', () => { if (!failed) res(data) }); req.on('error', rej)
   })
 }
 
@@ -310,7 +312,8 @@ class GitHub {
       return value
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
-      if (!this.cache.get(path)?.error) this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + GITHUB_ERROR_CACHE_MS })
+      const prev = this.cache.get(path)
+      if (!(prev?.error && Date.now() < prev.until)) this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + GITHUB_ERROR_CACHE_MS })
       throw err
     }
   }
@@ -717,11 +720,14 @@ export class UpgradeManager {
 
   // ---- job control --------------------------------------------------------
 
-  private claimSlot(job: Job): void {
-    if (this.current && (this.current.state === 'running' || this.current.state === 'queued')) throw new Error('an upgrade job is already running')
-    this.current = job // reserved synchronously, before any await, so two concurrent starts cannot both pass the guard
+  /** True while start()/rollback() are between the guard and publishing a Job, so concurrent starts cannot both pass. */
+  private starting = false
+  private claimSlot(): void {
+    if (this.starting || (this.current && (this.current.state === 'running' || this.current.state === 'queued'))) throw new Error('an upgrade job is already running')
+    this.starting = true // synchronous, before any await
   }
-  private release(job: Job): void { if (this.current === job) this.current = null }
+  /** Publish the job as current (or give the slot back on `null`). Only published jobs are observable by clients. */
+  private publish(job: Job | null): void { if (job) this.current = job; this.starting = false }
   private launch(job: Job, work: () => Promise<void>): Job {
     job.state = 'running'
     void work().then(() => job.finish(), (e) => job.finish(e)).finally(() => this.cache.clear())
@@ -731,12 +737,14 @@ export class UpgradeManager {
   async start(req: JobRequest): Promise<Job> {
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
-    const job = new Job(req.source, req)
-    this.claimSlot(job)
+    this.claimSlot()
     if (!req.dryRun) {
-      const h = await this.installer.check()
-      if (!h.available) { this.release(job); throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'}. Install the helper first, or start a dry run.`) }
+      let h: { available: boolean; error?: string }
+      try { h = await this.installer.check() } catch (e) { this.publish(null); throw e }
+      if (!h.available) { this.publish(null); throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'}. Install the helper first, or start a dry run.`) }
     }
+    const job = new Job(req.source, req)
+    this.publish(job)
     return this.launch(job, () => this.execute(job))
   }
 
@@ -789,7 +797,7 @@ export class UpgradeManager {
     } else {
       job.defineSteps([['sync', 'Sync source from git'], ['build', 'cargo build --release'], ['stage', 'Stage binaries'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version']])
       const src = join(this.workDir, 'src', 'fips')
-      await job.runStep('sync', async () => {
+      const builtSha = await job.runStep('sync', async () => {
         if (!existsSync(join(src, '.git'))) { await mkdir(join(this.workDir, 'src'), { recursive: true }); await job.exec('git', ['clone', '--no-checkout', this.repoUrl, src]) }
         await job.exec('git', ['fetch', '--prune', '--tags', 'origin'], { cwd: src })
         // A bare branch name must mean the remote branch just fetched, not the local branch git created at clone
@@ -805,9 +813,9 @@ export class UpgradeManager {
         const sha = (await job.exec('git', ['rev-parse', 'HEAD'], { cwd: src, quiet: true })).trim()
         const subject = (await job.exec('git', ['log', '-1', '--format=%s (%ci)'], { cwd: src, quiet: true })).trim()
         job.info(`building ${sha.slice(0, 10)} — ${subject}`)
+        return sha
       })
       const targetDir = join(this.workDir, 'target')
-      const buildStartedAt = Date.now()
       await job.runStep('build', async () => {
         const env: NodeJS.ProcessEnv = { CARGO_TARGET_DIR: targetDir, CARGO_TERM_COLOR: 'never', CARGO_TERM_PROGRESS_WHEN: 'never' }
         const tc = await this.toolchain()
@@ -815,7 +823,7 @@ export class UpgradeManager {
         if (!tc.libclang.ok) job.info('warning: libclang not detected; the fips-gateway build may fail (set LIBCLANG_PATH)')
         await job.exec('cargo', ['build', '--release', '--locked', ...this.cargoArgs], { cwd: src, env })
       })
-      await job.runStep('stage', async () => { await this.stageBinaries(job, join(targetDir, P.cargoOut), stageDir, buildStartedAt) })
+      await job.runStep('stage', async () => { await this.stageBinaries(job, join(targetDir, P.cargoOut), stageDir, builtSha) })
     }
 
     job.result.stageDir = stageDir
@@ -859,20 +867,24 @@ export class UpgradeManager {
   }
 
   /**
-   * Copy the daemon binaries from `from` into a fresh stage dir. With `newerThan` (a cargo build's start time),
-   * binaries older than that are leftovers from a previous build of a different ref in the shared target dir
-   * and are not staged: optional ones are skipped, required ones fail the job.
+   * Copy the daemon binaries from `from` into a fresh stage dir. With `expectSha` (the commit that was just
+   * built), each binary's `--version` revision must be a prefix of it: a binary reporting another revision is a
+   * leftover from an earlier build of a different ref in the shared target dir and is not staged (optional
+   * binaries are skipped, required ones fail the job). Cargo does not relink fresh binaries, so mtimes cannot
+   * tell a leftover from a legitimately up-to-date one; the embedded revision can.
    */
-  private async stageBinaries(job: Job, from: string, stageDir: string, newerThan?: number): Promise<void> {
+  private async stageBinaries(job: Job, from: string, stageDir: string, expectSha?: string): Promise<void> {
     await rm(stageDir, { recursive: true, force: true }); await mkdir(stageDir, { recursive: true })
     const staged: string[] = []
     for (const b of this.platform.binaries) {
       const p = join(from, b)
       const required = b.startsWith('fips.') || b === 'fips' || b.startsWith('fipsctl')
       if (!existsSync(p)) { if (required) throw new Error(`missing ${b} in ${from}`); job.info(`note: ${b} not present, skipping`); continue }
-      if (newerThan !== undefined) {
-        const mtime = (await stat(p)).mtimeMs
-        if (mtime < newerThan - 1000) { if (required) throw new Error(`${b} was not rebuilt by this job (left over from an earlier build)`); job.info(`note: ${b} is from an earlier build, not staged`); continue }
+      if (expectSha) {
+        const v = parseVersionOutput((await run(p, ['--version'], { timeout: 5000 })).stdout)
+        const rev = v?.rev?.replace(/[^0-9a-f].*$/, '')
+        if (rev && !expectSha.startsWith(rev)) { if (required) throw new Error(`${b} reports rev ${rev}, not the ${expectSha.slice(0, 10)} that was just built (left over from an earlier build)`); job.info(`note: ${b} is from an earlier build (rev ${rev}), not staged`); continue }
+        if (!rev) job.info(`note: ${b} reports no revision; staged unverified`)
       }
       await copyFile(p, join(stageDir, b))
       if (this.platform.os !== 'windows') await chmod(join(stageDir, b), 0o755)
@@ -884,8 +896,9 @@ export class UpgradeManager {
 
   async rollback(id: string): Promise<Job> {
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) throw new Error('invalid backup id')
+    this.claimSlot()
     const job = new Job('release', { source: 'release' }, `rollback:${id}`, 'rollback')
-    this.claimSlot(job)
+    this.publish(job)
     job.cancellable = false
     return this.launch(job, async () => {
       job.defineSteps([['install', `Restore backup ${id} (privileged)`], ['confirm', 'Confirm running version']])
@@ -957,7 +970,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
       if (sub === '/restart' && method === 'POST') { sendJson(res, 200, { output: await mgr.restartService() }); return true }
       if (sub === '/toolchain/plan' && method === 'GET') { sendJson(res, 200, await mgr.toolchainPlan()); return true }
       sendJson(res, 404, { error: 'not found' }); return true
-    } catch (e) { sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) }); return true }
+    } catch (e) { sendJson(res, e instanceof BodyTooLarge ? 413 : 400, { error: e instanceof Error ? e.message : String(e) }); return true }
   }
   return Object.assign(handler, { manager: mgr })
 }

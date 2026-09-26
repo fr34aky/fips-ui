@@ -79,8 +79,8 @@ const live = (() => {
     es.onopen = () => set({ conn: state.snapshot ? 'live' : 'connecting' });
     es.onerror = () => {
       set({ conn: 'reconnecting' });
-      // EventSource can't surface the HTTP status; probe health to detect a 401.
-      fetch('/api/snapshot', { headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => { if (r.status === 401) authStore.setNeeded(true); }).catch(() => {});
+      // EventSource can't surface the HTTP status; probe a cheap authenticated route to detect a 401.
+      fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => { if (r.status === 401) authStore.setNeeded(true); }).catch(() => {});
     };
   }
   function close() { es?.close(); es = null; }

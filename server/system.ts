@@ -28,9 +28,20 @@ export interface UnitState {
 // with CLOCK_MONOTONIC (process.hrtime on Linux), which like systemd's clock excludes suspend.
 const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestamp', 'ExecMainStartTimestamp', 'ActiveEnterTimestampMonotonic', 'ExecMainStartTimestampMonotonic', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
 
+// systemd < 251 rejects `--timestamp=unix` with exit 1, so the flag is tried once and dropped if refused.
+let unixTimestamps: boolean | null = null;
+async function systemctlShow(): Promise<string> {
+  const base = ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager'];
+  if (unixTimestamps !== false) {
+    try { const { stdout } = await execFileP('systemctl', [...base, '--timestamp=unix']); unixTimestamps = true; return stdout; }
+    catch (e) { if (unixTimestamps === true) throw e; unixTimestamps = false; }
+  }
+  return (await execFileP('systemctl', base)).stdout;
+}
+
 export async function unitStates(): Promise<UnitState[]> {
   try {
-    const { stdout } = await execFileP('systemctl', ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager', '--timestamp=unix']);
+    const stdout = await systemctlShow();
     const bootEpochMs = Date.now() - Number(process.hrtime.bigint() / 1_000_000n);
     // Output is blank-line separated blocks, one per unit, in request order.
     const blocks = stdout.trim().split(/\n\s*\n/);

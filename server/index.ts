@@ -220,10 +220,15 @@ function serveStatic(url: URL, res: Res) {
   if (rel.includes('..') || rel.includes('\0')) return json(res, 400, { error: 'bad path' });
   let file = path.join(STATIC_DIR, rel);
   const isFile = (f: string) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
-  if (!isFile(file)) file = path.join(STATIC_DIR, 'index.html'); // SPA fallback
+  const isAsset = rel.startsWith('/assets/');
+  if (!isFile(file)) {
+    // Hashed assets are never satisfied by the SPA fallback: a stale script URL must 404, not receive HTML.
+    if (isAsset) return json(res, 404, { error: 'asset not found (stale build?)' });
+    file = path.join(STATIC_DIR, 'index.html');
+  }
   if (!isFile(file)) return json(res, 404, { error: 'frontend not built: web/dist/index.html is missing' });
   const ext = path.extname(file);
-  const immutable = rel.startsWith('/assets/');
+  const immutable = isAsset;
   const stream = fs.createReadStream(file);
   stream.on('open', () => res.writeHead(200, { 'content-type': MIME[ext] ?? 'application/octet-stream', 'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache' }));
   // A file that vanishes or is unreadable (mid-build, wrong permissions) must fail this request, not the process.
@@ -277,7 +282,8 @@ async function route(req: Req, res: Res) {
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {
-    const lines = Number(url.searchParams.get('lines') ?? 300);
+    const requested = Number(url.searchParams.get('lines') ?? 300);
+    const lines = Number.isFinite(requested) ? Math.min(5000, Math.max(1, Math.floor(requested))) : 300;
     return json(res, 200, { lines: await recentLogs(lines, url.searchParams.get('since') ?? undefined) });
   }
   if (p === '/api/resolve') {
