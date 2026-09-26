@@ -134,9 +134,9 @@ export function Listening({ snap }: { snap: Snapshot }) {
   if (!l) return <Empty>Not available.</Empty>;
   return (
     <div className="grid gap-2">
-      <div className="flex items-center gap-2 text-xs">{l.firewall_active ? <Chip tone="good"><ShieldCheck size={12} />firewall active</Chip> : <Chip tone="crit"><ShieldAlert size={12} />fips-firewall inactive: all listeners exposed</Chip>}<span className="text-ink-3 mono truncate">{l.fips0_addr}</span></div>
+      <div className="flex items-center gap-2 text-xs">{l.firewall_active ? <Chip tone="good"><ShieldCheck size={12} />firewall active</Chip> : <Chip tone="crit"><ShieldAlert size={12} />fips-firewall inactive: all listeners exposed</Chip>}<span className="text-ink-3 mono truncate">{l.fips0_addr}</span><span className="text-ink-3 ml-auto shrink-0" title="IPv6 listeners bound to all interfaces or to fips0. IPv4-only and loopback listeners are not reachable over the mesh.">{l.sockets.length} reachable</span></div>
       {l.sockets.length === 0 ? <div className="text-sm text-ink-3 py-2">No IPv6 listeners reachable from the mesh.</div> : (
-        <div className="overflow-x-auto -mx-1"><table className="data"><thead><tr><th>Proto</th><th>Port</th><th>Process</th><th>Bind</th><th>Filter</th></tr></thead><tbody>
+        <div className="overflow-auto max-h-[26rem] -mx-1"><table className="data"><thead><tr><th>Proto</th><th>Port</th><th>Process</th><th>Bind</th><th>Filter</th></tr></thead><tbody>
           {l.sockets.map((k, i) => <tr key={i}><td className="uppercase text-xs">{k.proto}</td><td className="tabular">{k.port}</td><td>{k.process ? `${k.process}${k.pid ? ` (${k.pid})` : ''}` : '?'}</td><td className="text-ink-3 text-xs">{k.wildcard_bind ? 'all interfaces' : 'fips0 only'}</td><td><Chip tone={k.filter === 'accept' ? 'good' : k.filter === 'drop' ? 'neutral' : k.filter === 'no_firewall' ? 'crit' : 'warn'}>{k.filter === 'accept' ? 'open' : k.filter === 'drop' ? 'filtered' : k.filter === 'no_firewall' ? 'exposed' : k.filter}</Chip>{k.filter === 'drop' && <a className="ml-2 text-xs text-ink-3 hover:text-ink" href={`#/firewall?proto=${k.proto}&port=${k.port}${k.process ? `&note=${encodeURIComponent(k.process)}` : ''}`}>allow…</a>}</td></tr>)}
         </tbody></table></div>
       )}
