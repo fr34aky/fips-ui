@@ -222,11 +222,14 @@ take_lock() {
 
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
 # secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
-# character span is replaced by "<redacted #N>". Anything else is refused (exit 3, reasons on stderr), and so
-# is a file where a secret value also appears anywhere else (a comment, another key) or an nsec value sits
-# outside a secret key. Restore requires each placeholder to be a whole scalar value under the same key at the
-# same path, puts the original value text back, re-parses the result and checks each secret is exactly at its
-# path and nowhere else. Runs as root in isolated mode (python3 -I): no user environment is consulted.
+# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret value or
+# holds an nsec or 64-hex key is shown as "# <redacted comment #N>". Anything else is refused (exit 3, reasons
+# on stderr), and so is a file where a secret value also appears in another key, value or anchor, or an nsec
+# value sits outside a secret key. Restore requires each placeholder to be a whole scalar value under the same
+# key at the same path (and each comment placeholder a whole comment), puts the original text back, re-parses
+# the result and checks each secret is exactly at its path and nowhere else, and that the result can be shown
+# again with every restored comment still hidden. Runs as root in isolated mode (python3 -I): no user
+# environment is consulted.
 read -r -d '' REDACT_PY <<'PY' || true
 # Secret redaction for fips.yaml, decided from the parsed YAML tree (PyYAML's safe composer), never from text.
 #   redact <file>                     -> "base <sha256 of the bytes read>" line, then the file with each secret
@@ -252,7 +255,9 @@ NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
 HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
 NOT_SECRET = {'', 'null', '~', 'true', 'false', 'cookie'}
 BOM = '\ufeff'
-KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, sorted(set(k.lower() for k in sys.argv[2].split('|'))))) + r')[\'"]?\s*[:=]', re.I)
+KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, sorted(KEYS))) + r')[\'"]?\s*[:=]', re.I)
+# YAML 1.1 line breaks (libyaml); Python's str.splitlines also splits on \v, \f and others, which YAML does not.
+BREAK = re.compile(r'\r\n|[\r\n\x85\u2028\u2029]')
 PLACEHOLDERS = re.compile(r'"<redacted #\d+>"|# <redacted comment #\d+>')
 PH = re.compile(r'<redacted #(\d+)>')
 CPH = re.compile(r'^#\s*<redacted comment #(\d+)>\s*$')
@@ -428,8 +433,8 @@ def comment_spans(text):
             if b <= a:
                 continue
             if getattr(t, 'style', None) in ('|', '>'):
-                nl = text.find('\n', a)
-                a = b if nl < 0 or nl >= b else nl
+                m = BREAK.search(text, a)
+                a = b if not m or m.start() >= b else m.start()
             if b > a:
                 cov.append((a, b))
         cov.sort()
@@ -441,13 +446,13 @@ def comment_spans(text):
         k = bisect.bisect_right(starts, i) - 1
         return k >= 0 and cov[k][0] <= i < cov[k][1]
     out, pos = [], 0
-    for ln in text.splitlines(keepends=True):
-        body = ln.rstrip('\r\n')
-        for i, ch in enumerate(body):
-            if ch == '#' and not covered(pos + i):
-                out.append((pos + i, pos + len(body)))
+    for m in list(BREAK.finditer(text)) + [None]:
+        end = m.start() if m else len(text)
+        for i in range(pos, end):
+            if text[i] == '#' and not covered(i):
+                out.append((i, end))
                 break
-        pos += len(ln)
+        pos = m.end() if m else end
     return out
 
 def sensitive_comment(c, forms):
@@ -467,13 +472,14 @@ def redact_text(text):
         raise Refuse('the file already contains a redaction placeholder')
     root = compose(text, 'the file')
     found = secrets(text, root)
-    forms_all = set()
+    # Per secret: its decoded forms, and those plus its raw spellings (escapes, quotes) as they appear in the text.
+    decoded, spelled = [], []
     for _, _, v in found:
         f = secret_forms(v.value)
-        if f:
-            raw = text[v.start_mark.index:v.end_mark.index]
-            f |= {x for x in (raw, raw.strip('"\'')) if len(x) >= 3}
-        forms_all |= f
+        raw = text[v.start_mark.index:v.end_mark.index]
+        decoded.append(f)
+        spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
+    forms_all = set().union(*spelled) if spelled else set()
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
     comments = []
     for a, b in comment_spans(text):
@@ -485,14 +491,12 @@ def redact_text(text):
     secret_ids = {id(v) for _, _, v in found}
     others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
     bare = PLACEHOLDERS.sub('', out)  # the placeholders' own text is not a copy of anything
-    for _, name, v in found:
-        mine = secret_forms(v.value)
-        if mine:
-            raw = text[v.start_mark.index:v.end_mark.index]
-            mine |= {x for x in (raw, raw.strip('"\'')) if len(x) >= 3}
-        # Inside other scalars any occurrence counts; in the raw text short values must match a whole token.
-        if any(f in x.value for f in secret_forms(v.value) for x in others) or any(appears(f, bare) for f in mine):
-            raise Refuse(f'the value of {name} also appears elsewhere in the file (another key or value)')
+    # Anchor and tag names are text too, neither scalar nor comment.
+    names = [t.value if isinstance(t.value, str) else ''.join(x or '' for x in t.value) for t in yaml.scan(text, Loader=Loader) if isinstance(t, (yaml.AnchorToken, yaml.TagToken))]
+    for (_, name, v), mine, spell in zip(found, decoded, spelled):
+        # Inside other scalars and names any occurrence counts; in the raw text short values must match a whole token.
+        if any(f in x.value for f in mine for x in others) or any(f in s for f in spell for s in names) or any(appears(f, bare) for f in spell):
+            raise Refuse(f'the value of {name} also appears elsewhere in the file (another key, value or anchor)')
     squashed = re.sub(r'\s+', '', bare)
     if NSEC.search(squashed):
         raise Refuse('an nsec value appears outside a secret key')
@@ -609,14 +613,13 @@ def restore(orig_path, new_path, base):
                 raise Refuse(f'redacted secret #{i} ({oname}) would also appear in a non-secret value')
     # Never save something the editor could not show again (that would lock the Configuration page).
     try:
-        _, now_found, _ = redact_text(out)
+        _, _, now_comments = redact_text(out)
     except Refuse as e:
         raise Refuse(f'this change would leave a file the editor cannot show: {e}')
-    # A restored hidden comment that quotes an original secret which is no longer one would become visible.
-    now_forms = set().union(*[secret_forms(v.value) for _, _, v in now_found]) if now_found else set()
-    gone = set().union(*[secret_forms(ov.value) for _, _, ov in orig]) - now_forms if orig else set()
-    for j in cused:
-        if any(appears(f, ocomments[j - 1]) for f in gone):
+    # Every restored hidden comment must still be hidden in the result (it would show if it quotes a secret that
+    # was changed or removed).
+    for j in sorted(cused):
+        if ocomments[j - 1] not in now_comments:
             raise Refuse(f'hidden comment #{j} mentions a secret you changed or removed; delete that comment line or keep the secret')
     return nbom + out
 
