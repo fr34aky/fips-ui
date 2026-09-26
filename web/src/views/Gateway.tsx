@@ -6,14 +6,14 @@ import { fmtDuration, shortKey, fmtNum } from '../lib/format';
 
 export function Gateway({ snap }: { snap: Snapshot }) {
   const g = snap.gateway;
-  const unit = snap.units?.find((u) => u.unit === 'fips-gateway.service');
+  const unit = snap.units?.find((u) => u.id === 'fips-gateway');
   if (!g) {
     return (
       <Card title="LAN gateway">
         <Empty>
           <div className="max-w-md">
             <p className="mb-2">The <code>fips-gateway</code> control socket is not reachable{unit ? <>; the unit is <StatusChip value={unit.active} /></> : ''}.</p>
-            <p className="text-xs">The gateway folds an unmodified LAN into the mesh by allocating virtual IPs for mesh nodes and translating traffic. Enable <code>gateway.*</code> in fips.yaml and start <code>fips-gateway.service</code> to see pool usage and mappings here.</p>
+            <p className="text-xs">The gateway folds an unmodified LAN into the mesh by allocating virtual IPs for mesh nodes and translating traffic. Enable <code>gateway.*</code> in fips.yaml and start the <code>fips-gateway</code> service to see pool usage and mappings here.</p>
           </div>
         </Empty>
       </Card>

@@ -48,7 +48,7 @@ export interface Status {
   sparklines: Record<string, number[]>;
 }
 
-export interface UnitState { unit: string; loaded: boolean; active: string; sub: string; description: string; since?: number; mainPid?: number; memoryBytes?: number; cpuUsageNs?: number; restarts?: number; unitFileState?: string }
+export interface UnitState { unit: string; id: 'fips' | 'fips-dns' | 'fips-firewall' | 'fips-gateway'; loaded: boolean; active: string; sub: string; description: string; since?: number; mainPid?: number; memoryBytes?: number; cpuUsageNs?: number; restarts?: number; unitFileState?: string }
 
 export interface Gateway {
   pool_total: number; pool_allocated: number; pool_active: number; pool_draining: number; pool_free: number; nat_mappings: number; dns_listen: string;

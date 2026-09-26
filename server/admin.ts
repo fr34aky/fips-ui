@@ -238,7 +238,7 @@ export function createAdminHandler(opts: AdminOptions) {
     const managed = dropins.find((d) => d.managed);
     return {
       status: 'error' in st ? { error: st.error } : { unitActive: st.unit_active, unitEnabled: st.unit_enabled, tableLoaded: st.table_loaded, summary: summariseRuleset(st.ruleset) },
-      unit: units.find((u) => u.unit === 'fips-firewall.service') ?? null,
+      unit: units.find((u) => u.id === 'fips-firewall') ?? null,
       managedRules: managed ? parseManagedDropin(managed.content) : [],
       dropins,
     };

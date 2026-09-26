@@ -13,7 +13,12 @@ export class ControlError extends Error {
   }
 }
 
+/**
+ * The daemon's control endpoint. On Windows it is a TCP port on 127.0.0.1 (21210, gateway 21211); elsewhere a
+ * Unix socket, searched in the same order as fipsctl. FIPS_SOCKET may be a path, a port, or host:port.
+ */
 export function defaultSocketPath(kind: 'control' | 'gateway' = 'control'): string {
+  if (process.platform === 'win32') return kind === 'control' ? '21210' : '21211';
   const file = kind === 'control' ? 'control.sock' : 'gateway.sock';
   if (fs.existsSync('/run/fips')) return path.join('/run/fips', file);
   if (fs.existsSync('/var/run/fips')) return path.join('/var/run/fips', file);
@@ -24,6 +29,20 @@ export function defaultSocketPath(kind: 'control' | 'gateway' = 'control'): stri
 
 export const SOCKET_PATH = process.env.FIPS_SOCKET ?? defaultSocketPath('control');
 export const GATEWAY_SOCKET_PATH = process.env.FIPS_GATEWAY_SOCKET ?? defaultSocketPath('gateway');
+
+/** Connection options for an endpoint string: a TCP port, host:port / [v6]:port, or a Unix socket path. */
+export function endpointOptions(ep: string): net.NetConnectOpts {
+  if (/^\d{1,5}$/.test(ep)) return { host: '127.0.0.1', port: Number(ep) };
+  const m = /^(?:\[([0-9a-fA-F:.]+)\]|([A-Za-z0-9.-]+)):(\d{1,5})$/.exec(ep);
+  if (m && !ep.startsWith('/')) return { host: m[1] ?? m[2], port: Number(m[3]) };
+  return { path: ep };
+}
+
+/** Does this endpoint look reachable without connecting? (Unix sockets must exist; TCP endpoints always "may".) */
+export function endpointExists(ep: string): boolean {
+  const o = endpointOptions(ep) as { path?: string };
+  return o.path ? fs.existsSync(o.path) : true;
+}
 
 type Ok<T> = { status: 'ok'; data: T };
 type Err = { status: 'error'; message: string };
@@ -41,7 +60,7 @@ export function query<T = unknown>(
   if (Buffer.byteLength(line) > 4096) return Promise.reject(new ControlError('request too large', 'transport'));
 
   return new Promise<T>((resolve, reject) => {
-    const sock = net.createConnection(socketPath);
+    const sock = net.createConnection(endpointOptions(socketPath));
     let buf = '';
     let done = false;
     const finish = (fn: () => void) => {
@@ -78,7 +97,7 @@ function describeSocketError(e: NodeJS.ErrnoException, socketPath: string): stri
   switch (e.code) {
     case 'ENOENT': return `control socket not found at ${socketPath} (is the fips daemon running?)`;
     case 'EACCES': return `permission denied on ${socketPath} (add this user to the 'fips' group)`;
-    case 'ECONNREFUSED': return `connection refused on ${socketPath} (stale socket? daemon restarting?)`;
+    case 'ECONNREFUSED': return /^[\d.:[\]a-zA-Z-]*\d$/.test(socketPath) && !socketPath.startsWith('/') ? `nothing listening on control port ${socketPath} (is the fips daemon running?)` : `connection refused on ${socketPath} (stale socket? daemon restarting?)`;
     default: return `${e.code ?? 'error'}: ${e.message}`;
   }
 }

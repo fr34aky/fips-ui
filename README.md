@@ -33,6 +33,24 @@ Dark and light themes, responsive down to phone width, no external fonts or CDNs
 - A running `fips` daemon; the UI user must be in the **`fips`** group to reach `/run/fips/control.sock`
 - `journalctl` access to the fips unit for the Logs page (membership in `systemd-journal`, or `adm` on Debian, or being the same user that runs the daemon)
 
+## Operating systems
+
+The dashboard reads the daemon through its control socket and asks the local service manager and log system
+for everything else, so the read-only pages work wherever FIPS runs:
+
+| | Control endpoint | Service state and actions | Logs page |
+|---|---|---|---|
+| Linux, systemd | `/run/fips/control.sock` | systemctl | journald |
+| Linux, OpenRC | `/run/fips/control.sock` | rc-service | `/var/log/fips/fips.log` or `/var/log/fips.log` |
+| OpenWrt | `/run/fips/control.sock` | procd (ubus, `/etc/init.d/fips`) | logread |
+| macOS | `/var/run/fips/control.sock` | launchd (`com.fips.daemon`) | `/var/log/fips/fips.log`, else unified log |
+| FreeBSD | `/var/run/fips/control.sock` | rc.d (`service fips`) | `/var/log/fips/fips.log` or `/var/log/fips.log` |
+| Windows | TCP `127.0.0.1:21210` | Service Control Manager | `%ProgramData%\fips\logs\fips.log` |
+
+The node-management pages (configuration editor, firewall) and remote access over the mesh currently need
+Linux with systemd; the upgrade flow targets all of the above but has only been tested on Linux.
+`deploy/setup-local.sh` is systemd-only.
+
 ## Quick start
 
 ```sh
@@ -62,9 +80,12 @@ Everything is via environment variables.
 | `FIPS_UI_READ_ONLY` | – | `1` disables every mutating action (connect, disconnect, probe, service control, upgrade). |
 | `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | Legacy: `1` enables service buttons through plain `systemctl` (polkit rule or root) when the helper is not installed. With helper v3 they work without it. |
 | `FIPS_UI_POLL_MS` | `2000` | How often the backend polls the daemon while at least one browser is connected. |
-| `FIPS_SOCKET` | auto | Control socket path override (`/run/fips/control.sock`). |
+| `FIPS_SOCKET` | auto | Control endpoint: a Unix socket path, a TCP port (Windows default `21210`), or `host:port`. |
+| `FIPS_UI_SERVICE_MANAGER` | auto | Force `systemd`, `openrc`, `procd`, `launchd`, `rc` or `scm`. |
+| `FIPS_UI_SERVICE_FIPS`, `FIPS_UI_SERVICE_FIPS_GATEWAY`, … | per OS | Native service name for each service if your packaging differs (e.g. a custom launchd label). |
+| `FIPS_UI_LOG_FILE` | per OS | Read the daemon log from this file instead of the OS log system. |
 | `FIPS_GATEWAY_SOCKET` | auto | Gateway control socket override. |
-| `FIPS_UNIT` | `fips.service` | Journal unit to follow. |
+| `FIPS_UNIT` | `fips.service` | Journal unit to follow (systemd only). |
 | `FIPS_HOSTS` | `/etc/fips/hosts` | Hosts file to read. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
 
