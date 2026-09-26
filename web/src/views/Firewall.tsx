@@ -94,9 +94,9 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
           </Card>
         </div>
 
-        <Card title="Listening on fips0" hint="Local IPv6 listeners and how the loaded firewall treats them" pad={false}>
+        <Card title="Listening on fips0" hint="IPv6 listeners the mesh can reach (bound to all interfaces or to fips0) and how the loaded firewall treats them. IPv4-only and loopback listeners are not reachable over fips0 and are not listed." actions={snap.listening && <span className="text-xs text-ink-3">{snap.listening.sockets.length} reachable</span>} pad={false}>
           {!snap.listening ? <Empty>Not available.</Empty> : snap.listening.sockets.length === 0 ? <Empty>No IPv6 listeners reachable from the mesh.</Empty> : (
-            <div className="overflow-x-auto"><table className="data"><thead><tr><th>Proto</th><th>Port</th><th>Process</th><th>Filter</th><th /></tr></thead><tbody>
+            <div className="overflow-auto max-h-[26rem]"><table className="data"><thead><tr><th>Proto</th><th>Port</th><th>Process</th><th>Filter</th><th /></tr></thead><tbody>
               {snap.listening.sockets.map((k, i) => (
                 <tr key={i}>
                   <td className="uppercase text-xs">{k.proto}</td><td className="tabular">{k.port}</td><td>{k.process ?? '?'}{k.pid ? <span className="text-ink-3"> ({k.pid})</span> : null}</td>
