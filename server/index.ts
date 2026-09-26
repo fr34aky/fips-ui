@@ -241,7 +241,7 @@ const admin = createAdminHandler({
   authorize: () => !READ_ONLY,
   busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
 });
-/** Service control is available through the helper (v3+), or directly with the legacy opt-in. */
+/** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   if (READ_ONLY) return null;
   if ((await admin.helperInfo()).managementCapable) return 'helper';
@@ -336,7 +336,7 @@ async function route(req: Req, res: Res) {
   const svc = /^\/api\/service\/([a-z-]+\.service)\/(start|stop|restart|reload)$/.exec(p);
   if (svc) {
     const mode = await serviceControlMode();
-    if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v3+, installed by deploy/setup-local.sh) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
+    if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v4+, installed by deploy/setup-local.sh) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
     if (!(UNITS as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown unit');
     if (mode === 'helper') await admin.serviceAction(svc[1], svc[2]);
     else { const r = await serviceAction(svc[1] as UnitName, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }

@@ -25,7 +25,8 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [viewBackup, setViewBackup] = useState<{ id: string; yaml: string } | null>(null);
 
-  const original = cfg.data?.yaml ?? '';
+  // Browsers edit with LF line endings; compare and diff in LF (the helper keeps a CRLF file CRLF on save).
+  const original = (cfg.data?.yaml ?? '').replace(/\r\n/g, '\n');
   const text = draft ?? original;
   const dirty = draft !== null && draft !== original;
 

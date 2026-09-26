@@ -195,7 +195,7 @@ install_package() {
   esac
 }
 
-# ---------------------------------------------------------------- node management (v3)
+# ---------------------------------------------------------------- node management (v4)
 FIPS_CONFIG=/etc/fips/fips.yaml
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
@@ -253,6 +253,7 @@ HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
 NOT_SECRET = {'', 'null', '~', 'true', 'false', 'cookie'}
 BOM = '\ufeff'
 PH = re.compile(r'<redacted #(\d+)>')
+CPH = re.compile(r'^#\s*<redacted comment #(\d+)>\s*$')
 SAFE_TAGS = {'tag:yaml.org,2002:str', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:null'}
 Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
 
@@ -270,12 +271,6 @@ def read(path):
         raise Refuse('the file is not UTF-8')
     bom = text.startswith(BOM)
     return data, (text[1:] if bom else text), (BOM if bom else '')
-
-def looks_secret(value):
-    return value.strip().lower() not in NOT_SECRET
-
-def occurs(value, text):
-    return re.search(r'(?<![A-Za-z0-9_])' + re.escape(value) + r'(?![A-Za-z0-9_])', text) is not None
 
 def compose(text, what):
     try:
@@ -412,65 +407,91 @@ def ph(i):
     return f'"<redacted #{i}>"'
 
 def fmt(path):
-    return '.'.join((('[' + ', '.join(f'{k}={v}' for k, v in x[1][:2]) + ']') if isinstance(x, tuple) else str(x)) for x in path) or 'the top level'
+    def one(x):
+        if isinstance(x, tuple) and len(x) == 2 and isinstance(x[1], int) and isinstance(x[0], tuple):
+            return one(x[0]) + f'#{x[1] + 1}'
+        if isinstance(x, tuple) and x and x[0] == 'item':
+            return '[' + ', '.join(f'{k}={v}' for k, v in x[1]) + ']'
+        return str(x)
+    return '.'.join(one(x) for x in path) or 'the top level'
 
-def redact(path):
-    data, text, bom = read(path)
-    if PH.search(text):
+def comment_spans(text):
+    """(start, end) of every comment: a '#' outside every token (so never inside a scalar, quoted or plain),
+    at the start of a line or after whitespace, running to the end of the line."""
+    try:
+        cov = sorted((t.start_mark.index, t.end_mark.index) for t in yaml.scan(text, Loader=Loader) if t.end_mark.index > t.start_mark.index)
+    except yaml.YAMLError as e:
+        raise Refuse(f'not valid YAML: {str(e).splitlines()[0]}')
+    import bisect
+    starts = [a for a, _ in cov]
+    def covered(i):
+        k = bisect.bisect_right(starts, i) - 1
+        return k >= 0 and cov[k][0] <= i < cov[k][1]
+    out, pos = [], 0
+    for ln in text.splitlines(keepends=True):
+        body = ln.rstrip('\r\n')
+        for i, ch in enumerate(body):
+            if ch == '#' and (i == 0 or body[i - 1] in ' \t') and not covered(pos + i):
+                out.append((pos + i, pos + len(body)))
+                break
+        pos += len(ln)
+    return out
+
+KEYED = None
+def sensitive_comment(c, forms):
+    global KEYED
+    if KEYED is None:
+        KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*[:=]', re.I)
+    squashed = re.sub(r'\s+', '', c)
+    return bool(KEYED.search(c) or NSEC.search(squashed) or HEXKEY.search(squashed) or any(f in c for f in forms))
+
+def redact_text(text):
+    """-> (redacted text, secrets found, original texts of the redacted comments). Raises Refuse if unsafe."""
+    if PH.search(text) or re.search(r'<redacted comment #', text):
         raise Refuse('the file already contains a redaction placeholder')
     root = compose(text, 'the file')
     found = secrets(text, root)
-    out = splice(text, [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)])
-    # Whatever the form, no secret may survive anywhere in what is shown (comments, copies, other keys).
+    forms_all = set()
+    for _, _, v in found:
+        f = secret_forms(v.value)
+        if f:
+            raw = text[v.start_mark.index:v.end_mark.index]
+            f |= {x for x in (raw, raw.strip('"\'')) if len(x) >= 3}
+        forms_all |= f
+    edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
+    comments = []
+    for a, b in comment_spans(text):
+        if sensitive_comment(text[a:b], forms_all):
+            comments.append(text[a:b])
+            edits.append((a, b, f'# <redacted comment #{len(comments)}>'))
+    out = splice(text, edits)
+    # Outside comments (hidden above) a secret may not appear anywhere: other scalars, keys, raw spellings.
     secret_ids = {id(v) for _, _, v in found}
-    others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids]
+    others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
     for _, name, v in found:
-        raw = text[v.start_mark.index:v.end_mark.index]
-        forms = secret_forms(v.value)
-        if forms:  # the source spelling (escapes, quotes) counts only when the value itself is secret-looking
-            forms |= {f for f in (raw, raw.strip('"\'')) if len(f) >= 3}
-        if any(f in x.value for f in secret_forms(v.value) for x in others) or any(f in out for f in forms if f):
-            raise Refuse(f'the value of {name} also appears elsewhere in the file (a comment or another key)')
-    if NSEC.search(out):
-        raise Refuse('an nsec value appears outside a secret key (for example in a comment)')
-    if HEXKEY.search(out):
+        if any(f in x.value for f in secret_forms(v.value) for x in others) or any(f in out for f in forms_all if f):
+            raise Refuse(f'the value of {name} also appears elsewhere in the file (another key or value)')
+    squashed = re.sub(r'\s+', '', out)
+    if NSEC.search(squashed):
+        raise Refuse('an nsec value appears outside a secret key')
+    if HEXKEY.search(squashed):
         raise Refuse('a 64-character hex value (possibly a private key) appears outside a secret key')
-    # A secret key with a value anywhere in a comment (old or rotated secrets, "key=value", flow style), except
-    # documentation placeholders such as "password:<secret>".
-    keyed = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*[:=]\s*["\']?([^\s,}\]"\']+)', re.I)
-    for no, ln in enumerate(out.splitlines(), 1):
-        c = comment_of(ln)
-        for m in keyed.finditer(c):
-            val = m.group(2)
-            # Documentation placeholders ("<secret>") and known non-secret values ("cookie", "cookie:/path", null) are fine.
-            if val.startswith('<') or val.strip().lower() in NOT_SECRET or val.lower().startswith('cookie'):
-                continue
-            raise Refuse(f'line {no}: a comment contains a secret key with a value (an old or commented-out secret?)')
+    return out, found, comments
+
+def redact(path):
+    data, text, bom = read(path)
+    out, _, _ = redact_text(text)
     return 'base ' + hashlib.sha256(data).hexdigest() + '\n' + bom + out
 
-def comment_of(ln):
-    """The comment part of a YAML line: from a '#' at the start or after whitespace, outside quotes."""
-    q, i = None, 0
-    while i < len(ln):
-        ch = ln[i]
-        if q == '"':
-            if ch == '\\':
-                i += 2
-                continue
-            if ch == '"':
-                q = None
-        elif q == "'":
-            if ch == "'":
-                if ln[i + 1:i + 2] == "'":
-                    i += 2
-                    continue
-                q = None
-        elif ch in '"\'' and (i == 0 or ln[i - 1] in ' \t:[{,-'):
-            q = ch
-        elif ch == '#' and (i == 0 or ln[i - 1] in ' \t'):
-            return ln[i:]
-        i += 1
-    return ''
+def socket_path(path):
+    """node.control.socket_path from the parsed file, or '' (used by the helper's health check)."""
+    _, text, _ = read(path)
+    try:
+        d = yaml.load(text, Loader=Loader)
+        v = d.get('node', {}).get('control', {}).get('socket_path') if isinstance(d, dict) else None
+    except Exception:
+        v = None
+    return v if isinstance(v, str) and v.startswith('/') else ''
 
 def get(root, path):
     n = root
@@ -489,7 +510,7 @@ def restore(orig_path, new_path, base):
     odata, otext, _ = read(orig_path)
     if hashlib.sha256(odata).hexdigest() != base:
         raise Refuse('fips.yaml changed since you loaded it; reload the page and make your edit again')
-    orig = secrets(otext, compose(otext, 'the current file'))
+    _, orig, ocomments = redact_text(otext)
     _, ntext, nbom = read(new_path)
     # Browsers submit LF; keep a CRLF file CRLF.
     if '\r\n' in otext and '\r\n' not in ntext:
@@ -533,6 +554,19 @@ def restore(orig_path, new_path, base):
         walk(nroot, [], None, set())
     if len(PH.findall(ntext)) != placeholder_nodes:
         raise Refuse('a redaction placeholder appears somewhere other than as a whole value (a comment, key or longer string)')
+    cused, cfound = set(), 0
+    for a, b in comment_spans(ntext):
+        m = CPH.match(ntext[a:b])
+        if not m:
+            continue
+        cfound += 1
+        j = int(m.group(1))
+        if j < 1 or j > len(ocomments) or j in cused:
+            raise Refuse(f'comment placeholder #{j} does not exist or is used twice')
+        cused.add(j)
+        edits.append((a, b, ocomments[j - 1]))
+    if len(re.findall(r'<redacted comment #', ntext)) != cfound:
+        raise Refuse('a comment placeholder appears somewhere other than as a whole comment')
     out = splice(ntext, edits)
     # Re-parse: every restored secret must be exactly the original value at its original path, and nowhere else.
     root = compose(out, 'the result')
@@ -548,11 +582,18 @@ def restore(orig_path, new_path, base):
             places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in restored_ids and any(f in x.value for f in forms)]
             if places:
                 raise Refuse(f'redacted secret #{i} ({oname}) would also appear in a non-secret value')
+    # Never save something the editor could not show again (that would lock the Configuration page).
+    try:
+        redact_text(out)
+    except Refuse as e:
+        raise Refuse(f'this change would leave a file the editor cannot show: {e}')
     return nbom + out
 
 try:
     if MODE == 'redact':
         sys.stdout.buffer.write(redact(sys.argv[3]).encode('utf-8'))
+    elif MODE == 'socketpath':
+        sys.stdout.write(socket_path(sys.argv[3]))
     elif MODE == 'restore':
         with open(sys.argv[5], 'wb') as f:
             f.write(restore(sys.argv[3], sys.argv[4], sys.argv[6]).encode('utf-8'))
@@ -586,14 +627,8 @@ fipsctl_bin() { [[ -x "$BIN_DIR/fipsctl" ]] && echo "$BIN_DIR/fipsctl" || echo f
 # config sets, if any) answers, for 8 consecutive seconds within a 45 s budget.
 wait_fips_healthy() {
   local deadline=$(( $(date +%s) + 45 )) ok=0 restarts sock args=()
-  # node.control.socket_path only (other sections, such as native_api, have their own socket_path).
-  sock=$(awk '
-    function ind(s) { match(s, /[^ ]/); return RSTART - 1 }
-    /^[ \t]*(#.*)?$/ { next }
-    { i = ind($0); while (sp > 0 && st[sp] >= i) sp--; k = $0; sub(/^[ \t]*/, "", k); sub(/[ \t]*:.*/, "", k)
-      path = ""; for (j = 1; j <= sp; j++) path = path nm[j] "."; path = path k
-      if (path == "node.control.socket_path") { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }
-      sp++; st[sp] = i; nm[sp] = k }' "$FIPS_CONFIG" 2>/dev/null || true)
+  # node.control.socket_path from the parsed file (any YAML style); other sections have their own socket_path.
+  sock=$(python3 -I -c "$REDACT_PY" socketpath "$SECRET_KEYS" "$FIPS_CONFIG" 2>/dev/null || true)
   [[ -n "$sock" && "$sock" == /* ]] && args=(-s "$sock")
   sleep 3
   restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
@@ -626,9 +661,12 @@ backup_config() {
 
 # install_config_and_restart <file> <backup-id> <restart:true|false>
 # Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
+# Replace fips.yaml atomically: a temp file in the same directory, then rename (never a half-written file).
+put_config() { install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"; }
+
 install_config_and_restart() {
   trap '' INT TERM HUP
-  install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG"
+  put_config "$1"
   if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
   local start; start=$(date +%s)
   systemctl restart "$SERVICE" || true
@@ -637,7 +675,7 @@ install_config_and_restart() {
   fi
   local log; log=$(journal_tail_json "$SERVICE" "$start")
   log "daemon unhealthy with the new config; restoring backup $2"
-  install -m 0600 -o 0 -g 0 "$CONFIG_BACKUPS_DIR/$2.yaml" "$FIPS_CONFIG"
+  put_config "$CONFIG_BACKUPS_DIR/$2.yaml"
   systemctl restart "$SERVICE" || true
   local back=false; wait_fips_healthy && back=true
   printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"

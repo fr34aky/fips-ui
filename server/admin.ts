@@ -171,9 +171,17 @@ export type HelperInfo = { available: boolean; version: number | null; error?: s
 export function createAdminHandler(opts: AdminOptions) {
   const helperPath = opts.helperPath ?? process.env.FIPS_UI_HELPER ?? '/usr/local/libexec/fips-ui-helper';
   let helperCache: { at: number; value: HelperInfo } | null = null;
+  let helperPending: Promise<HelperInfo> | null = null;
 
-  async function helperInfo(force = false): Promise<HelperInfo> {
-    if (!force && helperCache && Date.now() - helperCache.at < 60_000) return helperCache.value;
+  /** Cached for a minute; concurrent callers share one in-flight check (one sudo call, not one per caller). */
+  function helperInfo(force = false): Promise<HelperInfo> {
+    if (!force && helperCache && Date.now() - helperCache.at < 60_000) return Promise.resolve(helperCache.value);
+    if (helperPending) return helperPending;
+    helperPending = checkHelper().finally(() => { helperPending = null; });
+    return helperPending;
+  }
+
+  async function checkHelper(): Promise<HelperInfo> {
     let value: HelperInfo;
     if (!existsSync(helperPath)) value = { available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
     else {
