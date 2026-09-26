@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Node.js requirement corrected to 22.18+, 23.6+ or 24+: earlier versions
+  only strip TypeScript behind a flag. `deploy/setup-local.sh` enforces it.
+- Job and backup ids are UTC, millisecond-resolution and counter-suffixed, so
+  two jobs in the same second get distinct ids and ordering survives DST.
+
+### Fixed
+
+- Oversized bodies on the main API got a connection reset instead of a 413.
+- Deterministic GitHub errors (404 for a rev that is not on master, or no
+  releases) were retried every minute and exhausted the anonymous limit; they
+  are now cached as long as successes.
+- The three GitHub calls behind the upgrade status ran sequentially, so an
+  unreachable GitHub stalled the page for up to 45 s; they now run together.
+- When the helper could not restart the service, the job waited two minutes
+  for a daemon that was never restarted and then blamed the daemon; the
+  restart step now fails immediately with the helper's message.
+- Rollback discarded the helper's result; the safety backup taken before a
+  rollback is now shown so a bad rollback can itself be undone.
+- A non-boolean `dryRun` could skip the installer precheck yet perform a real
+  install; the request is normalised once.
+- Stage dirs, downloads and partial files accumulated forever under the work
+  dir; a successful install removes its stage dir, and the newest three stage
+  dirs and two artifacts are kept.
+- A revision with a suffix (`-dirty`) defeated the staging check because the
+  version parser did not capture it.
+
 ## [0.1.2] - 2026-09-26
 
 ### Fixed

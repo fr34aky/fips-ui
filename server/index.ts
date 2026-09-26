@@ -1,4 +1,4 @@
-// FIPS UI API server. Zero dependencies; runs directly under Node >= 22.6 (native TypeScript stripping).
+// FIPS UI API server. Zero dependencies; runs directly under Node 22.18+ / 23.6+ / 24+ (unflagged TypeScript type stripping).
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,12 +48,16 @@ function json(res: Res, status: number, body: unknown) {
   res.end(text);
 }
 
-async function readBody(req: Req): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const c of req) { size += (c as Buffer).length; if (size > 64 * 1024) throw new HttpError(413, 'body too large'); chunks.push(c as Buffer); }
-  if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new HttpError(400, 'invalid JSON body'); }
+function readBody(req: Req): Promise<Record<string, unknown>> {
+  // Listener-based rather than `for await`: breaking out of the async iterator destroys the request and its
+  // socket, and a 413 written afterwards never reaches the client. Pausing keeps the socket usable.
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0, failed = false;
+    req.on('data', (c: Buffer) => { if (failed) return; size += c.length; if (size > 64 * 1024) { failed = true; req.pause(); reject(new HttpError(413, 'body too large (64 KiB limit)')); return; } chunks.push(c); });
+    req.on('end', () => { if (failed) return; if (!chunks.length) return resolve({}); try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { reject(new HttpError(400, 'invalid JSON body')); } });
+    req.on('error', (e) => { if (!failed) reject(e); });
+  });
 }
 
 function tokenOk(req: Req, url: URL): boolean {

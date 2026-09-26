@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot local setup, run with sudo from the repo checkout:
 #   sudo ./deploy/setup-local.sh [ui-user] [node-binary]
-# 1. checks preconditions (fips group, built frontend, Node >= 22.6)
+# 1. checks preconditions (fips group, built frontend, Node 22.18+/23.6+/24+)
 # 2. installs the privileged upgrade helper + its single sudoers rule for <ui-user>
 # 3. installs deploy/fips-ui.service plus a drop-in that runs it from this checkout as <ui-user>
 # 4. enables and (re)starts it, then checks /api/health
@@ -29,7 +29,8 @@ if [[ "$node" == */mise/shims/* ]]; then node=$(sudo -u "$user" -H bash -lc 'mis
 node=$(readlink -f "$node")
 ver=$("$node" -v 2>/dev/null | sed 's/^v//') || fail "$node -v failed"
 IFS=. read -r maj min _ <<<"$ver"
-(( maj > 22 || (maj == 22 && min >= 6) )) || fail "node $ver at $node is too old; 22.6+ is required (native TypeScript)"
+# Node strips TypeScript without a flag from 22.18 and 23.6 (and every 24+); earlier 22.x/23.x need --experimental-strip-types.
+(( maj >= 24 || (maj == 23 && min >= 6) || (maj == 22 && min >= 18) )) || fail "node $ver at $node is too old; 22.18+, 23.6+ or 24+ is required (unflagged TypeScript type stripping)"
 [[ "$node" =~ [[:space:]%] ]] && fail "node path '$node' contains whitespace or '%'"
 echo "== using node $ver at $node, UI user $user, checkout $here"
 

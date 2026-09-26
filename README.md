@@ -27,7 +27,7 @@ Dark and light themes, responsive down to phone width, no external fonts or CDNs
 
 ## Requirements
 
-- Node.js ≥ 22.6 (the backend is TypeScript run directly by Node; no build step for the server)
+- Node.js 22.18+, 23.6+ or 24+ (the backend is TypeScript run directly by Node's unflagged type stripping; no build step for the server)
 - A running `fips` daemon; the UI user must be in the **`fips`** group to reach `/run/fips/control.sock`
 - `journalctl` access to the fips unit for the Logs page (membership in `systemd-journal`, or `adm` on Debian, or being the same user that runs the daemon)
 

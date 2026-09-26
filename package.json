@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Web dashboard to watch and manage a FIPS mesh node",
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.18 <23 || >=23.6"
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
