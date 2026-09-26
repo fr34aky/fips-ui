@@ -23,6 +23,18 @@ by the UI. Every changing verb, including the upgrade verbs, takes a system-wide
 while a configuration change runs and the other way round. Config backups live in a fixed root-only
 directory (`/var/lib/fips-ui/config-backups` on Linux) that callers cannot redirect.
 
+## What the redaction protects, and what it does not
+
+Redaction keeps secret values off screens, out of the browser, its cache, logs and screenshots, and away from
+accidental copying: the values never leave the helper. It is **not** a boundary against someone allowed to
+edit `fips.yaml`. Such a person can always make the daemon use a secret somewhere else (for example point
+the Tor control address at a listener of their own, which then receives the control password), or learn a
+weak value by trial. That is why only admins may edit the configuration, and why admin rights, locally or
+over the mesh, should be treated as equivalent to root on the node.
+
+List entries are identified by their `npub`, `alias`, `name` or `id` (or their position if they have none),
+so a secret stays bound to its entry while the entry's other fields, and other entries, are edited freely.
+
 ## Firewall rules made by the UI
 
 Rules created on the Firewall page live in `/etc/fips/fips.d/fips-ui.nft`. Each rule line is preceded by a

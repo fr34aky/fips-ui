@@ -234,6 +234,10 @@ read -r -d '' REDACT_PY <<'PY' || true
 #   restore <original> <new> <out>    -> new file with each placeholder replaced by the original value text
 # Files are handled as bytes decoded without newline translation, so line endings and trailing newlines are
 # kept exactly; a leading UTF-8 BOM is kept aside (libyaml does not count it in its positions).
+#
+# Purpose: keep secret values off screens, out of the browser, logs and screenshots. It is NOT a boundary
+# against someone allowed to edit fips.yaml: such a person can always make the daemon use a secret somewhere
+# else (for example point the Tor control address at their own listener), which is why only admins may edit.
 import hashlib, re, sys
 try:
     import yaml
@@ -298,6 +302,20 @@ def uses(root):
             stack.extend(n.value)
     return counts
 
+def check_stray(n):
+    squashed = re.sub(r'\s+', '', n.value)
+    if NSEC.search(squashed):
+        raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
+    if HEXKEY.search(squashed):
+        raise Refuse(f'line {line(n)}: a 64-character hex value (possibly a private key) outside a secret key')
+
+def secret_forms(value):
+    """The strings whose presence elsewhere would reveal a secret: the value, and for Tor's "password:<pw>" the pw."""
+    forms = {value}
+    if value.lower().startswith('password:'):
+        forms.add(value.split(':', 1)[1])
+    return {f for f in forms if f.strip().lower() not in NOT_SECRET and len(f) >= 3}
+
 def secrets(text, root):
     """[(path, keyname, value node)] for every secret key; refuse any form that cannot be redacted exactly."""
     counts = uses(root)
@@ -310,6 +328,8 @@ def secrets(text, root):
         seen.add(id(n))
         if isinstance(n, nodes.MappingNode):
             for k, v in n.value:
+                if isinstance(k, nodes.ScalarNode):
+                    check_stray(k)
                 if not isinstance(k, nodes.ScalarNode):
                     if any(isinstance(x, nodes.ScalarNode) and x.value.strip().lower() in KEYS for x in flatten(k)):
                         raise Refuse(f'line {line(k)}: a secret key inside a complex mapping key')
@@ -341,24 +361,34 @@ def secrets(text, root):
                     continue
                 walk(v, p)
         elif isinstance(n, nodes.SequenceNode):
-            for i, v in enumerate(n.value):
-                walk(v, path + [itemsig(v, i)])
+            for v, sig in zip(n.value, sigs(n)):
+                walk(v, path + [sig])
         elif isinstance(n, nodes.ScalarNode):
-            if NSEC.search(n.value):
-                raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
-            if HEXKEY.search(n.value.replace('\n', '').replace(' ', '')):
-                raise Refuse(f'line {line(n)}: a 64-character hex value (possibly a private key) outside a secret key')
+            check_stray(n)
     if root is not None:
         walk(root, [])
     return found
 
+ID_KEYS = ('npub', 'alias', 'name', 'id')
+
 def itemsig(v, i):
-    """A list item's identity: its own non-secret scalar entries (so deleting or reordering other items keeps it)."""
+    """A list item's identity: its npub, alias, name or id if it has one (so editing its other fields, or deleting
+    and reordering other items, keeps it), else its position."""
     if isinstance(v, nodes.MappingNode):
-        own = tuple(sorted((k.value, x.value) for k, x in v.value if isinstance(k, nodes.ScalarNode) and isinstance(x, nodes.ScalarNode) and k.value.strip().lower() not in KEYS))
-        if own:
-            return ('item', own)
+        for idk in ID_KEYS:
+            for k, x in v.value:
+                if isinstance(k, nodes.ScalarNode) and isinstance(x, nodes.ScalarNode) and k.value == idk and x.value:
+                    return ('item', ((idk, x.value),))
     return i
+
+def sigs(seq):
+    """Signatures of a sequence's items, with an ordinal added where two items would otherwise collide."""
+    seen, out = {}, []
+    for i, v in enumerate(seq.value):
+        sig = itemsig(v, i)
+        n = seen.get(sig, 0); seen[sig] = n + 1
+        out.append(sig if n == 0 else (sig, n))
+    return out
 
 def flatten(n, seen=None):
     seen = seen if seen is not None else set()
@@ -395,14 +425,11 @@ def redact(path):
     secret_ids = {id(v) for _, _, v in found}
     others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids]
     for _, name, v in found:
-        if not looks_secret(v.value):
-            continue
         raw = text[v.start_mark.index:v.end_mark.index]
-        forms = {v.value, raw, raw.strip('"\'')}
-        long_enough = [f for f in forms if len(f) >= 6]
-        copy = any(x.value == v.value or (len(v.value) >= 6 and v.value in x.value) for x in others) \
-            or any(f in out for f in long_enough) or occurs(v.value, out)
-        if copy:
+        forms = secret_forms(v.value)
+        if forms:  # the source spelling (escapes, quotes) counts only when the value itself is secret-looking
+            forms |= {f for f in (raw, raw.strip('"\'')) if len(f) >= 3}
+        if any(f in x.value for f in secret_forms(v.value) for x in others) or any(f in out for f in forms if f):
             raise Refuse(f'the value of {name} also appears elsewhere in the file (a comment or another key)')
     if NSEC.search(out):
         raise Refuse('an nsec value appears outside a secret key (for example in a comment)')
@@ -410,24 +437,39 @@ def redact(path):
         raise Refuse('a 64-character hex value (possibly a private key) appears outside a secret key')
     # A secret key with a value anywhere in a comment (old or rotated secrets, "key=value", flow style), except
     # documentation placeholders such as "password:<secret>".
-    keyed = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*[:=]\s*(?![<\s"\']*[<$])[^\s,}\]]', re.I)
+    keyed = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*[:=]\s*["\']?([^\s,}\]"\']+)', re.I)
     for no, ln in enumerate(out.splitlines(), 1):
         c = comment_of(ln)
-        if c and keyed.search(c):
+        for m in keyed.finditer(c):
+            val = m.group(2)
+            # Documentation placeholders ("<secret>") and known non-secret values ("cookie", "cookie:/path", null) are fine.
+            if val.startswith('<') or val.strip().lower() in NOT_SECRET or val.lower().startswith('cookie'):
+                continue
             raise Refuse(f'line {no}: a comment contains a secret key with a value (an old or commented-out secret?)')
     return 'base ' + hashlib.sha256(data).hexdigest() + '\n' + bom + out
 
 def comment_of(ln):
     """The comment part of a YAML line: from a '#' at the start or after whitespace, outside quotes."""
-    q = None
-    for i, ch in enumerate(ln):
-        if q:
-            if ch == q and (q == "'" or ln[i - 1] != '\\'):
+    q, i = None, 0
+    while i < len(ln):
+        ch = ln[i]
+        if q == '"':
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '"':
                 q = None
-        elif ch in '"\'' and (i == 0 or ln[i - 1] in ' \t:[{,'):
+        elif q == "'":
+            if ch == "'":
+                if ln[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                q = None
+        elif ch in '"\'' and (i == 0 or ln[i - 1] in ' \t:[{,-'):
             q = ch
         elif ch == '#' and (i == 0 or ln[i - 1] in ' \t'):
             return ln[i:]
+        i += 1
     return ''
 
 def get(root, path):
@@ -436,7 +478,7 @@ def get(root, path):
         if isinstance(n, nodes.MappingNode) and isinstance(p, str):
             n = next((v for k, v in n.value if isinstance(k, nodes.ScalarNode) and k.value == p), None)
         elif isinstance(n, nodes.SequenceNode):
-            n = next((v for i, v in enumerate(n.value) if itemsig(v, i) == p), None)
+            n = next((v for v, sig in zip(n.value, sigs(n)) if sig == p), None)
         else:
             return None
         if n is None:
@@ -468,8 +510,8 @@ def restore(orig_path, new_path, base):
                     raise Refuse(f'line {line(k)}: a redaction placeholder used as a key')
                 walk(v, path + [k.value if isinstance(k, nodes.ScalarNode) else '?'], k, seen)
         elif isinstance(n, nodes.SequenceNode):
-            for i, v in enumerate(n.value):
-                walk(v, path + [itemsig(v, i)], None, seen)
+            for v, sig in zip(n.value, sigs(n)):
+                walk(v, path + [sig], None, seen)
         elif isinstance(n, nodes.ScalarNode):
             m = PH.fullmatch(n.value)
             if not m:
@@ -494,15 +536,18 @@ def restore(orig_path, new_path, base):
     out = splice(ntext, edits)
     # Re-parse: every restored secret must be exactly the original value at its original path, and nowhere else.
     root = compose(out, 'the result')
+    restored_ids = {id(v) for _, _, v in secrets(out, root)}
     for i in used:
         opath, oname, ov = orig[i - 1]
         n = get(root, opath)
         if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
             raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
-        if looks_secret(ov.value):
-            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and (x.value == ov.value or (len(ov.value) >= 6 and ov.value in x.value))]
-            if len(places) != 1:
-                raise Refuse(f'redacted secret #{i} ({oname}) would appear in more than one place')
+        forms = secret_forms(ov.value)
+        if forms:
+            # Other secrets may legitimately share a value; only non-secret scalars count as copies.
+            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in restored_ids and any(f in x.value for f in forms)]
+            if places:
+                raise Refuse(f'redacted secret #{i} ({oname}) would also appear in a non-secret value')
     return nbom + out
 
 try:
