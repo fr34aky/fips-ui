@@ -9,14 +9,14 @@
 # native package installer), restart the service.
 #
 # Commands:
-#   check                          -> {"ok":true,"version":2,...}
+#   check                          -> {"ok":true,"version":4,...}
 #   install <stagedir> [--no-restart]
 #   rollback <backup-id>
 #   restart
 #   list-backups
 #   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted as
 #                                     numbered placeholders bound to their key and parent line
-#   config-apply [--no-restart] [--base <sha256>] <- new fips.yaml on stdin; redacted placeholders are restored from
+#   config-apply [--no-restart] --base <sha256> <- new fips.yaml on stdin; redacted placeholders are restored from
 #                                     the current file; backed up, installed, daemon restarted and
 #                                     rolled back automatically if it does not come up healthy
 #   config-backups                 -> JSON list of config backups
@@ -224,7 +224,8 @@ take_lock() {
 # secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
 # character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret value or
 # holds an nsec or 64-hex key is shown as "# <redacted comment #N>". Anything else is refused (exit 3, reasons
-# on stderr), and so is a file where a secret value also appears in another key, value or anchor, or an nsec
+# on stderr), and so is a file where a secret value also appears in another value, anchor, tag or directive
+# (keys only as long copies), or an nsec
 # value sits outside a secret key. Restore requires each placeholder to be a whole scalar value under the same
 # key at the same path (and each comment placeholder a whole comment), puts the original text back, re-parses
 # the result and checks each secret is exactly at its path and nowhere else, and that the result can be shown
@@ -304,19 +305,27 @@ def uses(root):
             stack.extend(n.value)
     return counts
 
+def squash(s):
+    """Text with whitespace and comment markers removed: how a value wrapped over lines or comments reads joined."""
+    return re.sub(r'[\s#]+', '', s)
+
+def key_material(s):
+    """An nsec or a 64-hex key anywhere in s, even wrapped over several lines."""
+    q = squash(s)
+    return bool(NSEC.search(q) or HEXKEY.search(q))
+
 def check_stray(n):
-    squashed = re.sub(r'\s+', '', n.value)
-    if NSEC.search(squashed):
-        raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
-    if HEXKEY.search(squashed):
-        raise Refuse(f'line {line(n)}: a 64-character hex value (possibly a private key) outside a secret key')
+    if key_material(n.value):
+        raise Refuse(f'line {line(n)}: an nsec or 64-character hex value (possibly a private key) outside a secret key')
 
 def secret_forms(value):
-    """The strings whose presence elsewhere would reveal a secret: the value, and for Tor's "password:<pw>" the pw."""
+    """The strings whose presence elsewhere would reveal a secret: the value, and for Tor's "password:<pw>" the pw,
+    each also without surrounding spaces."""
     forms = {value}
     if value.lower().startswith('password:'):
         forms.add(value.split(':', 1)[1])
-    return {f for f in forms if f.strip().lower() not in NOT_SECRET and len(f) >= 3}
+    forms |= {f.strip() for f in forms}
+    return {f for f in forms if f.strip().lower() not in NOT_SECRET and len(f.strip()) >= 3}
 
 def secrets(text, root):
     """[(path, keyname, value node)] for every secret key; refuse any form that cannot be redacted exactly."""
@@ -422,13 +431,18 @@ def fmt(path):
         return str(x)
     return '.'.join(one(x) for x in path) or 'the top level'
 
-def comment_spans(text):
-    """(start, end) of every comment: any '#' outside every token (libyaml starts a comment at any such '#'),
-    running to the end of the line. A block scalar's token also spans its header line ("key: | # note"), whose
-    comment is not content, so that first line is not treated as covered."""
+def scan(text):
+    """-> (comment spans, names). A comment starts at any '#' outside every token (libyaml starts one at any such
+    '#') and runs to the end of the line. A block scalar's token also spans its header line ("key: | # note"),
+    whose comment is not content, so that line is not treated as covered. Names are the decoded values of every
+    token that is not a scalar (anchors, tags, %TAG and %YAML directives): text that is neither value nor comment."""
+    import bisect
+    cov, names = [], []
     try:
-        cov = []
         for t in yaml.scan(text, Loader=Loader):
+            v = getattr(t, 'value', None)
+            if v is not None and not isinstance(t, yaml.ScalarToken):
+                names.append(''.join(str(x) for x in v if x is not None) if isinstance(v, tuple) else str(v))
             a, b = t.start_mark.index, t.end_mark.index
             if b <= a:
                 continue
@@ -440,7 +454,6 @@ def comment_spans(text):
         cov.sort()
     except yaml.YAMLError as e:
         raise Refuse(f'not valid YAML: {str(e).splitlines()[0]}')
-    import bisect
     starts = [a for a, _ in cov]
     def covered(i):
         k = bisect.bisect_right(starts, i) - 1
@@ -453,11 +466,25 @@ def comment_spans(text):
                 out.append((i, end))
                 break
         pos = m.end() if m else end
-    return out
+    return out, names
+
+def comment_spans(text):
+    return scan(text)[0]
+
+def comment_runs(text, spans):
+    """Comments on consecutive lines, grouped (a key or password wrapped over several comment lines)."""
+    runs = []
+    for a, b in spans:
+        # Consecutive: only one line break and indentation between the previous comment's end and this '#'.
+        if runs and re.fullmatch(r'(\r\n|[\r\n\x85\u2028\u2029])[ \t]*', text[runs[-1][-1][1]:a]):
+            runs[-1].append((a, b))
+        else:
+            runs.append([(a, b)])
+    return runs
 
 def sensitive_comment(c, forms):
-    squashed = re.sub(r'\s+', '', c)
-    return bool(KEYED.search(c) or NSEC.search(squashed) or HEXKEY.search(squashed) or any(f in c for f in forms))
+    q = squash(c)
+    return bool(KEYED.search(c) or key_material(c) or any(f in c or (len(squash(f)) >= 6 and squash(f) in q) for f in forms))
 
 def appears(form, text):
     """Substring for values of 6+ characters; for shorter ones a whole-token match (avoids refusing a file because
@@ -481,27 +508,40 @@ def redact_text(text):
         spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
     forms_all = set().union(*spelled) if spelled else set()
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
+    spans, names = scan(text)
+    hide = set()
+    for run in comment_runs(text, spans):
+        # A run is judged as a whole too, so a key or password wrapped over several comment lines is hidden entirely.
+        if len(run) > 1 and sensitive_comment(''.join(text[a:b] for a, b in run), forms_all):
+            hide.update(run)
+        hide.update(s for s in run if sensitive_comment(text[s[0]:s[1]], forms_all))
     comments = []
-    for a, b in comment_spans(text):
-        if sensitive_comment(text[a:b], forms_all):
+    for a, b in spans:
+        if (a, b) in hide:
             comments.append(text[a:b])
             edits.append((a, b, f'# <redacted comment #{len(comments)}>'))
     out = splice(text, edits)
-    # Outside comments (hidden above) a secret may not appear anywhere: other scalars, keys, raw spellings.
+    # Outside comments (hidden above) a secret may not appear anywhere: other values, raw spellings, anchor, tag
+    # and directive names. Keys are the configuration's own vocabulary (a password "control" is not revealed by
+    # the key control_auth), so a key only counts when it is a long copy (12+ characters).
     secret_ids = {id(v) for _, _, v in found}
-    others = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
-    bare = PLACEHOLDERS.sub('', out)  # the placeholders' own text is not a copy of anything
-    # Anchor and tag names are text too, neither scalar nor comment.
-    names = [t.value if isinstance(t.value, str) else ''.join(x or '' for x in t.value) for t in yaml.scan(text, Loader=Loader) if isinstance(t, (yaml.AnchorToken, yaml.TagToken))]
+    scalars = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
+    keys = {id(k) for n in flatten(root) if isinstance(n, nodes.MappingNode) for k, _ in n.value} if root is not None else set()
+    values = [x for x in scalars if id(x) not in keys]
+    keytexts = [x for x in scalars if id(x) in keys]
+    # Raw text without placeholders and keys (whose spans shift by the same edits: blank them before redacting).
+    blank = splice(text, [(x.start_mark.index, x.end_mark.index, ' ' * (x.end_mark.index - x.start_mark.index)) for x in keytexts])
+    bare = PLACEHOLDERS.sub('', splice(blank, edits))
+    qbare = squash(bare)
     for (_, name, v), mine, spell in zip(found, decoded, spelled):
-        # Inside other scalars and names any occurrence counts; in the raw text short values must match a whole token.
-        if any(f in x.value for f in mine for x in others) or any(f in s for f in spell for s in names) or any(appears(f, bare) for f in spell):
-            raise Refuse(f'the value of {name} also appears elsewhere in the file (another key, value or anchor)')
-    squashed = re.sub(r'\s+', '', bare)
-    if NSEC.search(squashed):
-        raise Refuse('an nsec value appears outside a secret key')
-    if HEXKEY.search(squashed):
-        raise Refuse('a 64-character hex value (possibly a private key) appears outside a secret key')
+        long_ = [f for f in spell if len(squash(f)) >= 6]
+        if (any(f in x.value or (f in long_ and squash(f) in squash(x.value)) for f in mine for x in values)
+                or any(len(f) >= 12 and f in x.value for f in mine for x in keytexts)
+                or any(f in n for f in spell for n in names)
+                or any(appears(f, bare) for f in spell) or any(squash(f) in qbare for f in long_)):
+            raise Refuse(f'the value of {name} also appears elsewhere in the file (another value, anchor or tag)')
+    if key_material(bare):
+        raise Refuse('an nsec or 64-character hex value (possibly a private key) appears outside a secret key')
     return out, found, comments
 
 def redact(path):
@@ -599,19 +639,13 @@ def restore(orig_path, new_path, base):
     out = splice(ntext, edits)
     # Re-parse: every restored secret must be exactly the original value at its original path, and nowhere else.
     root = compose(out, 'the result')
-    restored_ids = {id(v) for _, _, v in secrets(out, root)}
     for i in used:
         opath, oname, ov = orig[i - 1]
         n = get(root, opath)
         if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
             raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
-        forms = secret_forms(ov.value)
-        if forms:
-            # Other secrets may legitimately share a value; only non-secret scalars count as copies.
-            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in restored_ids and any(f in x.value for f in forms)]
-            if places:
-                raise Refuse(f'redacted secret #{i} ({oname}) would also appear in a non-secret value')
-    # Never save something the editor could not show again (that would lock the Configuration page).
+    # Never save something the editor could not show again (that would lock the Configuration page); this also
+    # refuses a restored secret that would appear anywhere else.
     try:
         _, _, now_comments = redact_text(out)
     except Refuse as e:
