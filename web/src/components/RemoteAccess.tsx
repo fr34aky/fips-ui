@@ -8,9 +8,9 @@ import type { Principal } from '../lib/types';
 type Role = 'viewer' | 'admin';
 interface Entry { npub: string; label?: string; role: Role }
 interface Config { enabled: boolean; port: number; allowed: Entry[] }
-interface Status { listening: boolean; address: string | null; npub: string | null; port: number; error?: string }
+interface Status { listening: boolean; address: string | null; npub: string | null; port: number; guard?: { active: boolean; ports: number[]; error?: string }; error?: string }
 interface AccessResponse { config?: Config; status?: Status; file?: string; you: Principal; firewallManaged?: boolean }
-interface SaveResponse { config: Config; status: Status; firewall: { ok: boolean; skipped?: string; error?: string } }
+interface SaveResponse { config: Config; status: Status; firewall: { ok: boolean; skipped?: string; guard?: string; rule?: string } }
 
 export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
@@ -62,6 +62,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <Globe size={16} className="text-ink-3" />
           {!saved.enabled ? <Chip>off</Chip> : st.listening ? <Chip tone="good">listening</Chip> : <Chip tone="crit">not listening</Chip>}
+          {saved.enabled && <Chip tone={st.guard?.active ? 'good' : 'crit'} title="Kernel rule that only lets mesh source addresses reach the UI through the FIPS interface">{st.guard?.active ? 'spoofing guard on' : 'spoofing guard off'}</Chip>}
           {saved.enabled && st.error && <span className="text-crit text-xs">{st.error}</span>}
           {you.kind === 'mesh' && <span className="text-xs text-ink-3 ml-auto">you: {you.label || shortKey(you.npub, 10, 4)} · {you.role}</span>}
         </div>
@@ -94,8 +95,8 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
         </div>
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
-        {lastFw && !lastFw.ok && <ErrorNote>Firewall not updated: {lastFw.skipped ?? lastFw.error}. {lastFw.skipped ? `Allow tcp ${draft.port} from the listed npubs on the Firewall page or by hand.` : ''}</ErrorNote>}
-        {!data.firewallManaged && draft.enabled && <p className="text-xs text-warn">The helper (v3) is not installed, so the fips0 firewall is not opened automatically for port {draft.port}.</p>}
+        {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
+        {!data.firewallManaged && draft.enabled && <ErrorNote>Mesh access needs the privileged helper (v3): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 
         {!readOnly && (
           <div className="flex justify-end gap-2">

@@ -11,6 +11,7 @@ import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, type FirewallRule } from './admin.ts';
 import { MeshAccess, LOCAL, AccessError, expand6, type Principal, type AccessConfig } from './access.ts';
+import { isMeshAddress } from './net6.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -333,8 +334,9 @@ async function route(req: Req, res: Res) {
   const body = await readJsonBody(req);
 
   if (p === '/api/access') {
-    let firewall: unknown;
-    try { firewall = await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    const firewall = await syncMesh();
+    await mesh.reconcile();
     return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
   }
 
@@ -377,14 +379,14 @@ async function route(req: Req, res: Res) {
 }
 
 /**
- * Every request is attributed by where it really came from. A source that the kernel routes through the
- * FIPS TUN device is a mesh identity (see server/access.ts) and is admitted only as an allowed npub, on
- * either listener. The mesh listener admits nothing else. On the main listener any other source is the
- * local operator (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
+ * Every request is attributed by its source address. An fd00::/8 source is a mesh identity and is admitted
+ * only as an allowed npub (and only while the kernel guard is active, see server/access.ts), on either
+ * listener. The mesh listener admits nothing else. On the main listener any other source is the local
+ * operator (loopback, or whatever FIPS_UI_HOST exposes, where FIPS_UI_TOKEN applies).
  */
 async function handle(req: Req, res: Res, listener: 'main' | 'mesh'): Promise<void> {
   const remote = req.socket.remoteAddress;
-  if (await mesh.isMeshRouted(remote)) {
+  if (isMeshAddress(remote)) {
     const pr = mesh.principalFor(remote);
     if (!pr) return denyMesh(req, res);
     mesh.track(req.socket, pr);
@@ -430,26 +432,53 @@ async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
 const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
 
 /** Keep the UI's own firewall rule in step with the allow-list: its port, open only to the allowed npubs. */
-/** Runs inside the access queue after every load and save, so rule and allow-list cannot drift apart. */
-async function syncMeshFirewall(cfg: AccessConfig): Promise<{ ok: boolean; skipped?: string; error?: string }> {
-  if (!(await admin.helperInfo()).managementCapable) return { ok: false, skipped: 'helper v3 not installed; open the port in the firewall yourself' };
-  const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
-    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
-    : null;
-  // Another node-management change may hold the lock for a while (a config apply can take minutes): wait for it.
-  for (let attempt = 0; ; attempt++) {
+/**
+ * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the
+ * access queue; a failed or refused step leaves `dirty` set and is retried on the next 15 s tick.
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+type MeshSyncResult = { ok: boolean; guard?: string; rule?: string; skipped?: string };
+const meshSync = { dirty: true, running: null as Promise<MeshSyncResult> | null };
+function syncMesh(): Promise<MeshSyncResult> {
+  if (meshSync.running) return meshSync.running;
+  meshSync.running = (async (): Promise<MeshSyncResult> => {
+    meshSync.dirty = false;
+    const cfg: AccessConfig = mesh.config;
+    const helper = await admin.helperInfo().catch(() => null);
+    if (!helper?.managementCapable) {
+      mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper (v3), which installs the spoofing guard' });
+      meshSync.dirty = true;
+      return { ok: false, skipped: 'helper v3 not installed' };
+    }
+    // Guard every port that could see an fd00::/8 source: the mesh port, and the main port if it is not loopback-only.
+    const ports = cfg.enabled ? [...new Set([cfg.port, ...(LOOPBACK_HOSTS.has(HOST) ? [] : [PORT])])] : null;
+    const result: MeshSyncResult = { ok: true };
+    try {
+      const g = await admin.meshGuard(ports, mesh.tunName);
+      mesh.setGuard(ports && g.ok ? { active: true, ports } : { active: false, ports: [], error: ports ? g.error : undefined });
+      if (!g.ok) { result.ok = false; result.guard = g.error ?? 'failed'; }
+    } catch (e) { mesh.setGuard({ active: false, ports: [], error: (e as Error).message }); result.ok = false; result.guard = (e as Error).message; }
+    const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
+      ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
+      : null;
     try {
       const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
-      return r.ok ? { ok: true } : { ok: false, error: String(r.error ?? 'rejected') };
-    } catch (e) {
-      const msg = (e as Error).message;
-      if (attempt < 90 && /in progress|upgrade job is running/.test(msg)) { await new Promise((r) => setTimeout(r, 2000)); continue; }
-      return { ok: false, error: msg };
-    }
-  }
+      if (!r.ok) { result.ok = false; result.rule = String(r.error ?? 'rejected'); }
+    } catch (e) { result.ok = false; result.rule = (e as Error).message; }
+    if (!result.ok) meshSync.dirty = true;
+    return result;
+  })().finally(() => { meshSync.running = null; });
+  return meshSync.running;
 }
-mesh.onChange = syncMeshFirewall;
-void mesh.start();
+mesh.onChange = async () => { meshSync.dirty = true; };
+// Something outside the UI can remove the guard (restarting nftables.service flushes the whole ruleset), so
+// while mesh access is on it is re-applied every 2 minutes; the reload is atomic and idempotent.
+let meshTicks = 0;
+setInterval(() => {
+  if (mesh.config.enabled && ++meshTicks % 8 === 0) meshSync.dirty = true;
+  if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
+}, 15_000).unref();
+void mesh.start().then(() => syncMesh()).then(() => mesh.reconcile());
 
 server.listen(PORT, HOST, () => {
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);

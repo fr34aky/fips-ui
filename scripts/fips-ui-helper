@@ -26,6 +26,9 @@
 #                                     full baseline before /etc/fips/fips.d/<name>.nft is written
 #   dropin-delete <name>
 #   service <action> <unit>        -> start|stop|restart|reload|enable|disable for fips units (systemd)
+#   mesh-guard <ports|off> [tun]   -> load (or remove) table inet fips_ui_guard: TCP from fd00::/8 to the
+#                                     web UI's ports is dropped unless it arrives on lo or the FIPS TUN, so
+#                                     a mesh source address can be trusted as the npub it derives from
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -1007,6 +1010,33 @@ case "$cmd" in
     printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
     ;;
 
+  mesh-guard)
+    take_lock
+    ports=${2:-}; tun=${3:-fips0}
+    [[ "$tun" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid interface name"
+    command -v nft >/dev/null 2>&1 || die "nft not found"
+    if [[ "$ports" == off ]]; then
+      nft delete table inet fips_ui_guard 2>/dev/null || true
+      printf '{"ok":true,"active":false}\n'; exit 0
+    fi
+    [[ "$ports" =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,3}$ ]] || die "ports must be a comma-separated list of up to 4 ports"
+    for p in ${ports//,/ }; do (( p >= 1 && p <= 65535 )) || die "port $p out of range"; done
+    # Priority -5 runs before the fips baseline; only fd00::/8 sources to these ports are affected.
+    if ! err=$(nft -f - 2>&1 <<NFT
+add table inet fips_ui_guard
+flush table inet fips_ui_guard
+table inet fips_ui_guard {
+  chain input {
+    type filter hook input priority -5; policy accept;
+    iifname { "lo", "$tun" } return
+    ip6 saddr fd00::/8 tcp dport { ${ports//,/, } } counter drop comment "fips-ui: mesh source addresses only via $tun"
+  }
+}
+NFT
+    ); then printf '{"ok":false,"error":%s}\n' "$(json_escape "$(printf '%s' "$err" | grep -E 'Error:' | head -n 3)")"; exit 0; fi
+    printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$ports")" "$(json_escape "$tun")"
+    ;;
+
   list-backups)
     ensure_backups_dir
     printf '['
@@ -1021,6 +1051,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off> [tun]}"
     ;;
 esac

@@ -347,8 +347,17 @@ export function createAdminHandler(opts: AdminOptions) {
     });
   }
 
+  /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
+  async function meshGuard(ports: number[] | null, tun: string): Promise<{ ok: boolean; error?: string }> {
+    await requireHelper();
+    const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun], undefined, 30_000);
+    if (r.code !== 0) return { ok: false, error: helperError(r) };
+    return lastJson<{ ok: boolean; error?: string }>(r.stdout);
+  }
+
   return Object.assign(handler, {
     helperInfo,
+    meshGuard,
     updateManagedRules,
     /** True while a node-management change is running (upgrades must not start then). */
     changePending: () => pending,

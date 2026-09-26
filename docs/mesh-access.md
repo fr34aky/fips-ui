@@ -11,14 +11,20 @@ address of a connection that arrives through fips0 is therefore the `fd00::/8` a
 sender's public key. The UI derives the address of every allowed npub with `fipsctl address` and admits a
 connection only if its source address matches one of them.
 
-A source address alone is not proof, because an attacker on the local network could advertise a route
-for someone's `fd00::/8` address and complete a TCP handshake over the LAN. So a connection counts as an
-npub only if the kernel routes replies to its address through the FIPS TUN device (a reverse-path check
-with `ip route get`), or it is this node's own address over loopback. The mesh listener, bound to the
-fips0 address, refuses every other source. As a further layer, the UI keeps a rule in its managed firewall
-drop-in that opens the port only to the allowed npubs (this needs helper v3; see
-[node-management.md](node-management.md)). The rule is rewritten in the same step as every change to the
-allow-list, waiting if another node-management change is running.
+A source address alone is not proof, because a host on the local network could send packets with
+someone's `fd00::/8` address, and with a forged router advertisement even complete a TCP handshake. So
+the privileged helper loads a small kernel rule, table `inet fips_ui_guard`, that drops TCP from
+`fd00::/8` to the UI's ports unless it arrives on `lo` or the FIPS TUN device. The kernel applies it to
+every packet, the handshake included. The UI trusts `fd00::/8` sources only while it has confirmed the
+guard is loaded; without it (for example before helper v3 is installed) nobody is admitted from the mesh.
+The guard is re-applied every two minutes, because restarting `nftables.service` flushes the whole
+ruleset. On the main listener, `fd00::/8` sources are always treated as mesh identities, so if you expose
+the main listener on a LAN that itself uses `fd` ULA addresses, those clients need to be on the
+allow-list too.
+
+As a further layer, the UI keeps a rule in its managed firewall drop-in that opens the mesh port on fips0
+only to the allowed npubs. Both are updated right after every change to the allow-list and retried every
+15 seconds until they succeed.
 
 Removing an npub or changing its role closes its open connections, including live event streams. An
 operation it had already started, such as a configuration apply, still completes.
@@ -30,7 +36,7 @@ operation it had already started, such as a configuration apply, still completes
 | viewer | Everything read-only: dashboards, peers, metrics, logs, topology. No Configuration, Firewall or Upgrade pages, no connect, disconnect or probe, and no view of the access list. |
 | admin | The same as someone at this machine, including changing the node's configuration and firewall as root and upgrading it. Grant it only to keys you trust as much as this host's own login. |
 
-The local listener (loopback) is always admin. `FIPS_UI_TOKEN`, when set, is required on the local
+The local listener (loopback) is always admin. Mesh access requires helper v3 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
 listener only; over the mesh the npub is the credential.
 
 ## Configuration

@@ -5,14 +5,13 @@
 // through the mesh is the fd00::/8 address derived from the sender's npub. The UI therefore needs no
 // login over the mesh: it compares the peer address with the derived addresses of the allowed npubs.
 //
-// A source address alone is not proof: an on-link attacker could install a route for someone's fd00::/8
-// address on the LAN (a router advertisement) and complete a handshake from it. So a connection counts as
-// a mesh identity only if the kernel routes replies to its address through the FIPS TUN device (a
-// reverse-path check), or it is this node's own address over loopback. Anything else is not a mesh
-// identity, and the mesh listener refuses it outright. The firewall rule this module maintains is a
-// further layer.
+// A source address alone is not proof: a host on the LAN could send packets with someone's fd00::/8
+// address, and with a forged router advertisement even complete a handshake. So the helper loads a kernel
+// guard (table inet fips_ui_guard) that drops TCP from fd00::/8 to the UI's ports unless it arrives on lo or
+// the FIPS TUN device. Every packet is checked, the handshake included. fd00::/8 sources are trusted as
+// npubs only while that guard is confirmed active; without it nobody is admitted from the mesh.
+
 import http from 'node:http';
-import { execFile } from 'node:child_process';
 import type { Socket } from 'node:net';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -54,7 +53,7 @@ export function validateAccess(input: unknown): AccessConfig {
   return { enabled: x.enabled, port, allowed };
 }
 
-export interface MeshStatus { listening: boolean; address: string | null; npub: string | null; port: number; error?: string }
+export interface MeshStatus { listening: boolean; address: string | null; npub: string | null; port: number; guard: { active: boolean; ports: number[]; error?: string }; error?: string }
 
 type Entry = AccessEntry & { address: string };
 
@@ -69,8 +68,9 @@ export class MeshAccess {
   private queue: Promise<unknown> = Promise.resolve();
   /** Open connections admitted as a mesh principal, with the grant they were admitted under. */
   private conns = new Map<Socket, string>();
-  private routes = new Map<string, { at: number; mesh: boolean }>();
   private tun = 'fips0';
+  /** Whether the kernel guard for the current ports is loaded (set by the sync in server/index.ts). */
+  guard: { active: boolean; ports: number[]; error?: string } = { active: false, ports: [] };
   /** Set when access.json exists but could not be loaded; saving is refused until it loads, so it is never overwritten. */
   private loadError: string | undefined;
   private loaded = false;
@@ -86,29 +86,16 @@ export class MeshAccess {
     return p;
   }
 
+  get tunName(): string { return this.tun; }
+
   status(): MeshStatus {
-    return { listening: !!this.bound, address: this.bound?.address ?? this.own?.address ?? null, npub: this.own?.npub ?? null, port: this.config.port, error: this.loadError ?? (this.config.enabled ? this.lastError : undefined) };
+    return { listening: !!this.bound, address: this.bound?.address ?? this.own?.address ?? null, npub: this.own?.npub ?? null, port: this.config.port, guard: this.guard, error: this.loadError ?? (this.config.enabled ? this.lastError : undefined) };
   }
 
-  /**
-   * Reverse-path check: does the kernel route replies to `addr` through the FIPS TUN device? (Or is it this
-   * node's own fips0 address, reached over loopback.) Only then can the address be trusted as an npub's.
-   * Results are cached for 10 s. Fails closed where `ip` is unavailable.
-   */
-  async isMeshRouted(addr: string | undefined): Promise<boolean> {
-    const key = addr ? expand6(addr) : null;
-    if (!key || !key.startsWith('fd')) return false;
-    const hit = this.routes.get(key);
-    if (hit && Date.now() - hit.at < 10_000) return hit.mesh;
-    const out = await new Promise<string>((resolve) => execFile('ip', ['-j', '-6', 'route', 'get', addr!.replace(/%.*$/, '')], { timeout: 2000 }, (err, stdout) => resolve(err ? '' : String(stdout))));
-    let mesh = false;
-    try {
-      const r = (JSON.parse(out) as { dev?: string; type?: string }[])[0];
-      mesh = r?.dev === this.tun || (r?.dev === 'lo' && r?.type === 'local' && !!this.own && key === expand6(this.own.address));
-    } catch { mesh = false; }
-    if (this.routes.size > 2000) this.routes.clear();
-    this.routes.set(key, { at: Date.now(), mesh });
-    return mesh;
+  /** Record the guard state; losing it cuts every mesh connection and stops the listener until it is back. */
+  setGuard(g: { active: boolean; ports: number[]; error?: string }): void {
+    this.guard = g;
+    if (!g.active) { this.revalidate(); if (this.server) this.close(); }
   }
 
   /**
@@ -116,7 +103,7 @@ export class MeshAccess {
    * admitted. When mesh access is disabled nobody is admitted from the mesh.
    */
   principalFor(remote: string | undefined): Principal | null {
-    if (!this.config.enabled) return null;
+    if (!this.config.enabled || !this.guard.active) return null;
     const key = remote ? expand6(remote) : null;
     const e = key ? this.byAddress.get(key) : undefined;
     return e ? { kind: 'mesh', role: e.role, npub: e.npub, label: e.label, address: e.address } : null;
@@ -169,11 +156,11 @@ export class MeshAccess {
       }
     }
     this.loaded = true; this.loadError = undefined;
-    await this.onChange(this.config).catch(() => {});
+    void this.onChange(this.config).catch(() => {});
   }
 
   /** Validate, derive addresses, persist, and only then put the new list into effect. */
-  save(input: unknown): Promise<unknown> {
+  save(input: unknown): Promise<void> {
     return this.serial(async () => {
       if (!this.loaded) throw new AccessError(this.loadError ?? 'the saved access list has not loaded yet');
       const cfg = validateAccess(input);
@@ -188,7 +175,7 @@ export class MeshAccess {
       this.revalidate();
       if (rebind) this.close();
       await this.reconcileNow();
-      return this.onChange(cfg);
+      void this.onChange(cfg).catch(() => {});
     });
   }
 
@@ -220,6 +207,7 @@ export class MeshAccess {
       if (!this.own) { this.lastError = `daemon unreachable: ${(e as Error).message}`; return; }
     }
     if (!this.own) { this.lastError = 'the daemon did not report a fips0 address'; return; }
+    if (!this.guard.active || !this.guard.ports.includes(this.config.port)) { if (this.server) this.close(); this.lastError = `waiting for the spoofing guard${this.guard.error ? `: ${this.guard.error}` : ''}`; return; }
     const want = { address: this.own.address, port: this.config.port };
     if (this.bound && this.bound.address === want.address && this.bound.port === want.port) return;
     if (this.server) this.close();
