@@ -9,6 +9,7 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
+import { createAdminHandler } from './admin.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -231,9 +232,21 @@ function serveStatic(url: URL, res: Res) {
 // Router
 // ---------------------------------------------------------------------------------------------
 const startedAt = Date.now();
+let upgradeStarting = 0;
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
 const upgrade = createUpgradeHandler({ authorize: () => !READ_ONLY, controlSocket: SOCKET_PATH });
+// Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
+const admin = createAdminHandler({
+  authorize: () => !READ_ONLY,
+  busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
+});
+/** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
+async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
+  if (READ_ONLY) return null;
+  if ((await admin.helperInfo()).managementCapable) return 'helper';
+  return ALLOW_SERVICE_CONTROL ? 'direct' : null;
+}
 
 async function route(req: Req, res: Res) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -251,11 +264,19 @@ async function route(req: Req, res: Res) {
   if (p === '/api/health') {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
-    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: ALLOW_SERVICE_CONTROL && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: (await serviceControlMode()) !== null, nodeManagement: (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
-  if (p.startsWith('/api/upgrade')) { if (await upgrade(req, res)) return; }
+  if (p.startsWith('/api/upgrade')) {
+    if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
+    // Requests that start an upgrade or rollback are counted before any await, so a node-management change
+    // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
+    const starts = method === 'POST' && (p === '/api/upgrade/jobs' || p === '/api/upgrade/rollback');
+    if (starts) upgradeStarting++;
+    try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
+  }
+  if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 
   // Generic read-only proxy: /api/q/show_peers, /api/q/show_stats_history?metric=bytes_in&window=1h
@@ -314,10 +335,11 @@ async function route(req: Req, res: Res) {
 
   const svc = /^\/api\/service\/([a-z-]+\.service)\/(start|stop|restart|reload)$/.exec(p);
   if (svc) {
-    if (!ALLOW_SERVICE_CONTROL) throw new HttpError(403, 'service control is disabled; start the UI with FIPS_UI_ALLOW_SERVICE_CONTROL=1 and the needed privileges');
+    const mode = await serviceControlMode();
+    if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v4+, installed by deploy/setup-local.sh) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
     if (!(UNITS as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown unit');
-    const r = await serviceAction(svc[1] as UnitName, svc[2] as ServiceAction);
-    if (!r.ok) throw new HttpError(500, r.error);
+    if (mode === 'helper') await admin.serviceAction(svc[1], svc[2]);
+    else { const r = await serviceAction(svc[1] as UnitName, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }
     return json(res, 200, { ok: true, units: await unitStates() });
   }
 
@@ -333,7 +355,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  control socket : ${SOCKET_PATH}`);
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);
-  console.log(`  service control: ${ALLOW_SERVICE_CONTROL && !READ_ONLY ? 'enabled' : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`);
+  void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
 for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); process.exit(0); });

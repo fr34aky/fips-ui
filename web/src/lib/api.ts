@@ -5,7 +5,7 @@ const TOKEN_KEY = 'fips-ui-token';
 export const getToken = () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } };
 export const setToken = (t: string | null) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ } };
 
-export class ApiError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
+export class ApiError extends Error { status: number; body: unknown; constructor(status: number, message: string, body?: unknown) { super(message); this.status = status; this.body = body; } }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -19,7 +19,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const msg = (body as { error?: string } | null)?.error ?? `${res.status} ${res.statusText}`;
     if (res.status === 401) authStore.setNeeded(true);
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, body);
   }
   return body as T;
 }

@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, Sun, Moon, Menu, X, Wifi, WifiOff } from 'lucide-react';
+import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff } from 'lucide-react';
 import type { ConnState } from '../lib/api';
 
-export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'upgrade';
+export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'upgrade' | 'config' | 'firewall';
 
 export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[] = [
   { id: 'overview', label: 'Overview', icon: <Activity size={17} />, hint: 'Node status at a glance' },
@@ -15,6 +15,8 @@ export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[]
   { id: 'diagnostics', label: 'Diagnostics', icon: <Stethoscope size={17} />, hint: 'Probe reachability of a node' },
   { id: 'access', label: 'Access', icon: <ShieldCheck size={17} />, hint: 'ACL, firewall exposure, hosts' },
   { id: 'gateway', label: 'Gateway', icon: <Router size={17} />, hint: 'LAN gateway pool and mappings' },
+  { id: 'config', label: 'Configuration', icon: <FileCog size={17} />, hint: 'Edit fips.yaml with automatic rollback' },
+  { id: 'firewall', label: 'Firewall', icon: <BrickWall size={17} />, hint: 'fips0 firewall service and inbound rules' },
   { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={17} />, hint: 'Install a release or build master' },
 ];
 

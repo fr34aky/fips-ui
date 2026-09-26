@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { Shell, NAV, type ViewId } from './components/Shell';
 import { ToastProvider, Modal, ErrorNote, Empty, Chip } from './components/ui';
 import { api, useLive, useAuthNeeded, setAuthNeeded, setToken, getToken, reconnectLive } from './lib/api';
@@ -14,6 +14,8 @@ import { Diagnostics } from './views/Diagnostics';
 import { Access } from './views/Access';
 import { Gateway } from './views/Gateway';
 import { Upgrade } from './views/Upgrade';
+const Config = lazy(() => import('./views/Config'));
+import { Firewall } from './views/Firewall';
 import { shortKey } from './lib/format';
 
 function parseHash(): { view: ViewId; params: URLSearchParams } {
@@ -58,6 +60,8 @@ export default function App() {
       case 'access': body = <Access snap={snap} onProbe={probe} />; break;
       case 'gateway': body = <Gateway snap={snap} />; break;
       case 'upgrade': body = <Upgrade />; break;
+      case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;
+      case 'firewall': { const port = route.params.get('port'); body = <Firewall snap={snap} readOnly={!!health?.readOnly} prefill={port ? { port, proto: route.params.get('proto') === 'udp' ? 'udp' : 'tcp', comment: route.params.get('note') ?? undefined } : null} />; break; }
       default: body = <Overview snap={snap} health={health} onNav={nav} />;
     }
   }

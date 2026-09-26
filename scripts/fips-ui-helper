@@ -9,11 +9,23 @@
 # native package installer), restart the service.
 #
 # Commands:
-#   check                          -> {"ok":true,"version":2,...}
+#   check                          -> {"ok":true,"version":4,...}
 #   install <stagedir> [--no-restart]
 #   rollback <backup-id>
 #   restart
 #   list-backups
+#   config-show [backup-id]        -> fips.yaml (or a config backup) with secret values redacted as
+#                                     numbered placeholders bound to their key and parent line
+#   config-apply [--no-restart] --base <sha256> <- new fips.yaml on stdin; redacted placeholders are restored from
+#                                     the current file; backed up, installed, daemon restarted and
+#                                     rolled back automatically if it does not come up healthy
+#   config-backups                 -> JSON list of config backups
+#   config-restore <backup-id>     -> reinstall a config backup, restart with the same health check
+#   firewall-status                -> JSON: unit state, whether table inet fips is loaded, live ruleset
+#   dropin-apply <name>            <- nftables drop-in on stdin; validated with `nft -c` against the
+#                                     full baseline before /etc/fips/fips.d/<name>.nft is written
+#   dropin-delete <name>
+#   service <action> <unit>        -> start|stop|restart|reload|enable|disable for fips units (systemd)
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -25,7 +37,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=2
+HELPER_VERSION=4
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -104,13 +116,14 @@ svc_active() {
     *) return 1 ;;
   esac
 }
+# 9>&- : a daemon started by the service manager must not inherit the helper lock.
 svc_restart() {
   case "$SM" in
-    systemd) systemctl restart "$1" ;;
-    launchd) launchctl kickstart -k "system/$1" ;;
-    rc)      service "$1" restart ;;
-    openrc)  rc-service "$1" restart ;;
-    sysv)    "/etc/init.d/$1" restart ;;
+    systemd) systemctl restart "$1" 9>&- ;;
+    launchd) launchctl kickstart -k "system/$1" 9>&- ;;
+    rc)      service "$1" restart 9>&- ;;
+    openrc)  rc-service "$1" restart 9>&- ;;
+    sysv)    "/etc/init.d/$1" restart 9>&- ;;
     *) return 1 ;;
   esac
 }
@@ -176,10 +189,667 @@ install_binaries() {
 install_package() {
   local pkg=$1
   case "$OS" in
-    Darwin)  log "installer -pkg $pkg -target /"; installer -pkg "$pkg" -target / ;;
-    FreeBSD) log "pkg add -f $pkg"; pkg add -f "$pkg" ;;
+    Darwin)  log "installer -pkg $pkg -target /"; installer -pkg "$pkg" -target / 9>&- ;;
+    FreeBSD) log "pkg add -f $pkg"; pkg add -f "$pkg" 9>&- ;;
     *) die "package artifacts are not supported on $OS" ;;
   esac
+}
+
+# ---------------------------------------------------------------- node management (v4)
+FIPS_CONFIG=/etc/fips/fips.yaml
+FIPS_NFT=/etc/fips/fips.nft
+DROPIN_DIR=/etc/fips/fips.d
+# Fixed per OS and deliberately not derived from FIPS_UI_BACKUPS, which sudo forwards from the caller.
+CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DEFAULT")/config-backups"
+LOCK_FILE=/var/run/fips-ui-helper.lock
+MAX_CONFIG_BYTES=262144
+MAX_DROPIN_BYTES=65536
+# Keys whose values never leave this script, matched case-insensitively against the whole key.
+SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
+# Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
+# management verbs at scratch files so the whole flow can be exercised without touching /etc.
+if [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]]; then
+  FIPS_CONFIG=${FIPS_TEST_CONFIG:-$FIPS_CONFIG}; FIPS_NFT=${FIPS_TEST_NFT:-$FIPS_NFT}; DROPIN_DIR=${FIPS_TEST_DROPIN_DIR:-$DROPIN_DIR}
+  CONFIG_BACKUPS_DIR=${FIPS_TEST_CONFIG_BACKUPS:-$CONFIG_BACKUPS_DIR}; LOCK_FILE=${FIPS_TEST_LOCK:-$LOCK_FILE}
+fi
+
+# One privileged change at a time, across every caller (UI, upgrade jobs, a second tab, a shell).
+take_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || die "another privileged operation is in progress"
+}
+
+# Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
+# secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
+# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret of 8+
+# characters, or holds an nsec or 64-hex key (alone or wrapped over consecutive comment lines: every line
+# holding part of it) is shown as "# <redacted comment #N>". A secret line commented out in the editor
+# ('# nsec: "<redacted #1>"') gets its value back inside the comment, which then stays hidden. Anything else is refused (exit 3, reasons on stderr), and so is a file where a
+# secret of 8+ characters also appears in another value (npub included), anchor, tag or directive (keys only
+# as long copies), or an nsec or 64-hex value sits outside a secret key (hex public keys under npub are
+# allowed). Shorter secrets are redacted in place only. Restore requires each placeholder to be a whole scalar
+# value under the same key at the same path (and each comment placeholder a whole comment), puts the original
+# text back, re-parses the result and checks each secret is exactly at its path, and that the result can be
+# shown again with every restored comment still hidden. Runs as root in isolated mode (python3 -I): no user
+# environment is consulted.
+read -r -d '' REDACT_PY <<'PY' || true
+# Secret redaction for fips.yaml, decided from the parsed YAML tree (PyYAML's safe composer), never from text.
+#   redact <file>                     -> "base <sha256 of the bytes read>" line, then the file with each secret
+#                                        value replaced by "<redacted #N>" (exit 3 + reasons if unsafe)
+#   restore <original> <new> <out>    -> new file with each placeholder replaced by the original value text
+# Files are handled as bytes decoded without newline translation, so line endings and trailing newlines are
+# kept exactly; a leading UTF-8 BOM is kept aside (libyaml does not count it in its positions).
+#
+# Purpose: keep secret values off screens, out of the browser, logs and screenshots. It is NOT a boundary
+# against someone allowed to edit fips.yaml: such a person can always make the daemon use a secret somewhere
+# else (for example point the Tor control address at their own listener), which is why only admins may edit.
+import hashlib, re, sys
+try:
+    import yaml
+    from yaml import nodes
+except ImportError:
+    print('config editing needs python3 with PyYAML (Arch: python-yaml, Debian/Ubuntu: python3-yaml, Fedora: python3-pyyaml)', file=sys.stderr)
+    sys.exit(3)
+
+KEYS = set(k.lower() for k in sys.argv[2].split('|'))
+MODE = sys.argv[1]
+NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
+# In text with whitespace and '#' removed a key can touch hex letters of neighbouring words: any run of 64+.
+HEXRUN = re.compile(r'[0-9a-fA-F]{64,}')
+# Copies of a secret elsewhere in the file are detected for values of at least this many characters. Shorter
+# ones ("tor", "control", "fips") are ordinary words of this configuration; they are redacted where they are
+# set, but the same word elsewhere is not treated as a copy (that would lock the editor on normal files).
+MIN_COPY = 8
+# Keys whose value is a public key, which fips also accepts as 64 hex characters.
+PUBLIC_KEYS = {'npub'}
+NOT_SECRET = {'', 'null', '~', 'true', 'false', 'cookie'}
+BOM = '\ufeff'
+KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, sorted(KEYS))) + r')[\'"]?\s*[:=]', re.I)
+# YAML 1.1 line breaks (libyaml); Python's str.splitlines also splits on \v, \f and others, which YAML does not.
+BREAK = re.compile(r'\r\n|[\r\n\x85\u2028\u2029]')
+RUN_GAP = re.compile('(?:' + BREAK.pattern + r')[ \t]*')
+PLACEHOLDERS = re.compile(r'"<redacted #\d+>"|# <redacted comment #\d+>')
+PH = re.compile(r'<redacted #(\d+)>')
+COMMENTED = re.compile(r'^(#\s*(?:-\s+)?)([^:#"\']+|"[^"]*"|\'[^\']*\')\s*:\s*("<redacted #(\d+)>")\s*$')
+CPH = re.compile(r'^#\s*<redacted comment #(\d+)>\s*$')
+SAFE_TAGS = {'tag:yaml.org,2002:str', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:null'}
+Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+
+class Refuse(Exception):
+    pass
+
+def line(n):
+    return n.start_mark.line + 1
+
+def read(path):
+    data = open(path, 'rb').read()
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Refuse('the file is not UTF-8')
+    bom = text.startswith(BOM)
+    return data, (text[1:] if bom else text), (BOM if bom else '')
+
+def compose(text, what):
+    try:
+        docs = list(yaml.compose_all(text, Loader=Loader))
+    except yaml.YAMLError as e:
+        raise Refuse(f'{what} is not valid YAML: {str(e).splitlines()[0]}')
+    if len(docs) > 1:
+        raise Refuse(f'{what} has more than one YAML document')
+    return docs[0] if docs else None
+
+def uses(root):
+    """How often each node object is reachable (an alias makes it more than once). Cycle-safe."""
+    counts = {}
+    stack = [root] if root is not None else []
+    while stack:
+        n = stack.pop()
+        counts[id(n)] = counts.get(id(n), 0) + 1
+        if counts[id(n)] > 1:
+            continue
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                stack.extend((k, v))
+        elif isinstance(n, nodes.SequenceNode):
+            stack.extend(n.value)
+    return counts
+
+def squash(s):
+    """Text with whitespace and comment markers removed: how a value wrapped over lines or comments reads joined."""
+    return re.sub(r'[\s#]+', '', s)
+
+def key_material(s):
+    """An nsec or a 64-hex key anywhere in s, even wrapped over several lines or next to other hex letters."""
+    return squashed_key_material(squash(s))
+
+def squashed_key_material(q):
+    return bool(NSEC.search(q) or HEXRUN.search(q))
+
+def check_stray(n):
+    if key_material(n.value):
+        raise Refuse(f'line {line(n)}: an nsec or 64-character hex value (possibly a private key) outside a secret key')
+
+def secret_forms(value):
+    """The strings whose presence elsewhere would reveal a secret: the value, and for Tor's "password:<pw>" the pw,
+    each also without surrounding spaces."""
+    forms = {value}
+    if value.lower().startswith('password:'):
+        forms.add(value.split(':', 1)[1])
+    forms |= {f.strip() for f in forms}
+    return {f for f in forms if f.strip().lower() not in NOT_SECRET and len(f.strip()) >= 3}
+
+def secrets(text, root, public=None):
+    """[(path, keyname, value node)] for every secret key; refuse any form that cannot be redacted exactly."""
+    counts = uses(root)
+    if any(c > 1 for c in counts.values()):
+        raise Refuse('the file uses YAML aliases (*name), which this editor does not support')
+    found, seen = [], set()
+    def walk(n, path):
+        if id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                if isinstance(k, nodes.ScalarNode):
+                    check_stray(k)
+                if not isinstance(k, nodes.ScalarNode):
+                    if any(isinstance(x, nodes.ScalarNode) and x.value.strip().lower() in KEYS for x in flatten(k)):
+                        raise Refuse(f'line {line(k)}: a secret key inside a complex mapping key')
+                    walk(k, path + ['?']); walk(v, path + ['?'])
+                    continue
+                name = k.value.strip().lower()
+                p = path + [k.value]
+                if name in PUBLIC_KEYS and isinstance(v, nodes.ScalarNode):
+                    # A public key may be hex; only an nsec there is refused.
+                    if NSEC.search(squash(v.value)):
+                        raise Refuse(f'line {line(v)}: an nsec value under {name}')
+                    if public is not None:
+                        public.append(v)
+                    continue
+                if name in KEYS:
+                    if not isinstance(v, nodes.ScalarNode):
+                        raise Refuse(f'line {line(v)}: {name} holds a list or mapping, not a single value')
+                    if counts.get(id(v), 0) > 1 or counts.get(id(k), 0) > 1:
+                        raise Refuse(f'line {line(v)}: {name} is used through a YAML alias')
+                    if v.start_mark.line != v.end_mark.line:
+                        raise Refuse(f'line {line(v)}: {name} spans several lines')
+                    if v.style in ('|', '>'):
+                        raise Refuse(f'line {line(v)}: {name} is a block scalar')
+                    if v.tag not in SAFE_TAGS or text[v.start_mark.index:v.start_mark.index + 1] in ('&', '!', '*'):
+                        raise Refuse(f'line {line(v)}: {name} has an anchor or tag')
+                    if v.tag != 'tag:yaml.org,2002:null' and v.value != '':
+                        # The replaced characters must be exactly this value (guards against any position drift).
+                        snippet = text[v.start_mark.index:v.end_mark.index]
+                        try:
+                            back = yaml.compose(snippet, Loader=Loader)
+                        except yaml.YAMLError:
+                            back = None
+                        if not isinstance(back, nodes.ScalarNode) or back.value != v.value:
+                            raise Refuse(f'line {line(v)}: could not locate the exact value of {name}')
+                        found.append((p, name, v))
+                    continue
+                walk(v, p)
+        elif isinstance(n, nodes.SequenceNode):
+            for v, sig in zip(n.value, sigs(n)):
+                walk(v, path + [sig])
+        elif isinstance(n, nodes.ScalarNode):
+            check_stray(n)
+    if root is not None:
+        walk(root, [])
+    return found
+
+ID_KEYS = ('npub', 'alias', 'name', 'id')
+
+def itemsig(v, i):
+    """A list item's identity: its npub, alias, name or id if it has one (so editing its other fields, or deleting
+    and reordering other items, keeps it), else its position."""
+    if isinstance(v, nodes.MappingNode):
+        for idk in ID_KEYS:
+            for k, x in v.value:
+                if isinstance(k, nodes.ScalarNode) and isinstance(x, nodes.ScalarNode) and k.value == idk and x.value:
+                    return ('item', ((idk, x.value),))
+    return i
+
+def sigs(seq):
+    """Signatures of a sequence's items, with an ordinal added where two items would otherwise collide."""
+    seen, out = {}, []
+    for i, v in enumerate(seq.value):
+        sig = itemsig(v, i)
+        n = seen.get(sig, 0); seen[sig] = n + 1
+        out.append(sig if n == 0 else (sig, n))
+    return out
+
+def flatten(n, seen=None):
+    seen = seen if seen is not None else set()
+    if id(n) in seen:
+        return
+    seen.add(id(n))
+    yield n
+    if isinstance(n, nodes.MappingNode):
+        for k, v in n.value:
+            yield from flatten(k, seen); yield from flatten(v, seen)
+    elif isinstance(n, nodes.SequenceNode):
+        for v in n.value:
+            yield from flatten(v, seen)
+
+def splice(text, edits):
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+def ph(i):
+    return f'"<redacted #{i}>"'
+
+def fmt(path):
+    def one(x):
+        if isinstance(x, tuple) and len(x) == 2 and isinstance(x[1], int) and isinstance(x[0], tuple):
+            return one(x[0]) + f'#{x[1] + 1}'
+        if isinstance(x, tuple) and x and x[0] == 'item':
+            return '[' + ', '.join(f'{k}={v}' for k, v in x[1]) + ']'
+        return str(x)
+    return '.'.join(one(x) for x in path) or 'the top level'
+
+def scan(text):
+    """-> (comment spans, names). A comment starts at any '#' outside every token (libyaml starts one at any such
+    '#') and runs to the end of the line. A block scalar's token also spans its header line ("key: | # note"),
+    whose comment is not content, so that line is not treated as covered. Names are the decoded values of every
+    token that is not a scalar (anchors, tags, %TAG and %YAML directives): text that is neither value nor comment."""
+    import bisect
+    cov, names = [], []
+    try:
+        for t in yaml.scan(text, Loader=Loader):
+            v = getattr(t, 'value', None)
+            if v is not None and not isinstance(t, yaml.ScalarToken):
+                names.append(''.join(str(x) for x in v if x is not None) if isinstance(v, tuple) else str(v))
+            a, b = t.start_mark.index, t.end_mark.index
+            if b <= a:
+                continue
+            if getattr(t, 'style', None) in ('|', '>'):
+                m = BREAK.search(text, a)
+                a = b if not m or m.start() >= b else m.start()
+            if b > a:
+                cov.append((a, b))
+        cov.sort()
+    except yaml.YAMLError as e:
+        raise Refuse(f'not valid YAML: {str(e).splitlines()[0]}')
+    starts = [a for a, _ in cov]
+    def covered(i):
+        k = bisect.bisect_right(starts, i) - 1
+        return k >= 0 and cov[k][0] <= i < cov[k][1]
+    out, pos = [], 0
+    for m in list(BREAK.finditer(text)) + [None]:
+        end = m.start() if m else len(text)
+        for i in range(pos, end):
+            if text[i] == '#' and not covered(i):
+                out.append((i, end))
+                break
+        pos = m.end() if m else end
+    return out, names
+
+def comment_runs(text, spans):
+    """Comments on consecutive lines, grouped (a key or password wrapped over several comment lines)."""
+    runs = []
+    for a, b in spans:
+        # Consecutive: only one line break and indentation between the previous comment's end and this '#'.
+        if runs and RUN_GAP.fullmatch(text[runs[-1][-1][1]:a]):
+            runs[-1].append((a, b))
+        else:
+            runs.append([(a, b)])
+    return runs
+
+def sensitive_comment(c, forms):
+    """A single comment that names a secret key or quotes a secret form. Key material and wrapped forms are found by
+    hidden_windows, which also covers single lines."""
+    return bool(KEYED.search(c) or any(f in c for f, _ in forms))
+
+def copy_forms(forms):
+    """[(form, squashed form or '')] for the forms of at least MIN_COPY characters; the squashed form (for copies
+    wrapped over lines) only where it is itself that long."""
+    out = []
+    for f in forms:
+        if len(f.strip()) >= MIN_COPY:
+            q = squash(f)
+            out.append((f, q if len(q) >= MIN_COPY else ''))
+    return out
+
+def hidden_windows(text, run, forms):
+    """Lines of a comment run that reveal key material or a secret only when joined (a key wrapped over lines).
+    The squashed lines are joined once and searched; every line a match touches is hidden, so a greedy nsec match
+    covers all of a wrapped key even when its first line is sensitive on its own. Linear in the run's length."""
+    joined, owner = [], []
+    for k, (a, b) in enumerate(run):
+        q = squash(text[a:b])
+        joined.append(q); owner.extend([k] * len(q))
+    q = ''.join(joined)
+    hits = set()
+    # (start, end, characters a whole key needs: 63 for a bech32 nsec, 64 for hex, 0 for an exact secret form)
+    matches = [(m.start(), m.end(), need) for rx, need in ((NSEC, 63), (HEXRUN, 64)) for m in rx.finditer(q)]
+    for _, s in forms:
+        if not s:
+            continue
+        start = q.find(s)
+        while start >= 0:
+            matches.append((start, start + len(s), 0))
+            start = q.find(s, start + 1)
+    # A greedy match can run into a neighbouring line whose words happen to be hex or bech32 letters ("# added a
+    # new one"). An edge line stays visible when the rest of the match still holds a whole key without it.
+    for a, b, need in matches:
+        lines = owner[a:b]
+        keep = set(lines)
+        left = len(lines)
+        if need and lines[0] != lines[-1]:
+            for edge in (lines[-1], lines[0]):
+                c = lines.count(edge)
+                if left - c >= need:
+                    keep.discard(edge); left -= c
+        hits.update(keep)
+    return [run[k] for k in sorted(hits)]
+
+def redact_text(text):
+    """-> (redacted text, secrets found, original texts of the redacted comments). Raises Refuse if unsafe."""
+    if PH.search(text) or re.search(r'<redacted comment #', text):
+        raise Refuse('the file already contains a redaction placeholder')
+    root = compose(text, 'the file')
+    public = []
+    found = secrets(text, root, public)
+    # Per secret: its decoded forms, and those plus its raw spellings (escapes, quotes) as they appear in the text.
+    decoded, spelled = [], []
+    for _, _, v in found:
+        f = secret_forms(v.value)
+        raw = text[v.start_mark.index:v.end_mark.index]
+        decoded.append(f)
+        spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
+    forms_all = copy_forms(set().union(*spelled)) if spelled else []
+    edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
+    spans, names = scan(text)
+    hide = {s for s in spans if sensitive_comment(text[s[0]:s[1]], forms_all)}
+    # A key or password wrapped over consecutive comment lines: hide the lines that are sensitive only together
+    # (just those, so documentation around them stays visible).
+    for run in comment_runs(text, spans):
+        hide.update(hidden_windows(text, run, forms_all))
+    comments = []
+    for a, b in spans:
+        if (a, b) in hide:
+            comments.append(text[a:b])
+            edits.append((a, b, f'# <redacted comment #{len(comments)}>'))
+    out = splice(text, edits)
+    # Outside comments (hidden above) a secret may not appear anywhere: other values, raw spellings, anchor, tag
+    # and directive names. Keys are the configuration's own vocabulary (a password "control" is not revealed by
+    # the key control_auth), so a key only counts when it is a long copy (12+ characters).
+    secret_ids = {id(v) for _, _, v in found}
+    scalars = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
+    keys = {id(k) for n in flatten(root) if isinstance(n, nodes.MappingNode) for k, _ in n.value} if root is not None else set()
+    # Public keys (npub) are exempt from the stray-key check, not from the copy check.
+    values = [(x.value, squash(x.value)) for x in scalars if id(x) not in keys]
+    keytexts = [x for x in scalars if id(x) in keys]
+    # Raw text without placeholders and keys (whose spans shift by the same edits: blank them before redacting).
+    blank = splice(text, [(x.start_mark.index, x.end_mark.index, ' ' * (x.end_mark.index - x.start_mark.index)) for x in keytexts + public])
+    bare = PLACEHOLDERS.sub('', splice(blank, edits))
+    qbare = squash(bare)
+    for (_, name, v), mine, spell in zip(found, decoded, spelled):
+        mine, spell = copy_forms(mine), copy_forms(spell)
+        if (any(f in x or (sq and sq in qx) for f, sq in mine for x, qx in values)
+                or any(len(f) >= 12 and f in x.value for f, _ in mine for x in keytexts)
+                or any(f in n for f, _ in spell for n in names)
+                or any(f in bare or (sq and sq in qbare) for f, sq in spell)):
+            raise Refuse(f'the value of {name} also appears elsewhere in the file (another value, anchor or tag)')
+    if key_material(bare):
+        raise Refuse('an nsec or 64-character hex value (possibly a private key) appears outside a secret key')
+    return out, found, comments
+
+def redact(path):
+    data, text, bom = read(path)
+    out, _, _ = redact_text(text)
+    return 'base ' + hashlib.sha256(data).hexdigest() + '\n' + bom + out
+
+def socket_path(path):
+    """node.control.socket_path from the parsed file, or '' (used by the helper's health check)."""
+    _, text, _ = read(path)
+    try:
+        d = yaml.load(text, Loader=Loader)
+        ctl = d.get('node', {}).get('control', {}) if isinstance(d, dict) else {}
+        if isinstance(ctl, dict) and ctl.get('enabled') is False:
+            return '-'
+        v = ctl.get('socket_path') if isinstance(ctl, dict) else None
+    except Exception:
+        v = None
+    return v if isinstance(v, str) and v.startswith('/') else ''
+
+def get(root, path):
+    n = root
+    for p in path:
+        if isinstance(n, nodes.MappingNode) and isinstance(p, str):
+            n = next((v for k, v in n.value if isinstance(k, nodes.ScalarNode) and k.value == p), None)
+        elif isinstance(n, nodes.SequenceNode):
+            n = next((v for v, sig in zip(n.value, sigs(n)) if sig == p), None)
+        else:
+            return None
+        if n is None:
+            return None
+    return n
+
+def restore(orig_path, new_path, base):
+    odata, otext, _ = read(orig_path)
+    if hashlib.sha256(odata).hexdigest() != base:
+        raise Refuse('fips.yaml changed since you loaded it; reload the page and make your edit again')
+    _, orig, ocomments = redact_text(otext)
+    _, ntext, nbom = read(new_path)
+    # Browsers submit LF; keep a CRLF file CRLF.
+    if '\r\n' in otext and '\r\n' not in ntext:
+        ntext = ntext.replace('\n', '\r\n')
+    nroot = compose(ntext, 'the new file')
+    if any(c > 1 for c in uses(nroot).values()):
+        raise Refuse('the new file uses YAML aliases (*name), which this editor does not support')
+    edits, used = [], set()
+    placeholder_nodes = 0
+    def walk(n, path, key, seen):
+        nonlocal placeholder_nodes
+        if id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, nodes.MappingNode):
+            for k, v in n.value:
+                if isinstance(k, nodes.ScalarNode) and PH.search(k.value):
+                    raise Refuse(f'line {line(k)}: a redaction placeholder used as a key')
+                walk(v, path + [k.value if isinstance(k, nodes.ScalarNode) else '?'], k, seen)
+        elif isinstance(n, nodes.SequenceNode):
+            for v, sig in zip(n.value, sigs(n)):
+                walk(v, path + [sig], None, seen)
+        elif isinstance(n, nodes.ScalarNode):
+            m = PH.fullmatch(n.value)
+            if not m:
+                return
+            placeholder_nodes += 1
+            i = int(m.group(1))
+            if i < 1 or i > len(orig):
+                raise Refuse(f'line {line(n)}: placeholder #{i} does not exist')
+            if i in used:
+                raise Refuse(f'line {line(n)}: placeholder #{i} is used twice')
+            opath, oname, ov = orig[i - 1]
+            if path != opath or key is None or key.value.strip().lower() != oname:
+                raise Refuse(f'line {line(n)}: redacted secret #{i} ({oname}) must stay at {fmt(opath)}')
+            if n.start_mark.line != n.end_mark.line:
+                raise Refuse(f'line {line(n)}: placeholder #{i} must stay a single-line value')
+            used.add(i)
+            edits.append((n.start_mark.index, n.end_mark.index, otext[ov.start_mark.index:ov.end_mark.index]))
+    if nroot is not None:
+        walk(nroot, [], None, set())
+    if len(PH.findall(ntext)) != placeholder_nodes + sum(1 for a, b in scan(ntext)[0] if COMMENTED.match(ntext[a:b])):
+        raise Refuse('a redaction placeholder appears somewhere other than as a whole value (a comment, key or longer string)')
+    cused, cfound = set(), 0
+    for a, b in scan(ntext)[0]:
+        # A secret line commented out ('# nsec: "<redacted #1>"'): its value is put back inside the comment, which
+        # names the secret key and so stays hidden.
+        cm = COMMENTED.match(ntext[a:b])
+        if cm:
+            i = int(cm.group(4))
+            if i < 1 or i > len(orig) or cm.group(2).strip('\'"').strip().lower() != orig[i - 1][1]:
+                raise Refuse(f'a commented-out placeholder #{i} must stay under its own key ({orig[i - 1][1] if 0 < i <= len(orig) else "unknown"})')
+            ov = orig[i - 1][2]
+            edits.append((a + cm.start(3), a + cm.end(3), otext[ov.start_mark.index:ov.end_mark.index]))
+            continue
+        m = CPH.match(ntext[a:b])
+        if not m:
+            continue
+        cfound += 1
+        j = int(m.group(1))
+        if j < 1 or j > len(ocomments) or j in cused:
+            raise Refuse(f'comment placeholder #{j} does not exist or is used twice')
+        cused.add(j)
+        edits.append((a, b, ocomments[j - 1]))
+    if len(re.findall(r'<redacted comment #', ntext)) != cfound:
+        raise Refuse('a comment placeholder appears somewhere other than as a whole comment')
+    out = splice(ntext, edits)
+    # Re-parse: every restored secret must be exactly the original value at its original path, and nowhere else.
+    root = compose(out, 'the result')
+    for i in used:
+        opath, oname, ov = orig[i - 1]
+        n = get(root, opath)
+        if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
+            raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
+    # Never save something the editor could not show again (that would lock the Configuration page); this also
+    # refuses a restored secret that would appear anywhere else.
+    try:
+        _, _, now_comments = redact_text(out)
+    except Refuse as e:
+        raise Refuse(f'this change would leave a file the editor cannot show: {e}')
+    # Every restored hidden comment must still be hidden in the result (it would show if it quotes a secret that
+    # was changed or removed).
+    for j in sorted(cused):
+        if ocomments[j - 1] not in now_comments:
+            raise Refuse(f'hidden comment #{j} would become visible: it is hidden because of a secret or key text, alone or '
+                         f'together with the comment lines next to it. Keep those secrets and keep hidden comment lines together '
+                         f'(add new lines above or below them), or delete the hidden comment lines')
+    return nbom + out
+
+try:
+    if MODE == 'redact':
+        sys.stdout.buffer.write(redact(sys.argv[3]).encode('utf-8'))
+    elif MODE == 'socketpath':
+        sys.stdout.write(socket_path(sys.argv[3]))
+    elif MODE == 'restore':
+        with open(sys.argv[5], 'wb') as f:
+            f.write(restore(sys.argv[3], sys.argv[4], sys.argv[6]).encode('utf-8'))
+    else:
+        raise Refuse('unknown mode')
+except Refuse as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(3)
+except (OSError, UnicodeDecodeError) as e:
+    print(f'cannot read the file: {e}', file=sys.stderr)
+    sys.exit(3)
+PY
+redact() { python3 -I -c "$REDACT_PY" redact "$SECRET_KEYS" "$1"; }
+restore_secrets() { python3 -I -c "$REDACT_PY" restore "$SECRET_KEYS" "$1" "$2" "$3" "$4"; }
+
+read_stdin_limited() { # <dest> <max-bytes>
+  head -c "$(( $2 + 1 ))" > "$1"
+  local n; n=$(wc -c < "$1" | tr -d ' ')
+  (( n <= $2 )) || die "input larger than $2 bytes"
+  (( n > 0 )) || die "empty input"
+}
+
+journal_tail_json() { # <unit> <since-epoch>
+  local out; out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  json_escape "$out"
+}
+
+fipsctl_bin() { [[ -x "$BIN_DIR/fipsctl" ]] && echo "$BIN_DIR/fipsctl" || echo fipsctl; }
+
+# Healthy = the unit stays active without systemd restarting it, and the control socket (at the path the new
+# config sets, if any) answers, for 8 consecutive seconds within a 45 s budget.
+wait_fips_healthy() {
+  local deadline=$(( $(date +%s) + 45 )) ok=0 restarts sock args=()
+  # node.control.socket_path from the parsed file (any YAML style); other sections have their own socket_path.
+  sock=$(python3 -I -c "$REDACT_PY" socketpath "$SECRET_KEYS" "$FIPS_CONFIG" 2>/dev/null || true)
+  [[ -n "$sock" && "$sock" == /* ]] && args=(-s "$sock")
+  # With the control socket disabled (node.control.enabled: false) only "active without restarts" can be checked.
+  local probe=true; [[ "$sock" == "-" ]] && probe=false
+  sleep 3
+  restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+  while (( $(date +%s) < deadline )); do
+    if systemctl is-active --quiet "$SERVICE" && [[ "$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)" == "$restarts" ]] \
+       && { ! $probe || "$(fipsctl_bin)" "${args[@]}" show status >/dev/null 2>&1; }; then
+      ok=$((ok + 1)); (( ok >= 8 )) && return 0
+    else
+      ok=0; restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+require_systemd() { [[ "$SM" == systemd ]] || die "node management verbs need systemd (found $SM)"; }
+valid_id() { [[ "$1" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid backup id"; }
+
+# backup_config [keep-id]: never prunes <keep-id> (the backup about to be restored).
+backup_config() {
+  mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+  local id; id=$(date +%Y%m%d-%H%M%S); local f="$CONFIG_BACKUPS_DIR/$id.yaml" i=1
+  while [[ -e "$f" ]]; do i=$((i + 1)); f="$CONFIG_BACKUPS_DIR/$id-$i.yaml"; done
+  install -m 0600 -o 0 -g 0 "$FIPS_CONFIG" "$f"
+  local d n=0; for d in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do
+    n=$((n + 1)); (( n > 20 )) && [[ "$(basename "$d" .yaml)" != "${1:-}" ]] && rm -f -- "$d"
+  done
+  basename "$f" .yaml
+}
+
+# install_config_and_restart <file> <backup-id> <restart:true|false>
+# Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
+# Replace fips.yaml atomically: a temp file in the same directory, then rename (never a half-written file).
+put_config() { install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"; }
+
+install_config_and_restart() {
+  trap '' INT TERM HUP
+  put_config "$1"
+  if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
+  local start; start=$(date +%s)
+  systemctl restart "$SERVICE" || true
+  if wait_fips_healthy; then
+    printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":true}\n' "$(json_escape "$2")"; return
+  fi
+  local log; log=$(journal_tail_json "$SERVICE" "$start")
+  log "daemon unhealthy with the new config; restoring backup $2"
+  put_config "$CONFIG_BACKUPS_DIR/$2.yaml"
+  systemctl restart "$SERVICE" || true
+  local back=false; wait_fips_healthy && back=true
+  printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"
+}
+
+valid_dropin() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "invalid drop-in name (a-z, 0-9, _ and -, up to 41 characters)"; }
+
+# A drop-in is included inside the `inbound` chain, so it may only hold rule statements: no include/define
+# (which could read other files), no table or chain commands, no `;`, and braces balanced on every line
+# (so it cannot close the chain and act on the rest of the host's ruleset).
+check_dropin_content() {
+  awk '
+    { line = $0; t = line; gsub(/"[^"]*"/, "\"\"", t); sub(/#.*/, "", t); gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == "") next
+      split(t, w, /[ \t]+/); first = tolower(w[1])
+      if (first ~ /^(include|define|redefine|undefine|table|chain|flush|delete|add|create|insert|replace|reset|list|rename|monitor|export|import|describe|flowtable|destroy)$/) { printf "line %d: \"%s\" is not allowed in a drop-in\n", NR, w[1]; bad = 1; next }
+      if (t ~ /[;$]/) { printf "line %d: \";\" and \"$\" are not allowed in a drop-in\n", NR; bad = 1; next }
+      d = 0; for (i = 1; i <= length(t); i++) { ch = substr(t, i, 1); if (ch == "{") d++; else if (ch == "}") { d--; if (d < 0) break } }
+      if (d != 0) { printf "line %d: braces must balance within the line\n", NR; bad = 1 }
+    }
+    END { exit bad }' "$1"
+}
+
+# check_ruleset <dir-with-candidate-dropins>: validate the baseline plus drop-ins without loading anything.
+# Only nft's error summaries are returned (never the echoed source lines).
+check_ruleset() {
+  local t; t=$(mktemp -d); cp -a "$1/." "$t/" 2>/dev/null || true
+  sed "s#include \"$DROPIN_DIR/\*\.nft\"#include \"$t/*.nft\"#" "$FIPS_NFT" > "$t/.baseline"
+  grep -qF "include \"$t/*.nft\"" "$t/.baseline" || { rm -rf "$t"; printf '%s' "$FIPS_NFT does not contain the standard include \"$DROPIN_DIR/*.nft\" line; refusing to validate"; return 1; }
+  local out; out=$(nft -c -f "$t/.baseline" 2>&1); local rc=$?
+  rm -rf "$t"
+  printf '%s' "$out" | grep -E 'Error:' | sed -E "s#^.*/([a-z0-9_-]+\.nft|\.baseline):#\1:#" | head -n 20
+  return $rc
+}
+
+firewall_reload_if_active() {
+  if systemctl is-active --quiet fips-firewall.service; then systemctl reload-or-restart fips-firewall.service && echo true || echo false; else echo false; fi
 }
 
 # ---------------------------------------------------------------- commands
@@ -193,6 +863,7 @@ case "$cmd" in
     ;;
 
   install)
+    take_lock
     stage=${2:-}
     [[ -n "$stage" ]] || die "usage: install <stagedir> [--no-restart]"
     [[ "$stage" == /* ]] || die "stage dir must be an absolute path"
@@ -219,6 +890,7 @@ case "$cmd" in
     ;;
 
   rollback)
+    take_lock
     id=${2:-}
     [[ "$id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || die "invalid backup id"
     dir="$BACKUPS_DIR/$id"
@@ -232,8 +904,107 @@ case "$cmd" in
     ;;
 
   restart)
+    take_lock
     restarted=$(restart_services)
     printf '{"ok":true,"restarted":%s}\n' "$restarted"
+    ;;
+
+  config-show)
+    f="$FIPS_CONFIG"
+    if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; fi
+    [[ -f "$f" ]] || die "$f not found"
+    outf=$(mktemp); errf=$(mktemp); trap 'rm -f "$outf" "$errf"' EXIT
+    # The redactor reads the file once, hashes exactly those bytes and prints "base <sha256>" first, so the
+    # text shown and the hash config-apply --base must match can never come from different versions.
+    if ! redact "$f" >"$outf" 2>"$errf"; then
+      die "cannot show this file safely: $(head -n 8 "$errf" | tr '\n' ';') edit it from a shell"
+    fi
+    cat "$outf"
+    ;;
+
+  config-apply)
+    require_systemd; take_lock
+    restart=true; base=""; shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --no-restart) restart=false ;;
+        --base) [[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] || die "--base needs the sha256 printed by config-show"; base=$2; shift ;;
+        *) die "unknown option $1" ;;
+      esac
+      shift
+    done
+    [[ -n "$base" ]] || die "--base is required (the sha256 printed by config-show)"
+    [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
+    tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
+    read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
+    # The restorer checks --base against the exact bytes it reads, so nothing can change in between.
+    if ! err=$(restore_secrets "$FIPS_CONFIG" "$tmp" "$tmp2" "$base" 2>&1); then die "$(printf '%s' "$err" | head -n 3 | tr '\n' ' ')"; fi
+    grep -q '<redacted #' "$tmp2" && die "a redaction placeholder is still present"
+    if cmp -s "$tmp2" "$FIPS_CONFIG"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
+    id=$(backup_config)
+    install_config_and_restart "$tmp2" "$id" "$restart"
+    ;;
+
+  config-backups)
+    mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+    printf '['; first=true
+    for f in $(ls -1t "$CONFIG_BACKUPS_DIR"/*.yaml 2>/dev/null); do
+      $first || printf ','; first=false
+      printf '{"id":%s,"size":%s,"mtime":%s}' "$(json_escape "$(basename "$f" .yaml)")" "$(wc -c < "$f" | tr -d ' ')" "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")"
+    done
+    printf ']\n'
+    ;;
+
+  config-restore)
+    require_systemd; take_lock
+    valid_id "${2:-}"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"
+    tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; cp -p "$f" "$tmp"
+    id=$(backup_config "$2")
+    install_config_and_restart "$tmp" "$id" true
+    ;;
+
+  firewall-status)
+    require_systemd
+    active=false; systemctl is-active --quiet fips-firewall.service && active=true
+    enabled=$(systemctl is-enabled fips-firewall.service 2>/dev/null || true)
+    ruleset=null; loaded=false
+    if command -v nft >/dev/null 2>&1 && out=$(nft -j list table inet fips 2>/dev/null) && [[ -n "$out" ]]; then ruleset=$out; loaded=true; fi
+    printf '{"ok":true,"unit_active":%s,"unit_enabled":%s,"table_loaded":%s,"ruleset":%s}\n' "$active" "$(json_escape "${enabled:-unknown}")" "$loaded" "$ruleset"
+    ;;
+
+  dropin-apply)
+    require_systemd; take_lock
+    name=${2:-}; valid_dropin "$name"
+    command -v nft >/dev/null 2>&1 || die "nft not found"
+    [[ -f "$FIPS_NFT" ]] || die "$FIPS_NFT not found"
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    read_stdin_limited "$tmp/new" "$MAX_DROPIN_BYTES"
+    if ! err=$(check_dropin_content "$tmp/new"); then printf '{"ok":false,"error":"the drop-in contains statements that are not allowed","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
+    mkdir "$tmp/d"; cp -a "$DROPIN_DIR/." "$tmp/d/" 2>/dev/null || true; cp "$tmp/new" "$tmp/d/$name.nft"
+    if ! err=$(check_ruleset "$tmp/d"); then printf '{"ok":false,"error":"nft rejected the ruleset","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
+    mkdir -p "$DROPIN_DIR"
+    install -m 0644 -o 0 -g 0 "$tmp/new" "$DROPIN_DIR/$name.nft"
+    printf '{"ok":true,"file":%s,"reloaded":%s}\n' "$(json_escape "$DROPIN_DIR/$name.nft")" "$(firewall_reload_if_active)"
+    ;;
+
+  dropin-delete)
+    require_systemd; take_lock
+    name=${2:-}; valid_dropin "$name"
+    [[ -f "$DROPIN_DIR/$name.nft" ]] || die "drop-in $name not found"
+    rm -f -- "$DROPIN_DIR/$name.nft"
+    printf '{"ok":true,"reloaded":%s}\n' "$(firewall_reload_if_active)"
+    ;;
+
+  service)
+    require_systemd; take_lock
+    trap '' INT TERM HUP
+    action=${2:-}; unit=${3:-}
+    case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
+    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
+    systemctl cat "$unit.service" >/dev/null 2>&1 || die "$unit.service is not installed"
+    if [[ "$action" == reload ]]; then systemctl reload-or-restart "$unit.service"; else systemctl "$action" "$unit.service"; fi
+    a=false; systemctl is-active --quiet "$unit.service" && a=true
+    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
     ;;
 
   list-backups)
@@ -250,6 +1021,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>}"
     ;;
 esac

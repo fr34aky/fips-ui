@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Configuration** page: edit `/etc/fips/fips.yaml` with YAML validation,
+  a diff view and backups. Secret values are redacted by the helper and
+  restored on save; applying restarts the daemon, waits for it to stay
+  healthy, and restores the previous file automatically if it does not.
+- **Firewall** page: control `fips-firewall` (enable, start, stop, reload,
+  disable), see the drop counter, manage inbound rules for npubs, hosts-file
+  names, `fd00::/8` prefixes or anyone, allow a filtered listener in one
+  click, and edit other drop-ins. All changes are validated with `nft -c`
+  against the full ruleset before being written.
+- Service buttons work through the helper, without polkit rules.
+- Helper v4 with `config-*`, `firewall-status`, `dropin-*` and `service`
+  verbs. Re-run `deploy/setup-local.sh` to install it.
+
 ## [0.1.3] - 2026-09-26
 
 ### Changed
