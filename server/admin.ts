@@ -208,7 +208,8 @@ export function createAdminHandler(opts: AdminOptions) {
 
   async function serviceAction(unit: string, action: string): Promise<{ ok: boolean; unit: string; active: boolean; enabled: string }> {
     const name = unit.replace(/\.service$/, '');
-    return helperJson(['service', action, name], undefined, 90_000);
+    // A stop or restart can take systemd's full 90 s stop timeout, after up to 10 s waiting for the helper lock.
+    return helperJson(['service', action, name], undefined, 150_000);
   }
 
   async function firewallStatus() {
@@ -255,8 +256,12 @@ export function createAdminHandler(opts: AdminOptions) {
 
       if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
       if (!opts.authorize(req)) { sendJson(res, 403, { error: 'not allowed to change node state' }); return true; }
+      // The lock is taken before the body is read, so an upgrade cannot start in that window.
+      if (pending) { sendJson(res, 409, { error: 'another node-management change is in progress' }); return true; }
       const busy = opts.busy();
       if (busy) { sendJson(res, 409, { error: busy }); return true; }
+      pending = true;
+      try {
       // fips.yaml may be up to 256 KiB, which JSON escaping can roughly double.
       const body = await readJsonBody(req, sub === '/config' ? 1024 * 1024 : undefined);
 
@@ -265,19 +270,19 @@ export function createAdminHandler(opts: AdminOptions) {
         if (typeof yaml !== 'string' || !yaml.trim()) throw new BodyError(400, 'yaml (non-empty string) required');
         if (Buffer.byteLength(yaml) > 256 * 1024) throw new BodyError(400, 'configuration larger than 256 KiB');
         if (body.restart !== undefined && typeof body.restart !== 'boolean') throw new BodyError(400, 'restart must be a boolean');
-        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : [])], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT));
+        const result = await (helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : [])], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/config/restore') {
         const id = body.id;
         if (typeof id !== 'string' || !/^[0-9]{8}-[0-9]{6}(-[0-9]+)?$/.test(id)) throw new BodyError(400, 'id (backup id string) required');
-        const result = await exclusive(() => helperJson<Record<string, unknown>>(['config-restore', id], undefined, HELPER_RESTART_TIMEOUT));
+        const result = await (helperJson<Record<string, unknown>>(['config-restore', id], undefined, HELPER_RESTART_TIMEOUT));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/firewall/rules') {
         if (!Array.isArray(body.rules)) throw new BodyError(400, 'rules (array) required');
         const rules = body.rules.map(validateRule);
-        const result = await exclusive(async () => rules.length === 0
+        const result = await (rules.length === 0
           ? (existsSync(join(DROPIN_DIR, `${MANAGED_DROPIN}.nft`)) ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false })
           : helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(rules)));
         sendJson(res, result.ok ? 200 : 422, result); return true;
@@ -287,20 +292,21 @@ export function createAdminHandler(opts: AdminOptions) {
         if (typeof name !== 'string' || !DROPIN_RE.test(name)) throw new BodyError(400, 'name must match [a-z0-9][a-z0-9_-]{0,40}');
         if (name === MANAGED_DROPIN) throw new BodyError(400, `${MANAGED_DROPIN}.nft is managed through the rules editor`);
         if (typeof content !== 'string' || !content.trim()) throw new BodyError(400, 'content (non-empty string) required');
-        const result = await exclusive(() => helperJson<Record<string, unknown>>(['dropin-apply', name], content.endsWith('\n') ? content : content + '\n'));
+        const result = await (helperJson<Record<string, unknown>>(['dropin-apply', name], content.endsWith('\n') ? content : content + '\n'));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/firewall/dropin/delete') {
         const name = body.name;
         if (typeof name !== 'string' || !DROPIN_RE.test(name)) throw new BodyError(400, 'invalid drop-in name');
-        sendJson(res, 200, await exclusive(() => helperJson<Record<string, unknown>>(['dropin-delete', name]))); return true;
+        sendJson(res, 200, await (helperJson<Record<string, unknown>>(['dropin-delete', name]))); return true;
       }
       if (sub === '/service') {
         const { unit, action } = body as { unit?: unknown; action?: unknown };
         if (typeof unit !== 'string' || !/^(fips|fips-firewall|fips-dns|fips-gateway)(\.service)?$/.test(unit)) throw new BodyError(400, 'unit must be fips, fips-firewall, fips-dns or fips-gateway');
         if (typeof action !== 'string' || !['start', 'stop', 'restart', 'reload', 'enable', 'disable'].includes(action)) throw new BodyError(400, 'invalid action');
-        sendJson(res, 200, await exclusive(() => serviceAction(unit, action))); return true;
+        sendJson(res, 200, await (serviceAction(unit, action))); return true;
       }
+      } finally { pending = false; }
       sendJson(res, 404, { error: 'not found' }); return true;
     } catch (e) {
       if (e instanceof BodyError) sendJson(res, e.status, { error: e.message }, e.status === 413);

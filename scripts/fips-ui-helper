@@ -116,13 +116,14 @@ svc_active() {
     *) return 1 ;;
   esac
 }
+# 9>&- : a daemon started by the service manager must not inherit the helper lock.
 svc_restart() {
   case "$SM" in
-    systemd) systemctl restart "$1" ;;
-    launchd) launchctl kickstart -k "system/$1" ;;
-    rc)      service "$1" restart ;;
-    openrc)  rc-service "$1" restart ;;
-    sysv)    "/etc/init.d/$1" restart ;;
+    systemd) systemctl restart "$1" 9>&- ;;
+    launchd) launchctl kickstart -k "system/$1" 9>&- ;;
+    rc)      service "$1" restart 9>&- ;;
+    openrc)  rc-service "$1" restart 9>&- ;;
+    sysv)    "/etc/init.d/$1" restart 9>&- ;;
     *) return 1 ;;
   esac
 }
@@ -188,8 +189,8 @@ install_binaries() {
 install_package() {
   local pkg=$1
   case "$OS" in
-    Darwin)  log "installer -pkg $pkg -target /"; installer -pkg "$pkg" -target / ;;
-    FreeBSD) log "pkg add -f $pkg"; pkg add -f "$pkg" ;;
+    Darwin)  log "installer -pkg $pkg -target /"; installer -pkg "$pkg" -target / 9>&- ;;
+    FreeBSD) log "pkg add -f $pkg"; pkg add -f "$pkg" 9>&- ;;
     *) die "package artifacts are not supported on $OS" ;;
   esac
 }
@@ -219,84 +220,120 @@ take_lock() {
   flock -w 10 9 || die "another privileged operation is in progress"
 }
 
-# Secret redaction, as one awk program with two modes. Both modes walk YAML lines keeping a stack of
-# (indent, text) so every line knows its parent: the nearest earlier content line with less indentation.
+# Secret redaction, as one awk program with two modes. Every secret becomes one quoted placeholder,
+# `"<redacted #N>"`, written exactly where its value was: the key, a list item's dash and every sibling
+# stay visible and editable, and the YAML keeps its structure. A secret's value may be a plain or quoted
+# scalar (also spanning lines, or on the line after its key), a block scalar (| >), or a flow collection;
+# a flow collection that contains a secret key anywhere is hidden as a whole. Lines are tracked with a
+# stack of (indent, text) so every line knows its parent, compared in redacted form (so errors can never
+# echo a secret).
 #
-#   redact:  secret scalar values become "<redacted #N>"; a secret line that is a block scalar (| >), a flow
-#            collection, or carries an anchor/tag/alias, and any line with a secret key inside a flow mapping,
-#            becomes the comment "# <redacted #N>" (block scalar continuation lines are dropped with it).
-#   restore: (original, new) every placeholder #N in the new file must sit under the same key and the same
-#            parent line as #N in the original, and be used once; it is replaced by the original text.
-#            Deleting an entry drops its secret; moving or re-parenting a placeholder is refused.
+#   redact:  print the file with placeholders.
+#   restore: (original, new) each placeholder #N in the new file must sit under the same key and the same
+#            parent line as #N in the original and be used once; it is replaced by the original text.
+#            Deleting an entry drops its secret; moving, copying or re-parenting a placeholder is refused.
 SECRETS_AWK='
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 function indent(s,   i) { i = match(s, /[^ ]/); return i ? i - 1 : length(s) }
 function body(s,   b) { b = s; sub(/^[ \t]*(-[ \t]+)?/, "", b); return b }
-function keyof(s,   b, c, k) { b = body(s); c = index(b, ":"); if (c < 2) return ""; k = substr(b, 1, c - 1); gsub(/^["\047]|["\047]$/, "", k); return tolower(k) }
-function valof(s,   b) { b = body(s); return trim(substr(b, index(b, ":") + 1)) }
+function prefix(s) { return substr(s, 1, length(s) - length(body(s))) }
+function dashed(s) { return s ~ /^[ \t]*-([ \t]|$)/ }
+function blank_or_comment(s) { return s ~ /^[ \t]*(#.*)?$/ }
+# Remove quoted strings and comments, so brackets and keys inside them do not count.
+function code(s,   t) { t = s; gsub(/"([^"\\]|\\.)*"/, "\"\"", t); gsub(/\047[^\047]*\047/, "\047\047", t); sub(/(^|[ \t])#.*$/, "", t); return t }
+function depth(s,   t, o, c) { t = code(s); o = gsub(/[{[]/, "", t); t = code(s); c = gsub(/[]}]/, "", t); return o - c }
+# keyinfo(line): is it "key: ..."? Sets K_TEXT (key as written), K_NAME (normalised), K_END (colon index in body).
+function keyinfo(s,   b, e, c, rest) {
+  K_TEXT = ""; K_NAME = ""; K_END = 0; b = body(s)
+  if (b ~ /^"/) { e = index(substr(b, 2), "\""); if (!e) return 0; K_TEXT = substr(b, 1, e + 1); rest = substr(b, e + 2) }
+  else if (b ~ /^\047/) { e = index(substr(b, 2), "\047"); if (!e) return 0; K_TEXT = substr(b, 1, e + 1); rest = substr(b, e + 2) }
+  else { c = match(b, /:([ \t]|$)/); if (!c) return 0; K_TEXT = substr(b, 1, c - 1); rest = substr(b, c); if (K_TEXT ~ /[][{},#"\047]/) return 0 }
+  if (rest !~ /^[ \t]*:([ \t]|$)/) return 0
+  K_END = length(b) - length(rest) + index(rest, ":")
+  K_NAME = trim(K_TEXT); gsub(/^["\047]|["\047]$/, "", K_NAME); K_NAME = tolower(trim(K_NAME))
+  return 1
+}
+function valueof(s) { return trim(substr(body(s), K_END + 1)) }
 function secretkey(k) { return k ~ ("^(" KEYS ")$") }
-function flowsecret(s) { return tolower(s) ~ ("[{,][ \t]*[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") }
-function depth(s,   t, o, c) { t = s; o = gsub(/[{[]/, "", t); t = s; c = gsub(/[]}]/, "", t); return o - c }
+function flowsecret(s,   t) { t = tolower(s); sub(/(^|[ \t])#.*$/, "", t); return t ~ ("[{,][ \t]*[\"\047]?(" KEYS ")[\"\047]?[ \t]*:") }
 function parentof(ind) { while (sp > 0 && pind[sp] >= ind) sp--; return sp > 0 ? ptext[sp] : "" }
-function push(ind, s) { sp++; pind[sp] = ind; ptext[sp] = trim(s) }
-function spaces(n,   r) { r = ""; while (n-- > 0) r = r " "; return r }
-# walk(line) classifies one line; sets W_KIND ("skip" swallowed, "plain", "scalar", "line"), W_KEY, W_PARENT, W_IND
-function walk(s,   ind, k, v) {
-  if (swallow_ind >= 0) { if (s ~ /^[ \t]*$/ || indent(s) > swallow_ind) { W_KIND = "skip"; return } swallow_ind = -1 }
-  if (flow_depth > 0) { flow_depth += depth(s); W_KIND = "skip"; return }
-  if (s ~ /^[ \t]*(#.*)?$/) { W_KIND = "plain"; return }
-  ind = indent(s); W_IND = ind; W_PARENT = parentof(ind); k = keyof(s); W_KEY = k
-  if (secretkey(k) || flowsecret(s)) {
-    v = valof(s)
-    if (flowsecret(s) || v ~ /^[|>{\[&!*]/) {
-      W_KIND = "line"
-      if (v ~ /^[|>]/) swallow_ind = ind
-      d = depth(s); if (d > 0) flow_depth = d
-      return
+function push(ind, t) { sp++; pind[sp] = ind; ptext[sp] = t }
+function ph(id) { return "\"<redacted #" id ">\"" }
+function canonical(dash, ktext, id) { return (dash ? "- " : "") (ktext != "" ? trim(ktext) ": " : "") ph(id) }
+function unquoted_open(v, q,   t, n) { t = v; if (q == "\"") { gsub(/\\./, "", t); n = gsub(/"/, "", t) } else { gsub(/\047\047/, "", t); n = gsub(/\047/, "", t) } return n % 2 == 1 }
+
+# Output hooks: redact prints; the first pass of restore records.
+function out_plain(s) { if (MODE == "redact") print s }
+function unit_start(s, keyed, par,   ind, id) {
+  n++; ind = indent(s)
+  if (MODE == "redact") print prefix(s) (keyed ? K_TEXT ": " : "") ph(n)
+  else { okey[n] = keyed ? K_NAME : ""; oparent[n] = par; otext[n] = s }
+  push(ind, canonical(dashed(s), keyed ? K_TEXT : "", n))
+}
+function unit_more(s) { if (MODE != "redact") otext[n] = otext[n] "\n" s }
+
+# The walker (redact mode and the first pass of restore).
+function walk(s,   ind, keyed, v, k, par) {
+  if (cont == "block" || cont == "plain") { if (s ~ /^[ \t]*$/ || indent(s) > cont_ind) { unit_more(s); return } cont = "" }
+  else if (cont == "flow") { unit_more(s); fdepth += depth(s); if (fdepth <= 0) cont = ""; return }
+  else if (cont == "dq" || cont == "sq") { unit_more(s); if (unquoted_open(s, cont == "dq" ? "\"" : "\047")) cont = ""; return }
+  if (hold != "") {
+    if (s ~ /^[ \t]*$/) { holdblank = holdblank s "\n"; return }
+    if (!blank_or_comment(s) && indent(s) > hold_keycol && !keyinfo(s) && !dashed(s)) {
+      keyinfo(hold); unit_start(hold, 1, hold_par)
+      n2 = split(holdblank, hb, "\n"); for (i = 1; i < n2; i++) unit_more(hb[i])
+      unit_more(s); cont = "plain"; cont_ind = hold_keycol; hold = ""; holdblank = ""; return
     }
-    if (v != "" && v !~ /^#/) { W_KIND = "scalar"; return }
+    flush_hold()
   }
-  push(ind, s); W_KIND = "plain"
+  if (blank_or_comment(s)) { out_plain(s); return }
+  ind = indent(s); par = parentof(ind); keyed = keyinfo(s)
+  k = keyed ? K_NAME : ""
+  if (keyed && secretkey(k)) {
+    v = valueof(s)
+    if (v == "" || v ~ /^#/) { hold = s; hold_par = par; hold_keycol = length(prefix(s)); return }
+    unit_start(s, 1, par)
+    if (v ~ /^[|>]/) { cont = "block"; cont_ind = length(prefix(s)) }
+    else if (depth(s) > 0) { cont = "flow"; fdepth = depth(s) }
+    else if (v ~ /^"/ && unquoted_open(v, "\"")) cont = "dq"
+    else if (v ~ /^\047/ && unquoted_open(v, "\047")) cont = "sq"
+    return
+  }
+  if (flowsecret(s) && (keyed ? valueof(s) : body(s)) ~ /^[{[]/) {
+    unit_start(s, keyed, par)
+    if (depth(s) > 0) { cont = "flow"; fdepth = depth(s) }
+    return
+  }
+  push(ind, trim(s)); out_plain(s)
 }
-BEGIN { sp = 0; swallow_ind = -1; flow_depth = 0; n = 0 }
-MODE == "redact" {
-  walk($0)
-  if (W_KIND == "skip") next
-  if (W_KIND == "line") { n++; print spaces(W_IND) "# <redacted #" n ">"; next }
-  if (W_KIND == "scalar") { n++; b = body($0); print substr($0, 1, length($0) - length(b)) substr(b, 1, index(b, ":")) " \"<redacted #" n ">\""; next }
-  print; next
+function flush_hold(   n2, i, hb) {
+  if (hold == "") return
+  sp_hold = indent(hold); push(sp_hold, trim(hold)); out_plain(hold)
+  n2 = split(holdblank, hb, "\n"); for (i = 1; i < n2; i++) out_plain(hb[i])
+  hold = ""; holdblank = ""
 }
-MODE == "restore" && FNR == NR {
-  walk($0)
-  if (W_KIND == "skip") { otext[n] = otext[n] "\n" $0; next }
-  if (W_KIND == "line" || W_KIND == "scalar") { n++; okind[n] = W_KIND; okey[n] = W_KEY; oparent[n] = W_PARENT; oind[n] = W_IND; otext[n] = $0
-    b = body($0); oval[n] = substr(b, index(b, ":") + 1) }
-  next
-}
-MODE == "restore" && FNR == 1 { sp = 0; swallow_ind = -1; flow_depth = 0 }
+function reset() { sp = 0; cont = ""; hold = ""; holdblank = "" }
+
+BEGIN { reset(); n = 0 }
+MODE == "redact" { walk($0); next }
+MODE == "restore" && FILENAME == ARGV[1] { walk($0); next }
+MODE == "restore" && !second { flush_hold(); reset(); second = 1 }
 MODE == "restore" {
-  if ($0 ~ /^[ \t]*# <redacted #[0-9]+>[ \t]*$/) {
-    id = $0; gsub(/[^0-9]/, "", id); ind = indent($0); par = parentof(ind)
-    if (!(id in okind) || okind[id] != "line") { printf "placeholder #%s does not exist\n", id > "/dev/stderr"; bad = 1; next }
-    if (used[id]++) { printf "placeholder #%s is used twice\n", id > "/dev/stderr"; bad = 1; next }
-    if (par != oparent[id] || ind != oind[id]) { printf "redacted secret #%s was moved or its parent line (%s) changed; put it back where it was\n", id, oparent[id] > "/dev/stderr"; bad = 1; next }
-    print otext[id]; next
-  }
   if ($0 ~ /"<redacted #[0-9]+>"/) {
-    id = $0; sub(/.*"<redacted #/, "", id); sub(/>".*/, "", id)
-    if (trim(valof($0)) != "\"<redacted #" id ">\"") { printf "placeholder #%s must be the whole value of its key\n", id > "/dev/stderr"; bad = 1; next }
-    ind = indent($0); par = parentof(ind); k = keyof($0)
-    if (!(id in okind) || okind[id] != "scalar") { printf "placeholder #%s does not exist\n", id > "/dev/stderr"; bad = 1; next }
-    if (used[id]++) { printf "placeholder #%s is used twice\n", id > "/dev/stderr"; bad = 1; next }
-    if (k != okey[id] || par != oparent[id]) { printf "redacted secret #%s (%s) was moved or its parent line (%s) changed; put it back where it was\n", id, okey[id], oparent[id] > "/dev/stderr"; bad = 1; next }
-    b = body($0); print substr($0, 1, length($0) - length(b)) substr(b, 1, index(b, ":") - 1) ":" oval[id]
-    push(ind, $0); next
+    match($0, /"<redacted #[0-9]+>"/); id = substr($0, RSTART + 12, RLENGTH - 14)
+    ind = indent($0); par = parentof(ind)
+    if (keyinfo($0)) { key = K_NAME; ktext = K_TEXT; form = valueof($0) == ph(id) } else { key = ""; ktext = ""; form = trim(body($0)) == ph(id) }
+    if (!form) { printf "line %d: placeholder #%s must be the whole value\n", FNR, id > "/dev/stderr"; bad = 1; next }
+    if (!(id in otext)) { printf "line %d: placeholder #%s does not exist\n", FNR, id > "/dev/stderr"; bad = 1; next }
+    if (used[id]++) { printf "line %d: placeholder #%s is used twice\n", FNR, id > "/dev/stderr"; bad = 1; next }
+    if (key != okey[id] || par != oparent[id]) { printf "line %d: redacted secret #%s (%s) was moved or its parent line (%s) changed; put it back where it was\n", FNR, id, okey[id] == "" ? "flow value" : okey[id], oparent[id] == "" ? "top level" : oparent[id] > "/dev/stderr"; bad = 1; next }
+    print otext[id]; push(ind, canonical(dashed($0), ktext, id)); next
   }
   if ($0 ~ /<redacted/) { printf "line %d mentions a redaction placeholder in an unexpected form\n", FNR > "/dev/stderr"; bad = 1; next }
-  if ($0 !~ /^[ \t]*(#.*)?$/) push(indent($0), $0)
+  if (!blank_or_comment($0)) push(indent($0), trim($0))
   print
 }
-END { exit bad }
+END { if (MODE == "redact") flush_hold(); exit bad }
 '
 redact() { awk -v MODE=redact -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1"; }
 restore_secrets() { awk -v MODE=restore -v KEYS="$SECRET_KEYS" "$SECRETS_AWK" "$1" "$2" > "$3"; }
@@ -313,13 +350,21 @@ journal_tail_json() { # <unit> <since-epoch>
   json_escape "$out"
 }
 
-fipsctl_bin() { [[ -x "$BIN_DIR/fipsctl" ]] && echo "$BIN_DIR/fipsctl" || echo fipsctl; }
+# The fixed default bin dir, not BIN_DIR: FIPS_BIN_DIR is forwarded from the caller by sudo.
+fipsctl_bin() { local d=${FIPS_TEST_FIPSCTL_DIR:-$BIN_DIR_DEFAULT}; [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]] || d=$BIN_DIR_DEFAULT; [[ -x "$d/fipsctl" ]] && echo "$d/fipsctl" || echo fipsctl; }
 
 # Healthy = the unit stays active without systemd restarting it, and the control socket (at the path the new
 # config sets, if any) answers, for 8 consecutive seconds within a 45 s budget.
 wait_fips_healthy() {
   local deadline=$(( $(date +%s) + 45 )) ok=0 restarts sock args=()
-  sock=$(awk '/^[ \t]*socket_path[ \t]*:/ { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$FIPS_CONFIG" 2>/dev/null || true)
+  # node.control.socket_path only (other sections, such as native_api, have their own socket_path).
+  sock=$(awk '
+    function ind(s) { match(s, /[^ ]/); return RSTART - 1 }
+    /^[ \t]*(#.*)?$/ { next }
+    { i = ind($0); while (sp > 0 && st[sp] >= i) sp--; k = $0; sub(/^[ \t]*/, "", k); sub(/[ \t]*:.*/, "", k)
+      path = ""; for (j = 1; j <= sp; j++) path = path nm[j] "."; path = path k
+      if (path == "node.control.socket_path") { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); gsub(/^["\047]|["\047]$/, "", v); print v; exit }
+      sp++; st[sp] = i; nm[sp] = k }' "$FIPS_CONFIG" 2>/dev/null || true)
   [[ -n "$sock" && "$sock" == /* ]] && args=(-s "$sock")
   sleep 3
   restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
@@ -531,6 +576,7 @@ case "$cmd" in
 
   service)
     require_systemd; take_lock
+    trap '' INT TERM HUP
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
     case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
