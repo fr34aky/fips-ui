@@ -146,12 +146,12 @@ export function Listening({ snap }: { snap: Snapshot }) {
 
 export function Services({ units, health, now }: { units: UnitState[]; health: Health | null; now: number }) {
   const toast = useToast();
-  const [confirm, setConfirm] = useState<{ unit: string; action: 'restart' | 'start' | 'stop' } | null>(null);
+  const [confirm, setConfirm] = useState<{ id: string; unit: string; action: 'restart' | 'start' | 'stop' } | null>(null);
   const [busy, setBusy] = useState(false);
   const run = async () => {
     if (!confirm) return;
     setBusy(true);
-    try { await api.post(`/api/service/${confirm.unit}/${confirm.action}`); toast('ok', `${confirm.action} ${confirm.unit} succeeded`); setConfirm(null); }
+    try { await api.post(`/api/service/${confirm.id}/${confirm.action}`); toast('ok', `${confirm.action} ${confirm.id} succeeded`); setConfirm(null); }
     catch (e) { toast('err', (e as Error).message); }
     finally { setBusy(false); }
   };
@@ -162,15 +162,15 @@ export function Services({ units, health, now }: { units: UnitState[]; health: H
         const tone = u.active === 'active' ? (u.sub === 'running' || u.sub === 'exited' ? 'good' : 'warn') : u.active === 'failed' ? 'crit' : u.unitFileState === 'disabled' || u.unitFileState === 'static' ? 'neutral' : 'serious';
         return (
           <div key={u.unit} className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 bg-surface-2">
-            <div className="min-w-0"><div className="text-sm font-medium truncate">{u.unit.replace('.service', '')}</div><div className="text-[11px] text-ink-3 truncate">{u.active === 'active' && u.since ? `since ${fmtAgo(u.since, now)}` : u.description}{u.memoryBytes ? ` · ${fmtBytes(u.memoryBytes)}` : ''}{u.restarts ? ` · ${u.restarts} restart${u.restarts === 1 ? '' : 's'}` : ''}</div></div>
+            <div className="min-w-0"><div className="text-sm font-medium truncate">{u.id}</div><div className="text-[11px] text-ink-3 truncate">{u.active === 'active' && u.since ? `since ${fmtAgo(u.since, now)}` : u.description}{u.memoryBytes ? ` · ${fmtBytes(u.memoryBytes)}` : ''}{u.restarts ? ` · ${u.restarts} restart${u.restarts === 1 ? '' : 's'}` : ''}</div></div>
             <div className="flex items-center gap-1.5 shrink-0">
               <Chip tone={tone}>{u.active}{u.sub && u.sub !== u.active ? ` · ${u.sub}` : ''}</Chip>
-              {health?.serviceControl && <button className="btn ghost icon sm" title={u.active === 'active' ? `Restart ${u.unit}` : `Start ${u.unit}`} onClick={() => setConfirm({ unit: u.unit, action: u.active === 'active' ? 'restart' : 'start' })}><RotateCw size={14} /></button>}
+              {health?.serviceControl && <button className="btn ghost icon sm" title={u.active === 'active' ? `Restart ${u.unit}` : `Start ${u.unit}`} onClick={() => setConfirm({ id: u.id, unit: u.unit, action: u.active === 'active' ? 'restart' : 'start' })}><RotateCw size={14} /></button>}
             </div>
           </div>
         );
       })}
-      <ConfirmDialog open={!!confirm} onClose={() => setConfirm(null)} onConfirm={run} busy={busy} danger title={`${confirm?.action} ${confirm?.unit}?`} body={confirm?.unit === 'fips.service' && confirm.action !== 'start' ? 'Restarting the daemon drops every peer link and session. Peers reconnect automatically, but traffic over the mesh will pause for a few seconds.' : `systemctl ${confirm?.action} ${confirm?.unit} will run on this host.`} confirmLabel={confirm?.action ?? 'Confirm'} />
+      <ConfirmDialog open={!!confirm} onClose={() => setConfirm(null)} onConfirm={run} busy={busy} danger title={`${confirm?.action} ${confirm?.id}?`} body={confirm?.id === 'fips' && confirm.action !== 'start' ? 'Restarting the daemon drops every peer link and session. Peers reconnect automatically, but traffic over the mesh will pause for a few seconds.' : `The service manager will ${confirm?.action} ${confirm?.unit} on this host.`} confirmLabel={confirm?.action ?? 'Confirm'} />
     </div>
   );
 }

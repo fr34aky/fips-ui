@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
-import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH } from './control.ts';
-import { journal, recentLogs, type LogLine } from './journal.ts';
-import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
+import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
+import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
+import { unitStates, serviceAction, readHosts, hostInfo, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, type FirewallRule } from './admin.ts';
@@ -171,7 +171,7 @@ async function pollOnce(): Promise<Snapshot> {
       settle(query('show_connections'), 'connections', errors),
       slow ? settle(query('show_listening_sockets'), 'listening', errors) : Promise.resolve(lastSnapshot?.listening),
       slow ? settle(unitStates(), 'units', errors) : Promise.resolve(lastSnapshot?.units),
-      slow && fs.existsSync(GATEWAY_SOCKET_PATH)
+      slow && endpointExists(GATEWAY_SOCKET_PATH)
         ? settle(Promise.all([query('show_gateway', undefined, { socketPath: GATEWAY_SOCKET_PATH }), query('show_mappings', undefined, { socketPath: GATEWAY_SOCKET_PATH })]).then(([g, m]) => ({ ...(g as object), ...(m as object) })), 'gateway', errors)
         : Promise.resolve(slow ? null : lastSnapshot?.gateway),
     ]);
@@ -263,7 +263,8 @@ const admin = createAdminHandler({
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   if (READ_ONLY) return null;
-  if ((await admin.helperInfo()).managementCapable) return 'helper';
+  // The helper drives systemd; other service managers use the direct path.
+  if (PLATFORM.serviceManager === 'systemd' && (await admin.helperInfo()).managementCapable) return 'helper';
   return ALLOW_SERVICE_CONTROL ? 'direct' : null;
 }
 
@@ -286,7 +287,7 @@ async function route(req: Req, res: Res) {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
     const pr = principalOf(req);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, platform: PLATFORM, logSource: LOG_SOURCE, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -382,13 +383,14 @@ async function route(req: Req, res: Res) {
   const probeCancel = /^\/api\/probe\/(\d+)\/cancel$/.exec(p);
   if (probeCancel) return json(res, 200, await query('probe_cancel', { probe_id: Number(probeCancel[1]) }));
 
-  const svc = /^\/api\/service\/([a-z-]+\.service)\/(start|stop|restart|reload)$/.exec(p);
+  // /api/service/<id>/<action>; <id> is fips, fips-dns, fips-firewall or fips-gateway (a trailing .service is accepted).
+  const svc = /^\/api\/service\/([a-z-]+?)(?:\.service)?\/(start|stop|restart|reload)$/.exec(p);
   if (svc) {
     const mode = await serviceControlMode();
-    if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v4+, installed by deploy/setup-local.sh) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
-    if (!(UNITS as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown unit');
-    if (mode === 'helper') await admin.serviceAction(svc[1], svc[2]);
-    else { const r = await serviceAction(svc[1] as UnitName, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }
+    if (!mode) throw new HttpError(403, 'service control needs the privileged helper (v4+, installed by deploy/setup-local.sh; Linux with systemd) or FIPS_UI_ALLOW_SERVICE_CONTROL=1');
+    if (!(SERVICES as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown service');
+    if (mode === 'helper') await admin.serviceAction(`${svc[1]}.service`, svc[2]);
+    else { const r = await serviceAction(svc[1] as ServiceId, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }
     return json(res, 200, { ok: true, units: await unitStates() });
   }
 
@@ -604,6 +606,7 @@ void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() 
 server.listen(PORT, HOST, () => {
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
+  console.log(`  platform       : ${PLATFORM.os}${PLATFORM.distro ? ` (${PLATFORM.distro})` : ''}, services via ${PLATFORM.serviceManager}, logs via ${LOG_SOURCE ?? 'none'}`);
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));

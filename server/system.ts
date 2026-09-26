@@ -1,94 +1,15 @@
-// systemd unit state, /etc/fips/hosts parsing, and service actions.
-import { execFile } from 'node:child_process';
+// /etc/fips/hosts parsing and host facts; service state and actions live in server/platform.ts.
 import fs from 'node:fs/promises';
 import os from 'node:os';
-import { promisify } from 'node:util';
+import { existsSync } from 'node:fs';
+import { PLATFORM as P } from './platform.ts';
 
-const execFileP = promisify(execFile);
 
-export const UNITS = ['fips.service', 'fips-dns.service', 'fips-firewall.service', 'fips-gateway.service'] as const;
-export type UnitName = (typeof UNITS)[number];
-
-export interface UnitState {
-  unit: string;
-  loaded: boolean;
-  active: string;      // active | inactive | failed | activating ...
-  sub: string;         // running | exited | dead ...
-  description: string;
-  since?: number;      // epoch ms of ExecMainStartTimestamp / ActiveEnterTimestamp
-  mainPid?: number;
-  memoryBytes?: number;
-  cpuUsageNs?: number;
-  restarts?: number;
-  unitFileState?: string;
-}
-
-// Timestamps: `--timestamp=unix` (systemd >= 250) yields `@<epoch-seconds>`; older systemd ignores the flag and
-// prints a localized string that does not parse, so the monotonic variants are read as a fallback and converted
-// with CLOCK_MONOTONIC (process.hrtime on Linux), which like systemd's clock excludes suspend.
-const PROPS = ['LoadState', 'ActiveState', 'SubState', 'Description', 'ActiveEnterTimestamp', 'ExecMainStartTimestamp', 'ActiveEnterTimestampMonotonic', 'ExecMainStartTimestampMonotonic', 'MainPID', 'MemoryCurrent', 'CPUUsageNSec', 'NRestarts', 'UnitFileState'];
-
-// systemd < 251 rejects `--timestamp=unix` with exit 1, so the flag is tried once and dropped if refused.
-let unixTimestamps: boolean | null = null;
-async function systemctlShow(): Promise<string> {
-  const base = ['show', ...UNITS, '-p', PROPS.join(','), '--no-pager'];
-  if (unixTimestamps !== false) {
-    try { const { stdout } = await execFileP('systemctl', [...base, '--timestamp=unix']); unixTimestamps = true; return stdout; }
-    catch (e) { if (unixTimestamps === true) throw e; unixTimestamps = false; }
-  }
-  return (await execFileP('systemctl', base)).stdout;
-}
-
-export async function unitStates(): Promise<UnitState[]> {
-  try {
-    const stdout = await systemctlShow();
-    const bootEpochMs = Date.now() - Number(process.hrtime.bigint() / 1_000_000n);
-    // Output is blank-line separated blocks, one per unit, in request order.
-    const blocks = stdout.trim().split(/\n\s*\n/);
-    return blocks.map((block, i) => {
-      const kv: Record<string, string> = {};
-      for (const line of block.split('\n')) {
-        const eq = line.indexOf('=');
-        if (eq > 0) kv[line.slice(0, eq)] = line.slice(eq + 1);
-      }
-      const num = (s?: string) => (s && s !== '[not set]' && !Number.isNaN(Number(s)) ? Number(s) : undefined);
-      const unix = /^@(\d+)/.exec(kv.ExecMainStartTimestamp || kv.ActiveEnterTimestamp || '');
-      const monoUs = num(kv.ExecMainStartTimestampMonotonic) || num(kv.ActiveEnterTimestampMonotonic);
-      const sinceMs = unix ? Number(unix[1]) * 1000 : monoUs ? bootEpochMs + monoUs / 1000 : NaN;
-      return {
-        unit: UNITS[i] ?? `unit-${i}`,
-        loaded: kv.LoadState === 'loaded',
-        active: kv.ActiveState ?? 'unknown',
-        sub: kv.SubState ?? 'unknown',
-        description: kv.Description ?? '',
-        since: Number.isNaN(sinceMs) ? undefined : sinceMs,
-        mainPid: num(kv.MainPID) || undefined,
-        memoryBytes: num(kv.MemoryCurrent),
-        cpuUsageNs: num(kv.CPUUsageNSec),
-        restarts: num(kv.NRestarts),
-        unitFileState: kv.UnitFileState,
-      };
-    });
-  } catch {
-    return [];
-  }
-}
-
-export type ServiceAction = 'start' | 'stop' | 'restart' | 'reload';
-
-export async function serviceAction(unit: UnitName, action: ServiceAction): Promise<{ ok: true } | { ok: false; error: string }> {
-  try {
-    await execFileP('systemctl', [action, unit], { timeout: 30000 });
-    return { ok: true };
-  } catch (e) {
-    const err = e as { stderr?: string; message?: string };
-    return { ok: false, error: (err.stderr || err.message || 'systemctl failed').trim() };
-  }
-}
+export { unitStates, serviceAction, unitName, PLATFORM, SERVICES, type UnitState, type ServiceAction, type ServiceId } from './platform.ts';
 
 export interface HostEntry { hostname: string; npub: string; comment?: string }
 
-const HOSTS_PATH = process.env.FIPS_HOSTS ?? '/etc/fips/hosts';
+const HOSTS_PATH = process.env.FIPS_HOSTS ?? (os.platform() === 'win32' ? `${process.env.ProgramData ?? 'C:\\ProgramData'}\\fips\\hosts` : os.platform() === 'darwin' || os.platform() === 'freebsd' ? (existsSync('/usr/local/etc/fips/hosts') ? '/usr/local/etc/fips/hosts' : '/etc/fips/hosts') : '/etc/fips/hosts');
 
 export async function readHosts(): Promise<{ path: string; entries: HostEntry[]; raw: string | null; error?: string }> {
   try {
@@ -109,5 +30,5 @@ export async function readHosts(): Promise<{ path: string; entries: HostEntry[];
 }
 
 export async function hostInfo() {
-  return { hostname: os.hostname(), platform: os.platform(), release: os.release(), uptimeSecs: os.uptime(), loadavg: os.loadavg(), totalMem: os.totalmem(), freeMem: os.freemem() };
+  return { hostname: os.hostname(), platform: os.platform(), os: P.os, distro: P.distro, serviceManager: P.serviceManager, release: os.release(), uptimeSecs: os.uptime(), loadavg: os.loadavg(), totalMem: os.totalmem(), freeMem: os.freemem() };
 }

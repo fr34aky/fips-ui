@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   npubs. Managed on the Access page; see `docs/mesh-access.md`.
 - Helper v5 (`mesh-guard`) on top of v4's `config-*`, `firewall-status`, `dropin-*` and `service`
   verbs. Re-run `deploy/setup-local.sh` to install it.
+- Multi-OS support for the dashboard: service state, service actions and the
+  Logs page now work with systemd, OpenRC, OpenWrt's procd, macOS launchd,
+  FreeBSD rc.d and the Windows Service Control Manager, reading logs from
+  journald, logread, the macOS unified log or the daemon's log file. The
+  control endpoint may be a TCP port (Windows' default `21210`) or
+  `host:port` as well as a Unix socket. The detected platform is shown at
+  startup and in `/api/health`. New settings: `FIPS_UI_SERVICE_MANAGER`,
+  `FIPS_UI_SERVICE_<NAME>`, `FIPS_UI_LOG_FILE`.
+
+### Changed
+
+- `/api/service/<name>/<action>` takes the portable service id (`fips`,
+  `fips-gateway`, …); the old `fips.service` form is still accepted.
 
 ## [0.1.3] - 2026-09-26
 
