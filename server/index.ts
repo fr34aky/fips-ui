@@ -270,9 +270,11 @@ async function route(req: Req, res: Res) {
   if (p === '/api/events') return handleSse(req, res);
   if (p.startsWith('/api/upgrade')) {
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
-    // Counted before any await, so a node-management change cannot start while this request reads its body.
-    if (method === 'POST') upgradeStarting++;
-    try { if (await upgrade(req, res)) return; } finally { if (method === 'POST') upgradeStarting--; }
+    // Requests that start an upgrade or rollback are counted before any await, so a node-management change
+    // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
+    const starts = method === 'POST' && (p === '/api/upgrade/jobs' || p === '/api/upgrade/rollback');
+    if (starts) upgradeStarting++;
+    try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
   }
   if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());

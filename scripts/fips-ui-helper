@@ -37,7 +37,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=3
+HELPER_VERSION=4
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -229,15 +229,25 @@ take_lock() {
 # path and nowhere else. Runs as root in isolated mode (python3 -I): no user environment is consulted.
 read -r -d '' REDACT_PY <<'PY' || true
 # Secret redaction for fips.yaml, decided from the parsed YAML tree (PyYAML's safe composer), never from text.
-#   redact <file>                     -> file with each secret value replaced by "<redacted #N>" (exit 3 + reasons if unsafe)
+#   redact <file>                     -> "base <sha256 of the bytes read>" line, then the file with each secret
+#                                        value replaced by "<redacted #N>" (exit 3 + reasons if unsafe)
 #   restore <original> <new> <out>    -> new file with each placeholder replaced by the original value text
-import re, sys
-import yaml
-from yaml import nodes
+# Files are handled as bytes decoded without newline translation, so line endings and trailing newlines are
+# kept exactly; a leading UTF-8 BOM is kept aside (libyaml does not count it in its positions).
+import hashlib, re, sys
+try:
+    import yaml
+    from yaml import nodes
+except ImportError:
+    print('config editing needs python3 with PyYAML (Arch: python-yaml, Debian/Ubuntu: python3-yaml, Fedora: python3-pyyaml)', file=sys.stderr)
+    sys.exit(3)
 
 KEYS = set(k.lower() for k in sys.argv[2].split('|'))
 MODE = sys.argv[1]
 NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
+HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
+NOT_SECRET = {'', 'null', '~', 'true', 'false', 'cookie'}
+BOM = '\ufeff'
 PH = re.compile(r'<redacted #(\d+)>')
 SAFE_TAGS = {'tag:yaml.org,2002:str', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:null'}
 Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
@@ -247,6 +257,21 @@ class Refuse(Exception):
 
 def line(n):
     return n.start_mark.line + 1
+
+def read(path):
+    data = open(path, 'rb').read()
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Refuse('the file is not UTF-8')
+    bom = text.startswith(BOM)
+    return data, (text[1:] if bom else text), (BOM if bom else '')
+
+def looks_secret(value):
+    return value.strip().lower() not in NOT_SECRET and not value.startswith('cookie:') and len(value) >= 4
+
+def occurs(value, text):
+    return re.search(r'(?<![A-Za-z0-9_])' + re.escape(value) + r'(?![A-Za-z0-9_])', text) is not None
 
 def compose(text, what):
     try:
@@ -273,9 +298,11 @@ def uses(root):
             stack.extend(n.value)
     return counts
 
-def secrets(text, root, strict):
-    """[(path, keyname, value node)] for every secret key. With strict, refuse any form that cannot be redacted exactly."""
+def secrets(text, root):
+    """[(path, keyname, value node)] for every secret key; refuse any form that cannot be redacted exactly."""
     counts = uses(root)
+    if any(c > 1 for c in counts.values()):
+        raise Refuse('the file uses YAML aliases (*name), which this editor does not support')
     found, seen = [], set()
     def walk(n, path):
         if id(n) in seen:
@@ -284,32 +311,39 @@ def secrets(text, root, strict):
         if isinstance(n, nodes.MappingNode):
             for k, v in n.value:
                 if not isinstance(k, nodes.ScalarNode):
-                    if strict and any(isinstance(x, nodes.ScalarNode) and x.value.strip().lower() in KEYS for x in flatten(k)):
+                    if any(isinstance(x, nodes.ScalarNode) and x.value.strip().lower() in KEYS for x in flatten(k)):
                         raise Refuse(f'line {line(k)}: a secret key inside a complex mapping key')
                     walk(k, path + ['?']); walk(v, path + ['?'])
                     continue
                 name = k.value.strip().lower()
                 p = path + [k.value]
                 if name in KEYS:
-                    if strict:
-                        if not isinstance(v, nodes.ScalarNode):
-                            raise Refuse(f'line {line(v)}: {name} holds a list or mapping, not a single value')
-                        if counts.get(id(v), 0) > 1 or counts.get(id(k), 0) > 1:
-                            raise Refuse(f'line {line(v)}: {name} is used through a YAML alias')
-                        if v.start_mark.line != v.end_mark.line:
-                            raise Refuse(f'line {line(v)}: {name} spans several lines')
-                        if v.style in ('|', '>'):
-                            raise Refuse(f'line {line(v)}: {name} is a block scalar')
-                        if v.tag not in SAFE_TAGS or text[v.start_mark.index:v.start_mark.index + 1] in ('&', '!', '*'):
-                            raise Refuse(f'line {line(v)}: {name} has an anchor or tag')
-                    if isinstance(v, nodes.ScalarNode) and v.value != '':
+                    if not isinstance(v, nodes.ScalarNode):
+                        raise Refuse(f'line {line(v)}: {name} holds a list or mapping, not a single value')
+                    if counts.get(id(v), 0) > 1 or counts.get(id(k), 0) > 1:
+                        raise Refuse(f'line {line(v)}: {name} is used through a YAML alias')
+                    if v.start_mark.line != v.end_mark.line:
+                        raise Refuse(f'line {line(v)}: {name} spans several lines')
+                    if v.style in ('|', '>'):
+                        raise Refuse(f'line {line(v)}: {name} is a block scalar')
+                    if v.tag not in SAFE_TAGS or text[v.start_mark.index:v.start_mark.index + 1] in ('&', '!', '*'):
+                        raise Refuse(f'line {line(v)}: {name} has an anchor or tag')
+                    if v.tag != 'tag:yaml.org,2002:null' and v.value != '':
+                        # The replaced characters must be exactly this value (guards against any position drift).
+                        snippet = text[v.start_mark.index:v.end_mark.index]
+                        try:
+                            back = yaml.compose(snippet, Loader=Loader)
+                        except yaml.YAMLError:
+                            back = None
+                        if not isinstance(back, nodes.ScalarNode) or back.value != v.value:
+                            raise Refuse(f'line {line(v)}: could not locate the exact value of {name}')
                         found.append((p, name, v))
                     continue
                 walk(v, p)
         elif isinstance(n, nodes.SequenceNode):
             for i, v in enumerate(n.value):
                 walk(v, path + [i])
-        elif isinstance(n, nodes.ScalarNode) and strict and NSEC.search(n.value):
+        elif isinstance(n, nodes.ScalarNode) and NSEC.search(n.value):
             raise Refuse(f'line {line(n)}: an nsec value outside a secret key')
     if root is not None:
         walk(root, [])
@@ -340,19 +374,26 @@ def fmt(path):
     return '.'.join(str(x) for x in path) or 'the top level'
 
 def redact(path):
-    text = open(path, encoding='utf-8').read()
+    data, text, bom = read(path)
     if PH.search(text):
         raise Refuse('the file already contains a redaction placeholder')
     root = compose(text, 'the file')
-    found = secrets(text, root, strict=True)
+    found = secrets(text, root)
     out = splice(text, [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)])
-    # Whatever the form, no secret value may survive anywhere in what is shown (comments, copies, other keys).
+    # Whatever the form, no secret may survive anywhere in what is shown (comments, copies, other keys).
     for _, name, v in found:
-        if len(v.value) >= 4 and v.value in out:
+        if looks_secret(v.value) and occurs(v.value, out):
             raise Refuse(f'the value of {name} also appears elsewhere in the file (a comment or another key)')
     if NSEC.search(out):
         raise Refuse('an nsec value appears outside a secret key (for example in a comment)')
-    return out
+    if HEXKEY.search(out):
+        raise Refuse('a 64-character hex value (possibly a private key) appears outside a secret key')
+    # A commented-out secret line ("#   nsec: ...", "# - password: ..."), not prose that mentions a key.
+    keyed = re.compile(r'^\s*#[\s#]*(?:-\s+)?[\'"]?(' + '|'.join(map(re.escape, KEYS)) + r')[\'"]?\s*:\s*\S', re.I)
+    for no, ln in enumerate(out.splitlines(), 1):
+        if keyed.search(ln):
+            raise Refuse(f'line {no}: a comment contains a secret key with a value (a commented-out secret?)')
+    return 'base ' + hashlib.sha256(data).hexdigest() + '\n' + bom + out
 
 def get(root, path):
     n = root
@@ -368,10 +409,12 @@ def get(root, path):
     return n
 
 def restore(orig_path, new_path):
-    otext = open(orig_path, encoding='utf-8').read()
-    orig = secrets(otext, compose(otext, 'the current file'), strict=True)
-    ntext = open(new_path, encoding='utf-8').read()
+    _, otext, _ = read(orig_path)
+    orig = secrets(otext, compose(otext, 'the current file'))
+    _, ntext, nbom = read(new_path)
     nroot = compose(ntext, 'the new file')
+    if any(c > 1 for c in uses(nroot).values()):
+        raise Refuse('the new file uses YAML aliases (*name), which this editor does not support')
     edits, used = [], set()
     placeholder_nodes = 0
     def walk(n, path, key, seen):
@@ -416,18 +459,18 @@ def restore(orig_path, new_path):
         n = get(root, opath)
         if not isinstance(n, nodes.ScalarNode) or n.value != ov.value:
             raise Refuse(f'redacted secret #{i} ({oname}) would not end up at {fmt(opath)} with its value')
-        if len(ov.value) >= 4:
-            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and ov.value in x.value]
+        if looks_secret(ov.value):
+            places = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and occurs(ov.value, x.value)]
             if len(places) != 1:
                 raise Refuse(f'redacted secret #{i} ({oname}) would appear in more than one place')
-    return out
+    return nbom + out
 
 try:
     if MODE == 'redact':
-        sys.stdout.write(redact(sys.argv[3]))
+        sys.stdout.buffer.write(redact(sys.argv[3]).encode('utf-8'))
     elif MODE == 'restore':
-        with open(sys.argv[5], 'w', encoding='utf-8') as f:
-            f.write(restore(sys.argv[3], sys.argv[4]))
+        with open(sys.argv[5], 'wb') as f:
+            f.write(restore(sys.argv[3], sys.argv[4]).encode('utf-8'))
     else:
         raise Refuse('unknown mode')
 except Refuse as e:
@@ -437,7 +480,6 @@ except (OSError, UnicodeDecodeError) as e:
     print(f'cannot read the file: {e}', file=sys.stderr)
     sys.exit(3)
 PY
-require_yaml() { python3 -I -c 'import yaml' 2>/dev/null || die "config editing needs python3 with PyYAML (Arch: python-yaml, Debian/Ubuntu: python3-yaml, Fedora: python3-pyyaml)"; }
 redact() { python3 -I -c "$REDACT_PY" redact "$SECRET_KEYS" "$1"; }
 restore_secrets() { python3 -I -c "$REDACT_PY" restore "$SECRET_KEYS" "$1" "$2" "$3"; }
 
@@ -608,22 +650,30 @@ case "$cmd" in
     ;;
 
   config-show)
-    require_yaml
     f="$FIPS_CONFIG"
     if [[ -n "${2:-}" ]]; then valid_id "$2"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; fi
     [[ -f "$f" ]] || die "$f not found"
-    errf=$(mktemp); trap 'rm -f "$errf"' EXIT
-    if ! out=$(redact "$f" 2>"$errf"); then
+    outf=$(mktemp); errf=$(mktemp); trap 'rm -f "$outf" "$errf"' EXIT
+    # The redactor reads the file once, hashes exactly those bytes and prints "base <sha256>" first, so the
+    # text shown and the hash config-apply --base must match can never come from different versions.
+    if ! redact "$f" >"$outf" 2>"$errf"; then
       die "cannot show this file safely: $(head -n 8 "$errf" | tr '\n' ';') edit it from a shell"
     fi
-    # First line: the hash of the file shown, which config-apply --base must match (no silent overwrite).
-    printf 'base %s\n%s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$out"
+    cat "$outf"
     ;;
 
   config-apply)
-    require_systemd; require_yaml; take_lock
+    require_systemd; take_lock
     restart=true; base=""; shift
-    while [[ $# -gt 0 ]]; do case "$1" in --no-restart) restart=false ;; --base) base=${2:-}; shift ;; *) die "unknown option $1" ;; esac; shift; done
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --no-restart) restart=false ;;
+        --base) [[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] || die "--base needs the sha256 printed by config-show"; base=$2; shift ;;
+        *) die "unknown option $1" ;;
+      esac
+      shift
+    done
+    [[ -n "$base" ]] || die "--base is required (the sha256 printed by config-show)"
     [[ -f "$FIPS_CONFIG" ]] || die "$FIPS_CONFIG not found"
     tmp=$(mktemp); tmp2=$(mktemp); trap 'rm -f "$tmp" "$tmp2"' EXIT
     read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"

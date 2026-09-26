@@ -33,7 +33,7 @@ shipped by other software, are shown and can be edited raw with the same validat
 
 ## Security considerations
 
-With helper v3 installed, whoever can make state-changing requests to the UI can rewrite the daemon's
+With helper v4 installed, whoever can make state-changing requests to the UI can rewrite the daemon's
 configuration and firewall as root. The browser-origin checks (see the README) stop other websites from
 doing that through your browser, and read-only mode (`FIPS_UI_READ_ONLY=1`) turns it off entirely. The
 remaining exposure is **other local users of the same host**: the loopback listener does not know which

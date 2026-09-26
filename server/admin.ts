@@ -1,6 +1,6 @@
 // Node management: fips.yaml, the fips0 firewall and the fips systemd units.
 //
-// Everything here needs root and goes through the privileged helper (scripts/fips-ui-helper, v3+) via the
+// Everything here needs root and goes through the privileged helper (scripts/fips-ui-helper, v4+) via the
 // same single sudoers rule the upgrade flow uses. The backend never sees secret config values: the helper
 // redacts them on read and restores them on write. File contents travel on the helper's stdin, never as
 // paths, so nothing can be swapped between validation and install.
@@ -13,7 +13,7 @@ import { isMeshPrefix } from './net6.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { unitStates } from './system.ts';
 
-export const MIN_HELPER_VERSION = 3;
+export const MIN_HELPER_VERSION = 4;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
