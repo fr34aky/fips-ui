@@ -19,7 +19,7 @@ reachability probes, and (optionally) upgrade the node.
 | **Internals** | Every protocol counter family (searchable), routing state (pending lookups, retries, congestion), Bloom filters with fill meters, coordinate and identity caches. |
 | **Logs** | Live `journalctl -u fips` with level filter, search, pause, and target highlighting. |
 | **Diagnostics** | Staged reachability probes (bloom → discovery → path → session → RTT) against any npub or hosts-file name, with path visualisation and a run history. |
-| **Access** | Peer ACL state, firewall exposure of local listeners, the `/etc/fips/hosts` table (one-click probe), identity file facts. |
+| **Access** | **Web UI over the mesh**: let other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). Also peer ACL state, firewall exposure of local listeners, the `/etc/fips/hosts` table, identity file facts. |
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
 | **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
@@ -57,6 +57,7 @@ Everything is via environment variables.
 | `FIPS_UI_HOST` | `127.0.0.1` | Bind address. Only bind to a non-loopback address together with `FIPS_UI_TOKEN` or a reverse proxy that authenticates. |
 | `FIPS_UI_PORT` | `8321` | Port. |
 | `FIPS_UI_ALLOWED_HOSTS` | – | Comma-separated hostnames browsers may use to reach the UI, in addition to loopback and the bind address, e.g. `htpc.lan,node.fips`. Requests with any other `Host` are refused (DNS-rebinding protection). |
+| `FIPS_UI_ACCESS_FILE` | `~/.config/fips-ui/access.json` | Mesh access settings and allowed npubs, managed from the Access page. |
 | `FIPS_UI_TOKEN` | – | When set, every API call needs `Authorization: Bearer <token>`; the UI prompts for it once and stores it in the browser. Put it in `/etc/default/fips-ui` (mode 0600), not in the unit file. |
 | `FIPS_UI_READ_ONLY` | – | `1` disables every mutating action (connect, disconnect, probe, service control, upgrade). |
 | `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | Legacy: `1` enables service buttons through plain `systemctl` (polkit rule or root) when the helper is not installed. With helper v3 they work without it. |

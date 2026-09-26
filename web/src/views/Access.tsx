@@ -4,16 +4,18 @@ import { api, usePoll } from '../lib/api';
 import { shortKey } from '../lib/format';
 import { Listening } from './Overview';
 import { Stethoscope } from 'lucide-react';
+import { RemoteAccess } from '../components/RemoteAccess';
 
 interface Acl { allow_all: boolean; allow_entries: string[]; allow_file: string; allow_file_entries: string[]; default_decision: string; deny_all: boolean; deny_entries: string[]; deny_file: string; deny_file_entries: string[]; effective_mode: string; enforcement_active: boolean }
 
-export function Access({ snap, onProbe }: { snap: Snapshot; onProbe: (peer: string) => void }) {
+export function Access({ snap, onProbe, readOnly }: { snap: Snapshot; onProbe: (peer: string) => void; readOnly: boolean }) {
   const acl = usePoll(() => api.q<Acl>('show_acl'), [], 10000);
   const hosts = usePoll(() => api.get<{ path: string; entries: { hostname: string; npub: string; comment?: string }[]; error?: string }>('/api/hosts'), [], 30000);
   const peers = snap.peers?.peers ?? [];
   const a = acl.data;
   return (
     <div className="grid gap-4 fade-in">
+      <RemoteAccess readOnly={readOnly} />
       <div className="grid gap-4 lg:grid-cols-2">
         <Card title="Peer ACL" hint="Which npubs may authenticate as peers. Configured in fips.yaml and /etc/fips/peers.allow / peers.deny.">
           {acl.error ? <ErrorNote>{acl.error}</ErrorNote> : !a ? <Empty>Loading…</Empty> : (

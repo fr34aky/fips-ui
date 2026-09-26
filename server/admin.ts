@@ -328,8 +328,20 @@ export function createAdminHandler(opts: AdminOptions) {
     }
   };
 
+  /** Replace the managed rules through a pure function of the current ones (used by mesh access). */
+  function updateManagedRules(mutate: (rules: FirewallRule[]) => FirewallRule[]): Promise<Record<string, unknown>> {
+    return exclusive(async () => {
+      await requireHelper();
+      const managed = (await readDropins()).find((d) => d.managed);
+      const next = mutate(managed ? parseManagedDropin(managed.content) : []).map(validateRule);
+      if (next.length === 0) return managed ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false };
+      return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(next));
+    });
+  }
+
   return Object.assign(handler, {
     helperInfo,
+    updateManagedRules,
     /** True while a node-management change is running (upgrades must not start then). */
     changePending: () => pending,
     serviceAction: (unit: string, action: string) => { const b = opts.busy(); return b ? Promise.reject(new Error(b)) : exclusive(() => serviceAction(unit, action)); },

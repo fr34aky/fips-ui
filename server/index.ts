@@ -9,7 +9,8 @@ import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler } from './admin.ts';
+import { createAdminHandler, type FirewallRule } from './admin.ts';
+import { MeshAccess, LOCAL, AccessError, validateAccess, type Principal } from './access.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -70,16 +71,18 @@ function hostnameOf(value: string | undefined, isUrl = false): string | null {
  * same-site Origin when the browser sends one, must not be flagged cross-site by Sec-Fetch-Site, and must
  * be JSON, which HTML forms cannot produce and cross-origin fetches cannot send without a CORS preflight.
  */
-function browserChecks(req: Req, method: string): string | null {
-  if (HOST_CHECK) {
+function browserChecks(req: Req, method: string, via: 'local' | 'mesh'): string | null {
+  // On the mesh listener the names are this node's fips0 address and .fips names; locally the configured set.
+  const hostOk = (h: string | null) => (via === 'mesh' ? mesh.hostAllowed(h) : !!h && ALLOWED_HOSTS.has(h));
+  if (via === 'mesh' || HOST_CHECK) {
     const host = hostnameOf(req.headers.host);
-    if (!host || !ALLOWED_HOSTS.has(host)) return `host '${req.headers.host ?? ''}' is not allowed (set FIPS_UI_ALLOWED_HOSTS)`;
+    if (!hostOk(host)) return `host '${req.headers.host ?? ''}' is not allowed${via === 'local' ? ' (set FIPS_UI_ALLOWED_HOSTS)' : ''}`;
   }
   if (method === 'GET' || method === 'HEAD') return null;
   const origin = req.headers.origin;
   if (origin && origin !== 'null') {
     const o = hostnameOf(origin, true);
-    if (!o || (HOST_CHECK ? !ALLOWED_HOSTS.has(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
+    if (!o || (via === 'mesh' || HOST_CHECK ? !hostOk(o) : o !== hostnameOf(req.headers.host))) return `cross-origin request from ${origin} refused`;
   } else if (origin === 'null') return 'cross-origin request refused';
   const site = req.headers['sec-fetch-site'];
   if (typeof site === 'string' && site === 'cross-site') return 'cross-site request refused';
@@ -233,12 +236,16 @@ function serveStatic(url: URL, res: Res) {
 // ---------------------------------------------------------------------------------------------
 const startedAt = Date.now();
 let upgradeStarting = 0;
+/** Who is making each request: the loopback listener is the local operator; the mesh listener an allowed npub. */
+const principals = new WeakMap<Req, Principal>();
+const principalOf = (req: Req): Principal => principals.get(req) ?? LOCAL;
+const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
-const upgrade = createUpgradeHandler({ authorize: () => !READ_ONLY, controlSocket: SOCKET_PATH });
+const upgrade = createUpgradeHandler({ authorize: (req) => canChange(req), controlSocket: SOCKET_PATH });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
-  authorize: () => !READ_ONLY,
+  authorize: (req) => canChange(req),
   busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
 });
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
@@ -248,23 +255,24 @@ async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   return ALLOW_SERVICE_CONTROL ? 'direct' : null;
 }
 
-async function route(req: Req, res: Res) {
+async function route(req: Req, res: Res, via: 'local' | 'mesh' = 'local') {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const p = url.pathname;
   const method = req.method ?? 'GET';
 
   if (!p.startsWith('/api/')) return serveStatic(url, res);
 
-  const refused = browserChecks(req, method);
+  const refused = browserChecks(req, method, via);
   if (refused) return json(res, 403, { error: refused });
 
-  // Auth: when a token is configured, every API call needs it (mutations always, reads too).
-  if (p !== '/api/health' && !tokenOk(req, url)) return json(res, 401, { error: 'unauthorized', auth: 'token' });
+  // Auth: locally, a configured token is required for every API call. Over the mesh the npub is the credential.
+  if (via === 'local' && p !== '/api/health' && !tokenOk(req, url)) return json(res, 401, { error: 'unauthorized', auth: 'token' });
 
   if (p === '/api/health') {
     let daemon: unknown = null; let error: string | undefined;
     try { daemon = await query('show_status', undefined, { timeoutMs: 2500 }); } catch (e) { error = (e as Error).message; }
-    return json(res, 200, { ok: !error, auth: TOKEN ? 'token' : 'none', readOnly: READ_ONLY, upgrade: true, serviceControl: (await serviceControlMode()) !== null, nodeManagement: (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    const pr = principalOf(req);
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: fs.existsSync(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -276,7 +284,8 @@ async function route(req: Req, res: Res) {
     if (starts) upgradeStarting++;
     try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
   }
-  if (p.startsWith('/api/admin/')) { if (await admin(req, res)) return; }
+  // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
+  if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 
   // Generic read-only proxy: /api/q/show_peers, /api/q/show_stats_history?metric=bytes_in&window=1h
@@ -291,6 +300,10 @@ async function route(req: Req, res: Res) {
     throw new HttpError(404, `unknown or non-read-only command '${cmd}'`);
   }
 
+  if (p === '/api/access' && method === 'GET') {
+    const you = principalOf(req);
+    return json(res, 200, you.role === 'admin' ? { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: (await admin.helperInfo()).managementCapable } : { you });
+  }
   if (p === '/api/hosts') return json(res, 200, await readHosts());
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {
@@ -306,7 +319,15 @@ async function route(req: Req, res: Res) {
   // ---- mutating -----------------------------------------------------------------------------
   if (method !== 'POST') throw new HttpError(404, 'not found');
   if (READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
+  if (principalOf(req).role !== 'admin') throw new HttpError(403, 'your npub has viewer access; changes need admin');
   const body = await readJsonBody(req);
+
+  if (p === '/api/access') {
+    let next;
+    try { next = validateAccess(body); } catch (e) { throw new HttpError(400, (e as Error).message); }
+    try { await mesh.save(next); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    return json(res, 200, { config: mesh.config, status: mesh.status(), firewall: await syncMeshFirewall() });
+  }
 
   if (p === '/api/connect') {
     const { peer, address, transport } = body as { peer?: string; address?: string; transport?: string };
@@ -350,6 +371,47 @@ const server = http.createServer((req, res) => {
   route(req, res).catch((e) => errToResponse(res, e));
 });
 
+// ---------------------------------------------------------------------------------------------
+// Mesh access
+// ---------------------------------------------------------------------------------------------
+const MESH_TAG = 'mesh-access';
+
+async function denyMesh(req: Req, res: Res): Promise<void> {
+  const addr = req.socket.remoteAddress ?? 'unknown';
+  let npub: string | undefined;
+  try {
+    const idc = await query<{ entries: { ipv6_addr: string; npub: string }[] }>('show_identity_cache', undefined, { timeoutMs: 2000 });
+    npub = idc.entries.find((e) => e.ipv6_addr === addr)?.npub;
+  } catch { /* best effort */ }
+  const who = npub ? `${npub} (${addr})` : addr;
+  if ((req.url ?? '').startsWith('/api/')) return json(res, 403, { error: 'this node does not allow your npub', you: { address: addr, npub } }, true);
+  const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+  const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Access denied</title><body style="font:16px system-ui;padding:2rem;max-width:40rem;margin:auto;background:#0a1220;color:#e6edf7"><h1 style="font-size:1.4rem">This FIPS node's dashboard is private</h1><p>Your connection came from <code style="word-break:break-all">${esc(who)}</code>, which is not on its allow-list.</p><p style="color:#a3b3ca">Ask the operator to add your npub under <b>Access → Web UI over the mesh</b>.</p>`;
+  res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', connection: 'close' });
+  res.end(html);
+}
+
+const mesh = new MeshAccess((req, res) => {
+  const pr = mesh.principalFor(req.socket.remoteAddress);
+  if (!pr) { void denyMesh(req, res); return; }
+  principals.set(req, pr);
+  route(req, res, 'mesh').catch((e) => errToResponse(res, e));
+});
+
+/** Keep the UI's own firewall rule in step with the allow-list: its port, open only to the allowed npubs. */
+async function syncMeshFirewall(): Promise<{ ok: boolean; skipped?: string; error?: string }> {
+  if (!(await admin.helperInfo()).managementCapable) return { ok: false, skipped: 'helper v3 not installed; open the port in the firewall yourself' };
+  const cfg = mesh.config;
+  const rule: FirewallRule | null = cfg.enabled && cfg.allowed.length
+    ? { proto: 'tcp', ports: String(cfg.port), sources: cfg.allowed.map((a) => ({ kind: 'npub' as const, npub: a.npub, label: a.label })), comment: 'fips-ui web access over the mesh', tag: MESH_TAG }
+    : null;
+  try {
+    const r = await admin.updateManagedRules((rules) => [...rules.filter((x) => x.tag !== MESH_TAG), ...(rule ? [rule] : [])]);
+    return r.ok ? { ok: true } : { ok: false, error: String(r.error ?? 'rejected') };
+  } catch (e) { return { ok: false, error: (e as Error).message }; }
+}
+void mesh.start();
+
 server.listen(PORT, HOST, () => {
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
@@ -358,4 +420,4 @@ server.listen(PORT, HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close_all(); process.exit(0); });

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
-import { Shell, NAV, type ViewId } from './components/Shell';
+import { Shell, NAV, ADMIN_VIEWS, type ViewId } from './components/Shell';
 import { ToastProvider, Modal, ErrorNote, Empty, Chip } from './components/ui';
 import { api, useLive, useAuthNeeded, setAuthNeeded, setToken, getToken, reconnectLive } from './lib/api';
 import type { Health } from './lib/types';
@@ -42,11 +42,14 @@ export default function App() {
   const probe = useCallback((peer: string) => nav('diagnostics', { peer }), [nav]);
 
   const snap = live.snapshot;
+  const viewer = health?.principal?.role === 'viewer';
   const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${shortKey(snap.status.npub, 12, 6)}` : '', [snap]);
   const gwBadge = snap?.gateway ? <Chip tone="good" className="ml-auto" dot={false}>on</Chip> : undefined;
 
   let body: React.ReactNode;
-  if (!snap) {
+  if (viewer && ADMIN_VIEWS.includes(route.view)) {
+    body = <Empty>This page needs the admin role; your npub has viewer access.</Empty>;
+  } else if (!snap) {
     body = live.conn === 'reconnecting' ? <ErrorNote>Cannot reach the FIPS UI server. Retrying…</ErrorNote> : <Empty><div className="pulse">Connecting to the node…</div></Empty>;
   } else {
     switch (route.view) {
@@ -57,7 +60,7 @@ export default function App() {
       case 'internals': body = <Internals snap={snap} />; break;
       case 'logs': body = <Logs />; break;
       case 'diagnostics': body = <Diagnostics initialPeer={route.params.get('peer')} snap={snap} readOnly={!!health?.readOnly} />; break;
-      case 'access': body = <Access snap={snap} onProbe={probe} />; break;
+      case 'access': body = <Access snap={snap} onProbe={probe} readOnly={!!health?.readOnly} />; break;
       case 'gateway': body = <Gateway snap={snap} />; break;
       case 'upgrade': body = <Upgrade />; break;
       case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;
@@ -68,7 +71,7 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} uiVersion={health?.uiVersion} badge={gwBadge}>
+      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} uiVersion={health?.uiVersion} principal={health?.principal} badge={gwBadge}>
         {body}
       </Shell>
       <TokenDialog open={authNeeded} />

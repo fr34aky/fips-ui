@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff } from 'lucide-react';
 import type { ConnState } from '../lib/api';
+import type { Principal } from '../lib/types';
 
 export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'upgrade' | 'config' | 'firewall';
 
@@ -30,7 +31,11 @@ export function useTheme() {
   return [theme, () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))] as const;
 }
 
-export function Shell({ view, onNav, conn, nodeName, version, uiVersion, children, badge }: { view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; children: ReactNode; badge?: ReactNode }) {
+/** Pages that only make sense with the admin role. */
+export const ADMIN_VIEWS: ViewId[] = ['config', 'firewall', 'upgrade'];
+
+export function Shell({ view, onNav, conn, nodeName, version, uiVersion, principal, children, badge }: { view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; principal?: Principal; children: ReactNode; badge?: ReactNode }) {
+  const nav = principal?.role === 'viewer' ? NAV.filter((n) => !ADMIN_VIEWS.includes(n.id)) : NAV;
   const [theme, toggleTheme] = useTheme();
   const [open, setOpen] = useState(false);
   const current = NAV.find((n) => n.id === view)!;
@@ -54,7 +59,7 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, childre
           <button className="btn ghost icon sm ml-auto lg:hidden" onClick={() => setOpen(false)} aria-label="Close menu"><X size={16} /></button>
         </div>
         <nav className="flex flex-col gap-0.5 px-3 py-2 overflow-y-auto">
-          {NAV.map((n) => (
+          {nav.map((n) => (
             <a key={n.id} href={`#/${n.id}`} className={`nav-item ${view === n.id ? 'active' : ''}`} onClick={(e) => { e.preventDefault(); onNav(n.id); }} title={n.hint}>
               {n.icon}<span>{n.label}</span>
               {n.id === 'gateway' && badge}
@@ -66,6 +71,7 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, childre
             <span>{connChip}</span>
             <button className="btn ghost icon sm" onClick={toggleTheme} aria-label="Toggle theme" title="Toggle theme">{theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}</button>
           </div>
+          {principal?.kind === 'mesh' && <div className="mt-2 flex items-center gap-1.5" title={principal.npub}><span className={`chip ${principal.role === 'admin' ? 'accent' : ''}`}><span className="chip-dot" />via mesh · {principal.label || `${principal.npub.slice(0, 12)}…`} · {principal.role}</span></div>}
           {uiVersion && <div className="mt-2"><a href="https://github.com/fr34aky/fips-ui/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" className="hover:text-ink" title="Changelog">fips-ui v{uiVersion}</a></div>}
         </div>
       </aside>
