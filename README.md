@@ -68,6 +68,15 @@ Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are 
 
 ## Running as a service
 
+On the machine where the checkout lives, one command installs the upgrade helper, a systemd unit
+running the UI from the checkout as your user, and starts it:
+
+```sh
+sudo ./deploy/setup-local.sh
+```
+
+For a dedicated service account instead:
+
 ```sh
 sudo useradd -r -s /usr/sbin/nologin -G fips,systemd-journal fips-ui
 sudo mkdir -p /opt/fips-ui && sudo cp -r . /opt/fips-ui && sudo chown -R fips-ui: /opt/fips-ui
