@@ -222,14 +222,15 @@ take_lock() {
 
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
 # secret key's value must be a single-line plain or quoted scalar with no anchor, tag or alias; its exact
-# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret value or
-# holds an nsec or 64-hex key is shown as "# <redacted comment #N>". Anything else is refused (exit 3, reasons
-# on stderr), and so is a file where a secret value also appears in another value, anchor, tag or directive
-# (keys only as long copies), or an nsec
-# value sits outside a secret key. Restore requires each placeholder to be a whole scalar value under the same
-# key at the same path (and each comment placeholder a whole comment), puts the original text back, re-parses
-# the result and checks each secret is exactly at its path and nowhere else, and that the result can be shown
-# again with every restored comment still hidden. Runs as root in isolated mode (python3 -I): no user
+# character span is replaced by "<redacted #N>". A comment that names a secret key, quotes a secret value, or
+# holds an nsec or 64-hex key (alone or wrapped over consecutive comment lines) is shown as
+# "# <redacted comment #N>". Anything else is refused (exit 3, reasons on stderr), and so is a file where a
+# secret of 8+ characters also appears in another value (npub included), anchor, tag or directive (keys only
+# as long copies), or an nsec or 64-hex value sits outside a secret key (hex public keys under npub are
+# allowed). Shorter secrets are redacted in place only. Restore requires each placeholder to be a whole scalar
+# value under the same key at the same path (and each comment placeholder a whole comment), puts the original
+# text back, re-parses the result and checks each secret is exactly at its path, and that the result can be
+# shown again with every restored comment still hidden. Runs as root in isolated mode (python3 -I): no user
 # environment is consulted.
 read -r -d '' REDACT_PY <<'PY' || true
 # Secret redaction for fips.yaml, decided from the parsed YAML tree (PyYAML's safe composer), never from text.
@@ -253,6 +254,8 @@ except ImportError:
 KEYS = set(k.lower() for k in sys.argv[2].split('|'))
 MODE = sys.argv[1]
 NSEC = re.compile(r'nsec1[02-9ac-hj-np-z]{6,}', re.I)
+# In text with whitespace and '#' removed a key can touch hex letters of neighbouring words: any run of 64+.
+HEXRUN = re.compile(r'[0-9a-fA-F]{64,}')
 HEXKEY = re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])')
 # Copies of a secret elsewhere in the file are detected for values of at least this many characters. Shorter
 # ones ("tor", "control", "fips") are ordinary words of this configuration; they are redacted where they are
@@ -265,6 +268,7 @@ BOM = '\ufeff'
 KEYED = re.compile(r'(?<![A-Za-z0-9_])[\'"]?(' + '|'.join(map(re.escape, sorted(KEYS))) + r')[\'"]?\s*[:=]', re.I)
 # YAML 1.1 line breaks (libyaml); Python's str.splitlines also splits on \v, \f and others, which YAML does not.
 BREAK = re.compile(r'\r\n|[\r\n\x85\u2028\u2029]')
+RUN_GAP = re.compile('(?:' + BREAK.pattern + r')[ \t]*')
 PLACEHOLDERS = re.compile(r'"<redacted #\d+>"|# <redacted comment #\d+>')
 PH = re.compile(r'<redacted #(\d+)>')
 CPH = re.compile(r'^#\s*<redacted comment #(\d+)>\s*$')
@@ -316,9 +320,11 @@ def squash(s):
     return re.sub(r'[\s#]+', '', s)
 
 def key_material(s):
-    """An nsec or a 64-hex key anywhere in s, even wrapped over several lines."""
-    q = squash(s)
-    return bool(NSEC.search(q) or HEXKEY.search(q))
+    """An nsec or a 64-hex key anywhere in s, even wrapped over several lines or next to other hex letters."""
+    return bool(NSEC.search(s) or HEXKEY.search(s) or squashed_key_material(squash(s)))
+
+def squashed_key_material(q):
+    return bool(NSEC.search(q) or HEXRUN.search(q))
 
 def check_stray(n):
     if key_material(n.value):
@@ -486,16 +492,39 @@ def comment_runs(text, spans):
     runs = []
     for a, b in spans:
         # Consecutive: only one line break and indentation between the previous comment's end and this '#'.
-        if runs and re.fullmatch('(?:' + BREAK.pattern + r')[ \t]*', text[runs[-1][-1][1]:a]):
+        if runs and RUN_GAP.fullmatch(text[runs[-1][-1][1]:a]):
             runs[-1].append((a, b))
         else:
             runs.append([(a, b)])
     return runs
 
 def sensitive_comment(c, forms):
-    """forms: [(form, squashed form)]. Hiding a comment costs nothing, so short forms count here as whole words."""
+    """forms: [(form, squashed form)] of at least MIN_COPY characters (like copies in values; a hidden comment
+    blocks changing its secret, so ordinary short words must not hide comments)."""
     q = squash(c)
-    return bool(KEYED.search(c) or key_material(c) or any(appears(f, c) or (len(sq) >= MIN_COPY and sq in q) for f, sq in forms))
+    return bool(KEYED.search(c) or key_material(c) or any(f in c or sq in q for f, sq in forms))
+
+def hidden_windows(text, run, forms):
+    """Groups of consecutive comment lines that reveal key material or a secret only when joined (a key wrapped
+    over lines), whatever else hides some of them. Only minimal groups: neither end can be dropped. A match spans
+    at most `limit` squashed characters, so the inner lines of a group are bounded and the search is linear."""
+    sq = [squash(text[a:b]) for a, b in run]
+    limit = max([90] + [len(s) for _, s in forms])
+    def sens(i, j):
+        q = ''.join(sq[i:j + 1])
+        return squashed_key_material(q) or any(s in q for _, s in forms)
+    out = []
+    for i in range(len(run)):
+        inner = 0
+        for j in range(i + 1, len(run)):
+            if sens(i, j):
+                if not sens(i + 1, j) and not sens(i, j - 1):
+                    out.extend(run[i:j + 1])
+                break
+            inner += len(sq[j])
+            if inner > limit:
+                break
+    return out
 
 def appears(form, text):
     """Substring for values of 6+ characters; for shorter ones a whole-token match (avoids refusing a file because
@@ -518,18 +547,14 @@ def redact_text(text):
         raw = text[v.start_mark.index:v.end_mark.index]
         decoded.append(f)
         spelled.append(f | {x for x in (raw, raw.strip('"\'')) if len(x) >= 3} if f else set())
-    forms_all = [(f, squash(f)) for f in set().union(*spelled)] if spelled else []
+    forms_all = [(f, squash(f)) for f in set().union(*spelled) if len(f.strip()) >= MIN_COPY] if spelled else []
     edits = [(v.start_mark.index, v.end_mark.index, ph(i + 1)) for i, (_, _, v) in enumerate(found)]
     spans, names = scan(text)
     hide = {s for s in spans if sensitive_comment(text[s[0]:s[1]], forms_all)}
-    # A key or password wrapped over consecutive comment lines: hide the shortest groups of otherwise visible lines
-    # whose joined text is sensitive (only those lines, so documentation around them stays visible).
+    # A key or password wrapped over consecutive comment lines: hide the lines that are sensitive only together
+    # (just those, so documentation around them stays visible).
     for run in comment_runs(text, spans):
-        for size in range(2, len(run) + 1):
-            for i in range(len(run) - size + 1):
-                win = run[i:i + size]
-                if not any(s in hide for s in win) and sensitive_comment(''.join(text[a:b] for a, b in win), forms_all):
-                    hide.update(win)
+        hide.update(hidden_windows(text, run, forms_all))
     comments = []
     for a, b in spans:
         if (a, b) in hide:
@@ -542,8 +567,8 @@ def redact_text(text):
     secret_ids = {id(v) for _, _, v in found}
     scalars = [x for x in flatten(root) if isinstance(x, nodes.ScalarNode) and id(x) not in secret_ids] if root is not None else []
     keys = {id(k) for n in flatten(root) if isinstance(n, nodes.MappingNode) for k, _ in n.value} if root is not None else set()
-    public_ids = {id(x) for x in public}
-    values = [(x.value, squash(x.value)) for x in scalars if id(x) not in keys and id(x) not in public_ids]
+    # Public keys (npub) are exempt from the stray-key check, not from the copy check.
+    values = [(x.value, squash(x.value)) for x in scalars if id(x) not in keys]
     keytexts = [x for x in scalars if id(x) in keys]
     # Raw text without placeholders and keys (whose spans shift by the same edits: blank them before redacting).
     blank = splice(text, [(x.start_mark.index, x.end_mark.index, ' ' * (x.end_mark.index - x.start_mark.index)) for x in keytexts + public])
