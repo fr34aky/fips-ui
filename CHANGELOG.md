@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-26
+
+### Changed
+
+- Node.js requirement corrected to 22.18+, 23.6+ or 24+: earlier versions
+  only strip TypeScript behind a flag. `deploy/setup-local.sh` enforces it.
+- Job and backup ids are UTC, millisecond-resolution and counter-suffixed, so
+  two jobs in the same second get distinct ids and ordering survives DST.
+
+### Fixed
+
+- Oversized bodies on the main API got a connection reset instead of a 413.
+- Deterministic GitHub errors (404 for a rev that is not on master, or no
+  releases) were retried every minute and exhausted the anonymous limit; they
+  are now cached as long as successes.
+- The three GitHub calls behind the upgrade status ran sequentially, so an
+  unreachable GitHub stalled the page for up to 45 s; they now run together.
+- When the helper could not restart the service, the job waited two minutes
+  for a daemon that was never restarted and then blamed the daemon; the
+  restart step now fails immediately with the helper's message.
+- Rollback discarded the helper's result; the safety backup taken before a
+  rollback is now shown so a bad rollback can itself be undone.
+- A non-boolean `dryRun` could skip the installer precheck yet perform a real
+  install; the request is normalised once.
+- Stage dirs, downloads and partial files accumulated forever under the work
+  dir; a successful install removes its stage dir, and the newest three stage
+  dirs and two artifacts are kept.
+- A revision with a suffix (`-dirty`) defeated the staging check because the
+  version parser did not capture it. The full token is now kept everywhere so
+  a dirty and a clean build of the same commit are no longer conflated.
+- Non-boolean `dryRun`/`restart` values are rejected with 400 rather than
+  coerced. A 413 now closes the connection so a kept-alive socket is not left
+  mid-body. GitHub 403/429 answers honour `retry-after` and suggest a token.
+
 ## [0.1.2] - 2026-09-26
 
 ### Fixed
@@ -154,7 +188,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fr34aky/fips-ui/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fr34aky/fips-ui/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/fr34aky/fips-ui/releases/tag/v0.1.0

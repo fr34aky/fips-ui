@@ -1,4 +1,4 @@
-// FIPS UI API server. Zero dependencies; runs directly under Node >= 22.6 (native TypeScript stripping).
+// FIPS UI API server. Zero dependencies; runs directly under Node 22.18+ / 23.6+ / 24+ (unflagged TypeScript type stripping).
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH,
 import { journal, recentLogs, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, UNITS, type UnitName, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
+import { readJsonBody, BodyError, sendJson } from './http.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -42,19 +43,8 @@ class HttpError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
-function json(res: Res, status: number, body: unknown) {
-  const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
+const json = (res: Res, status: number, body: unknown, close = false) => sendJson(res, status, body, close);
 
-async function readBody(req: Req): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const c of req) { size += (c as Buffer).length; if (size > 64 * 1024) throw new HttpError(413, 'body too large'); chunks.push(c as Buffer); }
-  if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new HttpError(400, 'invalid JSON body'); }
-}
 
 function tokenOk(req: Req, url: URL): boolean {
   if (!TOKEN) return true;
@@ -98,6 +88,7 @@ function browserChecks(req: Req, method: string): string | null {
 }
 
 function errToResponse(res: Res, e: unknown) {
+  if (e instanceof BodyError) return json(res, e.status, { error: e.message }, e.status === 413);
   if (e instanceof HttpError) return json(res, e.status, { error: e.message });
   if (e instanceof ControlError) return json(res, e.kind === 'transport' ? 503 : 400, { error: e.message, kind: e.kind });
   console.error(e);
@@ -294,7 +285,7 @@ async function route(req: Req, res: Res) {
   // ---- mutating -----------------------------------------------------------------------------
   if (method !== 'POST') throw new HttpError(404, 'not found');
   if (READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
-  const body = await readBody(req);
+  const body = await readJsonBody(req);
 
   if (p === '/api/connect') {
     const { peer, address, transport } = body as { peer?: string; address?: string; transport?: string };

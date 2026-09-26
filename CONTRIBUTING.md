@@ -42,7 +42,7 @@ npm run install:all      # frontend dependencies; the server has none
 npm run dev              # API on :8321 with reload, Vite on :5173 with proxy
 ```
 
-Requirements: Node.js 22.6 or newer (the server is TypeScript executed
+Requirements: Node.js 22.18+, 23.6+ or 24+ (the server is TypeScript executed
 directly by Node with type stripping, so no parameter properties,
 enums or other syntax that needs transformation), and membership in
 the `fips` group so `/run/fips/control.sock` is reachable. The Logs

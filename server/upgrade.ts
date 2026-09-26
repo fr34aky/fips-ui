@@ -43,6 +43,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { join, dirname, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readJsonBody, BodyError, sendJson } from './http.ts'
 import { homedir, arch as osArch, platform as osPlatform } from 'node:os'
 import { connect as netConnect } from 'node:net'
 
@@ -169,9 +170,16 @@ export function detectPlatform(): Platform {
 // Small utilities
 // ---------------------------------------------------------------------------
 
+/**
+ * Ids for jobs and backups: UTC timestamp to the millisecond plus a per-process counter, fixed width, so ids are
+ * unique within a second, never go backwards on a DST change, and sort lexically in start order (the client
+ * relies on that to decide which job is newer).
+ */
+let idCounter = 0
 function nowId(): string {
-  const d = new Date(); const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  const d = new Date(); const p = (n: number, w = 2) => String(n).padStart(w, '0')
+  idCounter = (idCounter + 1) % 1000
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}-${p(d.getUTCMilliseconds(), 3)}${p(idCounter, 3)}`
 }
 
 /**
@@ -206,11 +214,23 @@ const isRoot = (): boolean => typeof process.getuid === 'function' ? process.get
 async function isElevatedWindows(): Promise<boolean> { return (await run('net', ['session'], { timeout: 5000 })).code === 0 }
 
 /** Parse "fips 0.6.0-dev (rev 0f0e1dc2bd)\ntarget: ..." */
-export function parseVersionOutput(out: string): { version: string; rev?: string; target?: string } | null {
-  const m = out.match(/^\s*fips\S*\s+(\S+)(?:\s+\(rev\s+([0-9a-f]+)\))?/m)
+export interface ParsedVersion { version: string; rev?: string; revFull?: string; target?: string }
+/**
+ * Parse `fips --version`. `rev` is the bare commit hash (what git and GitHub understand); `revFull` is the whole
+ * token inside the parentheses, including any suffix such as `-dirty` (what distinguishes two builds).
+ */
+export function parseVersionOutput(out: string): ParsedVersion | null {
+  const m = out.match(/^\s*fips\S*\s+(\S+)(?:\s+\(rev\s+([0-9a-f]+)([^)]*)\))?/m)
   if (!m) return null
   const t = out.match(/^target:\s*(\S+)/m)
-  return { version: m[1], rev: m[2], target: t?.[1] }
+  const revFull = m[2] ? `${m[2]}${(m[3] ?? '').trim() ? (m[3].trim().startsWith('-') ? '' : '-') + m[3].trim().replace(/^[,\s]+/, '') : ''}` : undefined
+  return { version: m[1], rev: m[2], revFull, target: t?.[1] }
+}
+/** Canonical one-line rendering: `0.6.0-dev (rev 0f0e1dc2bd-dirty)`. */
+export function fmtVersion(v: { version?: string; rev?: string; revFull?: string } | null | undefined): string {
+  if (!v?.version) return 'unknown'
+  const r = v.revFull ?? v.rev
+  return r ? `${v.version} (rev ${r})` : v.version
 }
 
 /** Compare semver-ish strings (v0.6.0-dev vs 0.5.1). -1/0/1. Pre-release < release of the same base. */
@@ -238,21 +258,7 @@ function controlQuery(socket: string, command: string, timeoutMs = 4000): Promis
   })
 }
 
-class BodyTooLarge extends Error { status = 413; constructor() { super('request body too large (64 KiB limit)') } }
-function readBody(req: IncomingMessage, limit = 64 * 1024): Promise<string> {
-  return new Promise((res, rej) => {
-    let data = ''
-    let failed = false
-    req.on('data', (c) => { if (failed) return; data += c; if (data.length > limit) { failed = true; rej(new BodyTooLarge()); req.pause() } })
-    req.on('end', () => { if (!failed) res(data) }); req.on('error', rej)
-  })
-}
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const s = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(s) })
-  res.end(s)
-}
 
 async function sha256File(path: string): Promise<string> {
   const h = createHash('sha256')
@@ -305,7 +311,19 @@ class GitHub {
           this.cache.set(path, { at: Date.now(), error: err, until: reset && reset > Date.now() ? reset : Date.now() + GITHUB_ERROR_CACHE_MS })
           throw err
         }
-        throw new Error(`GitHub API ${path}: HTTP ${r.status}`)
+        if (r.status === 429 || (r.status === 403 && (r.headers.has('retry-after') || r.headers.has('x-ratelimit-remaining')))) {
+          // Secondary/abuse limits: transient, with a retry-after; a token lifts them. A 403 without limit headers
+          // (token lacking access, blocked repo) is permanent and falls through to the long-TTL branch below.
+          const retry = Number(r.headers.get('retry-after')) * 1000
+          const err = new Error(`GitHub API ${path}: HTTP ${r.status} (temporarily limited; retry in ${retry ? Math.ceil(retry / 1000) : 60} s, or set FIPS_UI_GITHUB_TOKEN)`)
+          this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + (retry > 0 ? retry : GITHUB_ERROR_CACHE_MS) })
+          throw err
+        }
+        const err = new Error(`GitHub API ${path}: HTTP ${r.status}`)
+        // Other 4xx answers are deterministic (no such release, rev not an ancestor of master): retrying every
+        // minute only burns the rate limit, so they are cached as long as a success would be.
+        if (r.status >= 400 && r.status < 500) this.cache.set(path, { at: Date.now(), error: err, until: Date.now() + ttl })
+        throw err
       }
       const value = (await r.json()) as T
       this.cache.set(path, { at: Date.now(), value, until: Date.now() + ttl })
@@ -442,7 +460,7 @@ class Job {
 // Installers: how staged binaries reach the system
 // ---------------------------------------------------------------------------
 
-interface InstallResult { backup_id?: string; restarted?: boolean; installed_version?: string }
+interface InstallResult { backup_id?: string; restarted?: boolean; installed_version?: string; pre_rollback_backup?: string }
 
 interface Installer {
   kind: string
@@ -495,7 +513,7 @@ class WindowsInstaller implements Installer {
     const dir = join(this.backupsDir, id)
     await mkdir(dir, { recursive: true })
     for (const b of this.binaries) if (existsSync(join(this.binDir, b))) await copyFile(join(this.binDir, b), join(dir, b))
-    await writeFile(join(dir, 'VERSION'), ver ? `fips ${ver.version}${ver.rev ? ` (rev ${ver.rev})` : ''}\n` : 'unknown\n')
+    await writeFile(join(dir, 'VERSION'), `fips ${fmtVersion(ver)}\n`)
     job.info(`backed up current binaries to ${dir}`)
     return id
   }
@@ -515,7 +533,7 @@ class WindowsInstaller implements Installer {
     await this.startService(job)
     return { backup_id, restarted: true }
   }
-  async rollback(job: Job, id: string) { await this.backup(job); await this.swap(job, join(this.backupsDir, id)); await this.startService(job); return { restarted: true } }
+  async rollback(job: Job, id: string) { const pre_rollback_backup = await this.backup(job); await this.swap(job, join(this.backupsDir, id)); await this.startService(job); return { pre_rollback_backup, restarted: true } }
   async restart() { const s = await run('sc.exe', ['stop', this.service], { timeout: 60_000 }); await new Promise((r) => setTimeout(r, 2000)); const r = await run('sc.exe', ['start', this.service], { timeout: 60_000 }); if (r.code !== 0) throw new Error(r.stdout.trim()); return `${s.stdout.trim()}\n${r.stdout.trim()}` }
   async listBackups() { return readBackupsDir(this.backupsDir, this.binaries) }
 }
@@ -589,7 +607,7 @@ export class UpgradeManager {
     return this.binDirCache
   }
 
-  async installedVersion(): Promise<{ path: string | null; version?: string; rev?: string; target?: string; raw?: string }> {
+  async installedVersion(): Promise<{ path: string | null; version?: string; rev?: string; revFull?: string; target?: string; raw?: string }> {
     const path = join(await this.binDir(), 'fips' + this.platform.exe)
     if (!existsSync(path)) return { path: null }
     const r = await run(path, ['--version'], { timeout: 5000 })
@@ -597,11 +615,11 @@ export class UpgradeManager {
     return { path, raw: r.stdout.trim(), ...(p ?? {}) }
   }
 
-  async runningVersion(): Promise<{ version?: string; rev?: string; uptime_secs?: number; pid?: number } | null> {
+  async runningVersion(): Promise<{ version?: string; rev?: string; revFull?: string; uptime_secs?: number; pid?: number } | null> {
     const d = await controlQuery(this.controlSocket, 'show_status')
     if (!d) return null
     const p = parseVersionOutput(`fips ${String(d.version ?? '')}`)
-    return { version: p?.version, rev: p?.rev, uptime_secs: d.uptime_secs as number | undefined, pid: d.pid as number | undefined }
+    return { version: p?.version, rev: p?.rev, revFull: p?.revFull, uptime_secs: d.uptime_secs as number | undefined, pid: d.pid as number | undefined }
   }
 
   /** Which package manager owns the installed binary, if any (so the UI can warn about drift). */
@@ -694,20 +712,26 @@ export class UpgradeManager {
       this.installer.listBackups(),
     ])
     const toolchainPlan = await this.memo('toolchainPlan', TTL, force, () => this.toolchainPlan(toolchain))
+    // The three GitHub calls run concurrently so an unreachable GitHub costs one fetch timeout, not three in a row.
+    const [relR, headR, cmpR] = await Promise.allSettled([
+      this.gh.latestRelease(),
+      this.gh.branchHead('master'),
+      installed.rev ? this.gh.compare(installed.rev, 'master') : Promise.reject(new Error('no installed rev')),
+    ])
+    const errMsg = (r: PromiseSettledResult<unknown>) => (r.status === 'rejected' ? (r.reason instanceof Error ? r.reason.message : String(r.reason)) : '')
     let release: Record<string, unknown>
-    try {
-      const r = await this.gh.latestRelease()
+    if (relR.status === 'fulfilled') {
+      const r = relR.value
       const asset = this.pickAsset(r)
       release = { tag: r.tag_name, name: r.name, publishedAt: r.published_at, url: r.html_url, prerelease: r.prerelease, notes: r.body?.slice(0, 4000) ?? '', asset: asset ? { name: asset.name, size: asset.size } : null, checksums: !!r.assets.find((a) => a.name === this.platform.checksumFile), relation: installed.version ? cmpWord(compareVersions(r.tag_name, installed.version)) : 'unknown' }
-    } catch (e) { release = { error: e instanceof Error ? e.message : String(e) } }
+    } else release = { error: errMsg(relR) }
     let master: Record<string, unknown>
-    try {
-      const head = await this.gh.branchHead('master')
-      let ahead: { ahead_by: number; behind_by: number; commits: { sha: string; subject: string; date: string; url: string }[] } | null = null
-      if (installed.rev) { try { const c = await this.gh.compare(installed.rev, 'master'); ahead = { ahead_by: c.ahead_by, behind_by: c.behind_by, commits: c.commits.slice(-40).reverse().map((x) => ({ sha: x.sha, subject: x.commit.message.split('\n')[0], date: x.commit.committer.date, url: x.html_url })) } } catch { ahead = null } }
+    if (headR.status === 'fulfilled') {
+      const head = headR.value
+      const ahead = cmpR.status === 'fulfilled' ? { ahead_by: cmpR.value.ahead_by, behind_by: cmpR.value.behind_by, commits: cmpR.value.commits.slice(-40).reverse().map((x) => ({ sha: x.sha, subject: x.commit.message.split('\n')[0], date: x.commit.committer.date, url: x.html_url })) } : null
       master = { sha: head.sha, subject: head.commit.message.split('\n')[0], date: head.commit.committer.date, url: head.html_url, ahead, relation: installed.rev && head.sha.startsWith(installed.rev) ? 'same' : ahead ? (ahead.ahead_by > 0 ? 'newer' : 'same') : 'unknown' }
-    } catch (e) { master = { error: e instanceof Error ? e.message : String(e) } }
-    const restartPending = !!(installed.version && running?.version && (installed.version !== running.version || (installed.rev ?? '') !== (running.rev ?? '')))
+    } else master = { error: errMsg(headR) }
+    const restartPending = !!(installed.version && running?.version && (installed.version !== running.version || (installed.revFull ?? installed.rev ?? '') !== (running.revFull ?? running.rev ?? '')))
     return {
       platform: { os: this.platform.os, arch: this.platform.arch, artifactKind: this.platform.artifactKind, installer: this.installer.kind, binDir: await this.binDir(), workDir: this.workDir, controlSocket: this.controlSocket },
       installed, running, package: pkg, helper, toolchain, toolchainPlan, backups, release, master, restartPending,
@@ -730,11 +754,38 @@ export class UpgradeManager {
   private publish(job: Job | null): void { if (job) this.current = job; this.starting = false }
   private launch(job: Job, work: () => Promise<void>): Job {
     job.state = 'running'
-    void work().then(() => job.finish(), (e) => job.finish(e)).finally(() => this.cache.clear())
+    // Housekeeping runs while the job still holds the slot, so it can never delete files of a job started right after.
+    const settle = async (succeeded: boolean, e?: unknown) => {
+      job.cancellable = false; job.emitState() // the work is over; cancel would have nothing to act on
+      await this.housekeep(job, succeeded)
+      job.finish(e)
+    }
+    void work().then(() => settle(true), (e) => settle(false, e)).finally(() => this.cache.clear())
     return job
   }
 
-  async start(req: JobRequest): Promise<Job> {
+  /** Bound the work dir: drop partial downloads and extract dirs, keep the 3 newest stage dirs and 2 newest artifacts. */
+  private async housekeep(job: Job, succeeded: boolean): Promise<void> {
+    const keepNewest = async (dir: string, keep: number, filter: (name: string) => boolean = () => true) => {
+      let names: string[]
+      try { names = (await readdir(dir)).filter(filter) } catch { return }
+      const withTime = await Promise.all(names.map(async (n) => ({ n, t: (await stat(join(dir, n)).catch(() => null))?.mtimeMs ?? 0 })))
+      for (const { n } of withTime.sort((a, b) => b.t - a.t).slice(keep)) await rm(join(dir, n), { recursive: true, force: true }).catch(() => {})
+    }
+    try {
+      if (!job.dryRun && succeeded && job.result.stageDir) await rm(job.result.stageDir, { recursive: true, force: true })
+      await rm(join(this.workDir, 'extract'), { recursive: true, force: true })
+      await keepNewest(join(this.workDir, 'downloads'), 0, (n) => n.endsWith('.part'))
+      await keepNewest(join(this.workDir, 'downloads'), 2, (n) => !n.endsWith('.part'))
+      await keepNewest(join(this.workDir, 'stage'), 3)
+    } catch { /* housekeeping is best effort */ }
+  }
+
+  async start(reqIn: JobRequest): Promise<Job> {
+    // Flags must be real booleans: a client that sends "true" or 1 has asked for something and must get a 400,
+    // never a silent flip to the destructive default.
+    for (const k of ['dryRun', 'restart'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
+    const req: JobRequest = { ...reqIn, dryRun: reqIn.dryRun === true, restart: reqIn.restart !== false }
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
     this.claimSlot()
@@ -830,7 +881,7 @@ export class UpgradeManager {
     if (P.artifactKind !== 'pkg' || job.source === 'master') {
       const staged = parseVersionOutput((await run(join(stageDir, 'fips' + P.exe), ['--version'], { timeout: 5000 })).stdout)
       if (!staged) throw new Error('staged fips binary did not report a version')
-      job.result.stagedVersion = staged.rev ? `${staged.version} (rev ${staged.rev})` : staged.version
+      job.result.stagedVersion = fmtVersion(staged)
       job.info(`staged version: ${job.result.stagedVersion}`)
     } else {
       job.result.stagedVersion = job.ref === 'latest' ? 'latest release' : job.ref
@@ -848,22 +899,29 @@ export class UpgradeManager {
     const r = await job.runStep('install', () => this.installer.install(job, stageDir, job.restart))
     job.result.backupId = r.backup_id; job.result.restarted = !!r.restarted
     if (!job.restart && !job.result.restarted) { job.skipStep('restart', 'restart disabled by operator'); job.skipStep('confirm', 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
-    await job.runStep('restart', async () => { if (!job.result.restarted) job.info('installer reported no restart; waiting for the daemon anyway') })
-    await job.runStep('confirm', async () => {
-      const deadline = Date.now() + 120_000
-      while (Date.now() < deadline) {
-        const v = await this.runningVersion()
-        if (v?.version && (!before || v.pid !== before.pid)) {
-          job.result.runningVersion = v.rev ? `${v.version} (rev ${v.rev})` : v.version
-          job.info(`daemon is back: ${job.result.runningVersion} (pid ${v.pid})`)
-          const expectRev = job.result.stagedVersion?.match(/rev ([0-9a-f]+)/)?.[1]
-          if (expectRev && v.rev && expectRev !== v.rev) throw new Error(`daemon reports ${job.result.runningVersion}, expected ${job.result.stagedVersion}`)
-          return
-        }
-        await new Promise((res) => setTimeout(res, 1500))
+    await job.runStep('restart', async () => { if (!job.result.restarted) throw new Error(await this.restartFailureMessage('binaries are installed', before)) })
+    await job.runStep('confirm', () => this.awaitDaemonBack(job, before, job.result.stagedVersion))
+  }
+
+  /**
+   * Wait for the daemon to answer on the control socket with a new pid, record what it reports, and (when the
+   * expected version is known) fail if it differs. Shared by upgrade and rollback confirm steps.
+   */
+  private async awaitDaemonBack(job: Job, before: { pid?: number } | null, expected?: string): Promise<void> {
+    const deadline = Date.now() + 120_000
+    while (Date.now() < deadline) {
+      const v = await this.runningVersion()
+      if (v?.version && (!before || v.pid !== before.pid)) {
+        job.result.runningVersion = fmtVersion(v)
+        job.info(`daemon is back: ${job.result.runningVersion} (pid ${v.pid})`)
+        const expectRev = expected?.match(/rev ([^)\s]+)/)?.[1]
+        const gotRev = v.revFull ?? v.rev
+        if (expectRev && gotRev && expectRev !== gotRev) throw new Error(`daemon reports ${job.result.runningVersion}, expected ${expected}`)
+        return
       }
-      throw new Error('daemon did not answer on the control socket within 120 s after restart')
-    })
+      await new Promise((res) => setTimeout(res, 1500))
+    }
+    throw new Error('daemon did not answer on the control socket within 120 s after restart')
   }
 
   /**
@@ -881,8 +939,7 @@ export class UpgradeManager {
       const required = b.startsWith('fips.') || b === 'fips' || b.startsWith('fipsctl')
       if (!existsSync(p)) { if (required) throw new Error(`missing ${b} in ${from}`); job.info(`note: ${b} not present, skipping`); continue }
       if (expectSha) {
-        const v = parseVersionOutput((await run(p, ['--version'], { timeout: 5000 })).stdout)
-        const rev = v?.rev?.replace(/[^0-9a-f].*$/, '')
+        const rev = parseVersionOutput((await run(p, ['--version'], { timeout: 5000 })).stdout)?.rev
         if (rev && !expectSha.startsWith(rev)) { if (required) throw new Error(`${b} reports rev ${rev}, not the ${expectSha.slice(0, 10)} that was just built (left over from an earlier build)`); job.info(`note: ${b} is from an earlier build (rev ${rev}), not staged`); continue }
         if (!rev) job.info(`note: ${b} reports no revision; staged unverified`)
       }
@@ -904,20 +961,25 @@ export class UpgradeManager {
       job.defineSteps([['install', `Restore backup ${id} (privileged)`], ['confirm', 'Confirm running version']])
       const h = await this.installer.check(); if (!h.available) throw new Error(`cannot roll back: ${h.error}`)
       const before = await this.runningVersion()
-      await job.runStep('install', () => this.installer.rollback(job, id))
-      await job.runStep('confirm', async () => {
-        const deadline = Date.now() + 120_000
-        while (Date.now() < deadline) {
-          const v = await this.runningVersion()
-          if (v?.version && (!before || v.pid !== before.pid)) { job.result.runningVersion = v.rev ? `${v.version} (rev ${v.rev})` : v.version; job.info(`daemon is back: ${job.result.runningVersion}`); return }
-          await new Promise((res) => setTimeout(res, 1500))
-        }
-        throw new Error('daemon did not come back within 120 s')
-      })
+      const r = await job.runStep('install', () => this.installer.rollback(job, id))
+      const pre = r.pre_rollback_backup ?? r.backup_id
+      if (pre) { job.result.backupId = pre; job.info(`safety backup of the replaced binaries: ${pre}`) }
+      job.result.restarted = !!r.restarted; job.emitState()
+      if (!r.restarted) throw new Error(await this.restartFailureMessage('the backup is restored on disk', before))
+      await job.runStep('confirm', () => this.awaitDaemonBack(job, before))
     })
   }
 
   restartService(): Promise<string> { return this.installer.restart() }
+
+  /** The helper reports restarted:false both when the unit is unknown and when the restart failed; say which state the daemon is really in. */
+  private async restartFailureMessage(done: string, before: { pid?: number } | null): Promise<string> {
+    const v = await this.runningVersion()
+    const state = !v?.version ? 'the daemon is not answering on the control socket, so the service is probably down'
+      : before?.pid && v.pid !== before.pid ? `a daemon did come up afterwards (${fmtVersion(v)}, pid ${v.pid}), so the restart may have succeeded despite the helper's report; check the running version above`
+      : `the previously running daemon (${fmtVersion(v)}, pid ${v.pid}) is still up`
+    return `the installer could not restart the service (see the helper output above); ${done} and ${state}`
+  }
 }
 
 async function findDirContaining(root: string, file: string, depth = 3): Promise<string | null> {
@@ -949,7 +1011,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
     try {
       if (sub === '/status' && method === 'GET') { sendJson(res, 200, await mgr.status(url.searchParams.get('refresh') === '1')); return true }
       if (sub === '/backups' && method === 'GET') { sendJson(res, 200, { backups: await mgr.installer.listBackups() }); return true }
-      if (sub === '/jobs' && method === 'POST') { const body = JSON.parse((await readBody(req)) || '{}') as JobRequest; sendJson(res, 202, (await mgr.start(body)).summary()); return true }
+      if (sub === '/jobs' && method === 'POST') { const body = (await readJsonBody(req)) as unknown as JobRequest; sendJson(res, 202, (await mgr.start(body)).summary()); return true }
       if (sub === '/jobs/current' && method === 'GET') {
         const j = mgr.job; if (!j) { sendJson(res, 404, { error: 'no job' }); return true }
         sendJson(res, 200, { ...j.summary(), log: j.logSince(Number(url.searchParams.get('since') ?? '0')) }); return true
@@ -966,11 +1028,11 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
         return true
       }
       if (sub === '/jobs/current/cancel' && method === 'POST') { const j = mgr.job; if (!j) { sendJson(res, 404, { error: 'no job' }); return true } sendJson(res, 200, { cancelled: j.cancel() }); return true }
-      if (sub === '/rollback' && method === 'POST') { const body = JSON.parse((await readBody(req)) || '{}') as { id?: string }; if (!body.id) { sendJson(res, 400, { error: 'id required' }); return true } sendJson(res, 202, (await mgr.rollback(body.id)).summary()); return true }
+      if (sub === '/rollback' && method === 'POST') { const body = (await readJsonBody(req)) as { id?: unknown }; if (typeof body.id !== 'string' || !body.id) { sendJson(res, 400, { error: 'id (string) required' }); return true } sendJson(res, 202, (await mgr.rollback(body.id as string)).summary()); return true }
       if (sub === '/restart' && method === 'POST') { sendJson(res, 200, { output: await mgr.restartService() }); return true }
       if (sub === '/toolchain/plan' && method === 'GET') { sendJson(res, 200, await mgr.toolchainPlan()); return true }
       sendJson(res, 404, { error: 'not found' }); return true
-    } catch (e) { sendJson(res, e instanceof BodyTooLarge ? 413 : 400, { error: e instanceof Error ? e.message : String(e) }); return true }
+    } catch (e) { if (e instanceof BodyError) sendJson(res, e.status, { error: e.message }, e.status === 413); else sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) }); return true }
   }
   return Object.assign(handler, { manager: mgr })
 }
