@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The daemon's placeholder names for unnamed peers ("npub1ab...cdef") are no
   longer shown as names.
 
+### Changed
+
+- Web UI over the mesh accepts any `<name>.fips` address, so visitors can use a
+  name from their own hosts file. A bare name without `.fips` is still refused.
+- When the server refuses the browser (for example an address it does not
+  accept), the page shows the reason instead of "Cannot reach the FIPS UI server".
+
 ## [0.2.0] - 2026-09-26
 
 ### Added

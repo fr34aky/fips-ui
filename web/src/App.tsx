@@ -52,7 +52,8 @@ export default function App() {
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
     body = <Empty>This page needs the admin role; your npub has viewer access.</Empty>;
   } else if (!snap) {
-    body = live.conn === 'reconnecting' ? <ErrorNote>Cannot reach the FIPS UI server. Retrying…</ErrorNote> : <Empty><div className="pulse">Connecting to the node…</div></Empty>;
+    body = live.refused ? <ErrorNote>The FIPS UI server refused this browser: {live.refused}</ErrorNote>
+      : live.conn === 'reconnecting' ? <ErrorNote>Cannot reach the FIPS UI server. Retrying…</ErrorNote> : <Empty><div className="pulse">Connecting to the node…</div></Empty>;
   } else {
     switch (route.view) {
       case 'peers': body = <Peers snap={snap} health={health} onProbe={probe} selected={route.params.get('peer')} onSelect={selectPeer} />; break;

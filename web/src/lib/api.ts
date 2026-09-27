@@ -51,7 +51,7 @@ export const setAuthNeeded = authStore.setNeeded;
 
 // ------------------------------------------------------------- live store (SSE)
 export type ConnState = 'connecting' | 'live' | 'reconnecting';
-interface LiveState { snapshot: Snapshot | null; conn: ConnState; lastEventAt: number }
+interface LiveState { snapshot: Snapshot | null; conn: ConnState; lastEventAt: number; /** Why the server refuses this browser (403), shown instead of "cannot reach". */ refused?: string }
 
 const MAX_LOG_BUFFER = 2000;
 const live = (() => {
@@ -76,10 +76,14 @@ const live = (() => {
       logs = logs.length >= MAX_LOG_BUFFER ? [...logs.slice(-MAX_LOG_BUFFER + 1), line] : [...logs, line];
       logSubs.forEach((f) => f());
     });
-    es.onopen = () => set({ conn: state.snapshot ? 'live' : 'connecting' });
+    es.onopen = () => set({ conn: state.snapshot ? 'live' : 'connecting', refused: undefined });
     es.onerror = () => {
       set({ conn: 'reconnecting' });
-      const probe = () => fetch('/api/hosts', { method: 'HEAD', headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then((r) => r.status, () => 0);
+      // The same checks as the event stream, with the server's reason in the body.
+      const probe = () => fetch('/api/health', { headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then(async (r) => {
+        if (r.status === 403) { const b = await r.json().catch(() => null) as { error?: string } | null; set({ refused: b?.error ?? 'access refused' }); }
+        return r.status;
+      }, () => 0);
       const reopen = (ms: number) => setTimeout(() => { if (refs > 0 && !es) open(); }, ms);
       // A non-200 answer closes an EventSource permanently: reopen it ourselves, unless access is refused for
       // good (401 needs a token and the dialog reconnects; 403 means this client is not allowed). Temporary
