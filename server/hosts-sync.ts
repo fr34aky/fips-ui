@@ -59,6 +59,18 @@ export class HostsSync {
   status: SyncStatus = { running: false };
   private readonly deps: SyncDeps;
   private timer: NodeJS.Timeout | null = null;
+  /** Syncs, saves and removals run one at a time, in order. */
+  private chain: Promise<unknown> = Promise.resolve();
+  /** Bumped by every save: a sync started under an older configuration does not write. */
+  private gen = 0;
+  /** Turning sync off could not remove the synced names yet; retried every minute. */
+  private pendingRemoval = false;
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.chain.then(fn);
+    this.chain = p.catch(() => {});
+    return p;
+  }
 
   constructor(deps: SyncDeps) { this.deps = deps; }
 
@@ -69,7 +81,7 @@ export class HostsSync {
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.status.error = `cannot load ${FILE}: ${(e as Error).message}`; }
     // Check once a minute whether a sync is due (every intervalMin, or once a day while the master is offline).
     this.timer = setInterval(() => {
-      if (this.config.enabled && Date.now() >= (this.status.nextAttempt ?? 0)) void this.run();
+      if (this.config.enabled ? Date.now() >= (this.status.nextAttempt ?? 0) : this.pendingRemoval) void this.run();
     }, 60_000);
     this.timer.unref();
     if (this.config.enabled) void this.run();
@@ -79,13 +91,20 @@ export class HostsSync {
   async save(input: unknown): Promise<SyncStatus> {
     const cfg = validateSyncConfig(input);
     if (cfg.enabled && cfg.master === (await this.deps.ownNpub())) throw new SyncError('this node cannot follow itself');
+    // Queued behind a sync in flight, which then no longer writes (the generation changes first).
+    this.gen++;
+    return this.serial(() => this.apply(cfg));
+  }
+
+  private async apply(cfg: SyncConfig): Promise<SyncStatus> {
     await mkdir(dirname(FILE), { recursive: true, mode: 0o700 });
     const tmp = `${FILE}.${process.pid}.tmp`;
     try { await writeFile(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, FILE); }
     catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${FILE}: ${(e as Error).message}`); }
     this.config = cfg;
     this.status = { running: false };
-    if (cfg.enabled) await this.run();
+    this.pendingRemoval = !cfg.enabled;
+    if (cfg.enabled) await this.syncNow();
     else await this.removeBlock();
     return this.status;
   }
@@ -96,14 +115,22 @@ export class HostsSync {
    * hosts file while the master is offline.
    */
   async run(): Promise<SyncStatus> {
-    if (this.status.running || !this.config.enabled) return this.status;
+    if (this.status.running) return this.status;
+    if (!this.config.enabled) return this.pendingRemoval ? this.serial(async () => { await this.removeBlock(); return this.status; }) : this.status;
+    return this.serial(() => this.syncNow());
+  }
+
+  private async syncNow(): Promise<SyncStatus> {
+    if (!this.config.enabled) return this.status;
     const { master, port } = this.config;
+    const gen = this.gen;
     this.status = { ...this.status, running: true, lastAttempt: Date.now() };
     try {
       const entries = await this.fetchMaster(master, port);
       const cur = await readHosts();
       if (cur.error) throw new SyncError(`cannot read ${cur.path}: ${cur.error}`);
       const content = renderSync(cur.raw, master, await this.deps.label(master).catch(() => undefined), entries.valid);
+      if (gen !== this.gen) return this.status; // the configuration changed while fetching: the new one decides
       if (content !== cur.raw) { await this.deps.write(content, cur.base); this.status.lastChange = Date.now(); }
       this.status = { ...this.status, lastSuccess: Date.now(), received: entries.valid.length, skipped: entries.skipped, error: undefined, unreachableSince: undefined, nextAttempt: Date.now() + this.config.intervalMin * 60_000 };
     } catch (e) {
@@ -132,6 +159,9 @@ export class HostsSync {
     }
     // 503: the master's mesh listener is up but not ready (guard reloading, identity unknown): a normal retry.
     if (!res.ok || !Array.isArray(body?.entries)) throw new SyncError(`the master answered ${res.status}${body?.error ? `: ${body.error}` : ''}`);
+    // A master that cannot read its own hosts file answers with no entries and an error: never take that as
+    // "no names" (it would remove every synced name on every follower).
+    if (body.error) throw new SyncError(`the master cannot read its hosts file (${body.error}); keeping the names synced last`);
     // Only well-formed entries are taken (the same rules as the editor); the last one wins on a duplicate name.
     const byName = new Map<string, string>();
     let skipped = 0;
@@ -149,10 +179,11 @@ export class HostsSync {
   private async removeBlock(): Promise<void> {
     try {
       const cur = await readHosts();
-      if (!cur.synced) return;
-      await this.deps.write(renderSync(cur.raw, cur.synced.master, undefined, null), cur.base);
-      this.status.lastChange = Date.now();
-    } catch (e) { this.status.error = `could not remove the synced names: ${(e as Error).message}`; }
+      if (cur.error) throw new Error(`cannot read ${cur.path}: ${cur.error}`);
+      if (cur.synced) { await this.deps.write(renderSync(cur.raw, cur.synced.master, undefined, null), cur.base); this.status.lastChange = Date.now(); }
+      this.pendingRemoval = false;
+      this.status.error = undefined;
+    } catch (e) { this.status.error = `could not remove the synced names (retried every minute): ${(e as Error).message}`; }
   }
 
   close(): void { if (this.timer) clearInterval(this.timer); }

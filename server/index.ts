@@ -444,7 +444,7 @@ async function route(req: Req, res: Res) {
     } catch (e) { throw e instanceof HttpError ? e : new HttpError(e instanceof SyncError ? 400 : 500, (e as Error).message); }
   }
   if (p === '/api/hosts/sync/run') {
-    if (!hostsSync.config.enabled) throw new HttpError(400, 'syncing from a master is not configured');
+    // Syncs now, or with sync turned off retries removing names a failed removal left behind.
     return json(res, 200, { config: hostsSync.config, status: await hostsSync.run() });
   }
 

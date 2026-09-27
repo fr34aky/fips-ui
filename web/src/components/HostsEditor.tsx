@@ -172,6 +172,7 @@ function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | n
           <label className="grid gap-1 text-xs text-ink-3">Every (min)<input className="input mono w-24" type="number" min={1} max={1440} value={draft.intervalMin} onChange={(e) => setDraft({ ...draft, intervalMin: Number(e.target.value) })} /></label>
         </div>
       )}
+      {!config.enabled && status.error && <div className="flex items-center gap-2"><ErrorNote>{status.error}</ErrorNote><button className="btn sm shrink-0" disabled={busy} onClick={() => post('/api/hosts/sync/run', {}, 'Synced names removed')}><RefreshCw size={13} />Retry</button></div>}
       {config.enabled && status.error && <ErrorNote>{status.error}{status.unreachableSince ? <> Offline since {fmtAgo(status.unreachableSince)}; the names synced last stay in effect.</> : null}{status.nextAttempt ? <> Next automatic try {fmtIn(status.nextAttempt)}.</> : null}</ErrorNote>}
       {config.enabled && !status.error && status.lastSuccess && <p className="text-xs text-ink-3">{status.received} name{status.received === 1 ? '' : 's'} from the master{status.skipped ? `, ${status.skipped} invalid left out` : ''}; last change {status.lastChange ? fmtAgo(status.lastChange) : 'none since start'}.</p>}
       <div className="flex items-center gap-2">
