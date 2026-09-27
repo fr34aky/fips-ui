@@ -24,8 +24,9 @@ release: it is offered the next one. Without git history fips-ui shows `package.
 
 1. **Checks the installation**: fips-ui must run from a git checkout of the release repository, on a branch,
    without local changes. Otherwise the card explains why it cannot update itself.
-2. `git fetch --tags`, then **fast-forwards** the checkout to the release tag. A checkout with commits that are
-   not in the release (ahead of it or diverged) is refused, never rewritten.
+2. `git fetch --tags`, then **fast-forwards** the checkout to the release tag. A checkout that already contains
+   the release (it follows `main` past the tag) stays where it is and is only built and restarted. A checkout that
+   diverged from the release is refused, never rewritten.
 3. `npm ci` for the frontend when its dependencies changed or its build tools are missing (with
    `--include=dev`: the service runs with `NODE_ENV=production`), then `npm run build`.
 4. **Self-test**: starts the new server once in a mode without side effects, on a spare loopback port. If it
