@@ -1,0 +1,103 @@
+# Releases are driven by tags: pushing an annotated tag vX.Y.Z on a commit of main runs the smoke tests on that
+# commit and, when they pass, publishes the GitHub release that nodes update to (they follow releases/latest).
+#   git tag -a v0.8.0 -m "fips-ui 0.8.0" && git push origin v0.8.0
+# The notes are CHANGELOG.md's [Unreleased] section (GitHub's generated notes when it is empty); afterwards that
+# section is moved under the new version on main. A tag with a pre-release suffix (v0.8.0-rc.1) becomes a
+# pre-release, which nodes do not install.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check-tag:
+    name: Check the tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: tag
+        name: Tag format, on main, not released yet
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::tag $TAG is not vX.Y.Z or vX.Y.Z-pre"; exit 1; }
+          pre=${BASH_REMATCH[2]}
+          # Annotated only: git describe (the nodes' version) prefers annotated tags over lightweight ones.
+          git fetch -q --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          [[ $(git cat-file -t "refs/tags/$TAG") == tag ]] || { echo "::error::$TAG is a lightweight tag; use git tag -a"; exit 1; }
+          # Nodes fast-forward their checkout of main to the tag: it must be on main.
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "::error::release $TAG exists already"; exit 1; fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$([[ -n "$pre" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: Smoke tests
+    needs: check-tag
+    uses: ./.github/workflows/smoke.yml
+
+  release:
+    name: Publish the release
+    needs: [check-tag, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.check-tag.outputs.version }}
+      PRERELEASE: ${{ needs.check-tag.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main, fetch-depth: 0 }
+      - name: Release notes from [Unreleased]
+        run: |
+          # The section as of the tagged commit, between "## [Unreleased]" and the next "## [".
+          git show "$GITHUB_SHA:CHANGELOG.md" | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' > notes.md
+          if grep -q '[^[:space:]]' notes.md; then echo "notes=file" >> "$GITHUB_ENV"; else echo "notes=generated" >> "$GITHUB_ENV"; fi
+          cat notes.md
+      - name: Publish
+        run: |
+          args=(--verify-tag --title "fips-ui $VERSION")
+          [[ "$notes" == file ]] && args+=(--notes-file notes.md) || args+=(--generate-notes)
+          [[ "$PRERELEASE" == true ]] && args+=(--prerelease) || args+=(--latest)
+          gh release create "$TAG" "${args[@]}"
+      - name: Move [Unreleased] under the new version on main
+        if: env.PRERELEASE == 'false'
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$GITHUB_SHA^" 2>/dev/null || true)
+          python3 - "$VERSION" "$prev" <<'PY'
+          import re, sys, datetime
+          version, prev = sys.argv[1], sys.argv[2]
+          p = 'CHANGELOG.md'; s = open(p).read()
+          if f'## [{version}]' in s:
+              sys.exit(0)
+          # Entries merged after the tag belong to the next release: only move the section when it is unchanged.
+          m = re.search(r'^## \[Unreleased\]\n(.*?)(?=^## \[)', s, flags=re.S | re.M)
+          if m is None or m.group(1).strip() != open('notes.md').read().strip():
+              print(f'::warning::[Unreleased] changed since {version} was tagged; move its entries under {version} by hand')
+              sys.exit(0)
+          today = datetime.date.today().isoformat()
+          s = s.replace('## [Unreleased]\n', f'## [Unreleased]\n\n## [{version}] - {today}\n', 1)
+          base = 'https://github.com/fr34aky/fips-ui'
+          s = re.sub(r'^\[Unreleased\]: .*$', f'[Unreleased]: {base}/compare/v{version}...HEAD'
+                     + (f'\n[{version}]: {base}/compare/{prev}...v{version}' if prev else f'\n[{version}]: {base}/releases/tag/v{version}'),
+                     s, count=1, flags=re.M)
+          s = re.sub(r'\n{3,}', '\n\n', s)
+          open(p, 'w').write(s)
+          PY
+          git diff --quiet && exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -qam "Changelog: $VERSION"
+          for _ in 1 2 3; do git push origin HEAD:main && exit 0; git pull -q --rebase origin main; done
+          echo "::warning::could not update CHANGELOG.md on main; move [Unreleased] under $VERSION by hand"

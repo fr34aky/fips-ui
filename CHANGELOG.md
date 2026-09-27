@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Releases are tags**: pushing a `vX.Y.Z` tag on `main` runs the smoke tests
+  and publishes the GitHub release, with the `[Unreleased]` changelog section as
+  its notes (`.github/workflows/release.yml`). Not every merged change is a
+  release anymore.
+- fips-ui's version comes from the git tag of its checkout (`0.8.0`, or
+  `0.8.0+3` for commits after it) instead of `package.json`, which is no longer
+  bumped for releases.
+
+### Fixed
+
+- Version comparison of the self-update: a pre-release sorts before its release
+  and a `+build` suffix is ignored.
+
 ## [0.7.1] - 2026-09-27
 
 ### Added

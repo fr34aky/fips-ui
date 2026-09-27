@@ -1,5 +1,6 @@
 # Smoke tests: install fips-ui the way docs/install.md describes on each system, next to the newest fips daemon
 # release where upstream ships one for it, and check the running UI with scripts/smoke-test.mjs.
+# release.yml runs them on a tag before it publishes the release.
 # pfSense and OpenWrt have no images that run on GitHub's runners; they are not covered.
 name: Smoke tests
 
@@ -8,6 +9,7 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call: # from release.yml, on the tagged commit
 
 permissions:
   contents: read

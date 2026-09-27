@@ -5,6 +5,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { RELEASE_MARKER } from './version.ts';
 
 const REPO = process.env.FIPS_UI_REPO ?? 'fr34aky/fips-ui';
 const CHECK_MS = 6 * 60 * 60_000;
@@ -17,11 +18,18 @@ export interface Release { tag: string; version: string; url: string; publishedA
 export interface InstallMode { mode: 'git' | 'manual'; reason?: string; branch?: string }
 export interface UpdateJob { tag: string; state: 'running' | 'done' | 'failed'; startedAt: number; finishedAt?: number; log: string[]; error?: string; restarting?: boolean }
 
-/** -1, 0 or 1 for semantic versions like 0.3.0 (pre-release suffixes are ignored). */
+/**
+ * -1, 0 or 1 for semantic versions like 0.3.0. A pre-release sorts before its release (0.8.0-rc.1 < 0.8.0); build
+ * metadata is ignored, so a checkout past its tag ("0.8.0+3", see version.ts) counts as that release.
+ */
 export function compareVersions(a: string, b: string): number {
-  const pa = a.replace(/^v/, '').split(/[.-]/).slice(0, 3).map(Number), pb = b.replace(/^v/, '').split(/[.-]/).slice(0, 3).map(Number);
-  for (let i = 0; i < 3; i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return Math.sign(d); }
-  return 0;
+  const parse = (v: string) => { const [core, pre = ''] = v.replace(/^v/, '').split('+')[0].split(/-(.*)/s); return { n: core.split('.').slice(0, 3).map((x) => Number(x) || 0), pre }; };
+  const pa = parse(a), pb = parse(b);
+  for (let i = 0; i < 3; i++) { const d = (pa.n[i] ?? 0) - (pb.n[i] ?? 0); if (d) return Math.sign(d); }
+  if (pa.pre === pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+  return Math.sign(pa.pre.localeCompare(pb.pre, 'en', { numeric: true }));
 }
 
 // A service often runs node by absolute path (nvm, mise, a tarball) with a PATH that does not contain it; npm lives
@@ -165,7 +173,10 @@ export class SelfUpdate {
       const t = await this.selftest();
       job.log.push(...t.out.split('\n').slice(-15));
       if (!t.ok) throw new Error('the new version did not start (self-test failed)');
+      const after = (await step('git rev-parse HEAD', 'git', ['rev-parse', 'HEAD'])).trim();
       this.remember(before, tag, job);
+      // The installed release, for when git cannot tell the version later (see version.ts).
+      try { writeFileSync(path.join(this.root, '.git', RELEASE_MARKER), `${tag} ${after}\n`); } catch { /* not essential */ }
       job.state = 'done';
       job.finishedAt = Date.now();
       if (this.canRestart) { job.restarting = true; job.log.push('restarting the service…'); setTimeout(onRestart, 1500); }
