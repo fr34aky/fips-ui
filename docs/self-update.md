@@ -6,11 +6,19 @@ separate from upgrading the fips daemon ([upgrade.md](upgrade.md)).
 ## Finding new releases
 
 The server asks GitHub for the newest release of `fr34aky/fips-ui` about 10 seconds after it starts and then
-every 6 hours; **Check now** asks at once. A newer release shows as **vX available** next to the version in the
+every 6 hours; **Check now** asks at once. Releases are published from tags
+(`vX.Y.Z`, see [CONTRIBUTING.md](../CONTRIBUTING.md#releasing)); a bare tag without a release, a draft and a
+pre-release are not offered. A newer release shows as **vX available** next to the version in the
 sidebar (admins go to the Upgrade page from it, others to the release notes), and the card shows its release
 notes. Each check is one GitHub API request; unauthenticated requests are limited to 60 per hour per public IP
 address. Set `FIPS_UI_GITHUB_TOKEN` (a token without any permissions is enough) in the settings file
 (`/etc/default/fips-ui`, on FreeBSD and pfSense `/usr/local/etc/fips-ui.env`) to lift that.
+
+## Version
+
+The version in the sidebar comes from the checkout: the release tag it is on (`0.8.0`), or the last tag and the
+number of commits after it (`0.8.0+3`, for a checkout that follows `main`). Such a checkout counts as that
+release: it is offered the next one. Without git history fips-ui shows `package.json`'s version instead.
 
 ## What Update does
 

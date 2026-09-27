@@ -57,8 +57,8 @@ npm run build && npm start
 ## Branches
 
 There is one long-lived branch, `main`. Open PRs against it. Tags mark
-releases and [CHANGELOG.md](CHANGELOG.md) records what changed between
-them.
+releases (see [Releasing](#releasing)) and [CHANGELOG.md](CHANGELOG.md)
+records what changed between them.
 
 ## Reporting bugs
 
@@ -146,24 +146,46 @@ history does not need to be pretty.
 
 ## Releasing
 
+Not every merged change is a release. Changes collect under `[Unreleased]` in
+[CHANGELOG.md](CHANGELOG.md) until the maintainer decides to release them;
+a release is then a single tag:
+
+```bash
+git switch main && git pull
+git tag -a v0.8.0 -m "fips-ui 0.8.0"
+git push origin v0.8.0
+```
+
 Versions follow [Semantic Versioning](https://semver.org/): patch for fixes,
 minor for features, major for breaking changes to the API, environment
-variables or the helper protocol. The version lives in the root
-`package.json` (mirrored in `web/package.json`), is served as `uiVersion`
-from `/api/health` and shown in the sidebar. To cut a release:
+variables or the helper protocol.
 
-1. Move the `[Unreleased]` entries in [CHANGELOG.md](CHANGELOG.md) under a
-   new `## [X.Y.Z] - YYYY-MM-DD` heading and update the compare links.
-2. Set `"version"` in `package.json` and `web/package.json`.
-3. Commit as `Release X.Y.Z`, tag it `vX.Y.Z` (annotated), push with tags.
-4. Publish the GitHub release with that changelog section as its notes:
+Pushing the tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
-   ```bash
-   gh release create vX.Y.Z --title "fips-ui X.Y.Z" --notes-file <(sed -n '/^## \[X.Y.Z\]/,/^## \[/p' CHANGELOG.md | sed '1d;$d')
-   ```
+1. Checks the tag: `vX.Y.Z` or `vX.Y.Z-pre` (for example `v0.8.0-rc.1`),
+   on a commit of `main` (nodes fast-forward their checkout of `main` to it),
+   and not released yet.
+2. Runs the [smoke tests](.github/workflows/smoke.yml) on the tagged commit.
+   If they fail, nothing is published; delete the tag
+   (`git push --delete origin v0.8.0 && git tag -d v0.8.0`), fix, tag again.
+3. Publishes the GitHub release with the `[Unreleased]` section as its notes
+   (GitHub's generated notes when the section is empty). A tag with a
+   pre-release suffix becomes a pre-release, which nodes do not install.
+4. Moves the `[Unreleased]` entries under `## [X.Y.Z] - date` on `main`
+   and updates the compare links (a commit by `github-actions[bot]`; skipped
+   with a warning if `[Unreleased]` changed after the tag).
+
+Nodes see the new release on their next check ([docs/self-update.md](docs/self-update.md)).
+
+The version comes from the tag: a git checkout reports the tag it is on
+(`0.8.0`), or the last tag and the commits after it (`0.8.0+3`), as
+`uiVersion` in `/api/health` and in the sidebar (`server/version.ts`).
+`"version"` in `package.json` is only the fallback without git history
+and is not bumped for releases.
 
 Deployments made with `deploy/setup-local.sh` run from the checkout, so
-`git pull && npm run build && sudo systemctl restart fips-ui` updates them.
+the Upgrade page updates them, or by hand
+`git pull && npm run build` and a restart of the service.
 
 ## AI coding assistant policy
 

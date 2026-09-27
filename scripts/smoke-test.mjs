@@ -11,6 +11,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { uiVersion } from '../server/version.ts';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -19,7 +20,7 @@ const flag = (name) => args.includes(name);
 const base = opt('--url') ?? 'http://127.0.0.1:8321';
 const token = opt('--token') ?? process.env.FIPS_UI_TOKEN;
 
-const expectVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
+const expectVersion = uiVersion(root);
 const shippedHelper = Number(/^HELPER_VERSION=(\d+)/m.exec(readFileSync(join(root, 'scripts/fips-ui-helper'), 'utf8'))?.[1]);
 
 let failed = 0;
@@ -43,7 +44,7 @@ for (let i = 0; i < 120; i++) {
 if (!health || health.status !== 200) { check('server answers /api/health', false, health?.status ?? 'no answer'); process.exit(1); }
 const h = health.body;
 check('server answers /api/health', true);
-check('uiVersion is the checkout\'s', h.uiVersion === expectVersion, `${h.uiVersion} (package.json ${expectVersion})`);
+check('uiVersion is the checkout\'s', h.uiVersion === expectVersion, `${h.uiVersion} (checkout ${expectVersion})`);
 if (opt('--os')) check('platform os', h.platform?.os === opt('--os'), h.platform);
 if (opt('--killed-at') !== undefined) {
   const startedAt = Math.floor(Date.now() / 1000) - h.uiUptimeSecs;

@@ -15,6 +15,7 @@ import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect,
 import { HostsSync, SyncError } from './hosts-sync.ts';
 import { HostsFollowers, isSyncRequest } from './hosts-followers.ts';
 import { SelfUpdate } from './self-update.ts';
+import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
@@ -39,7 +40,7 @@ const WILDCARD_BIND = ['0.0.0.0', '::', '', '*'].includes(HOST);
 const ALLOWED_HOSTS = new Set<string>(['localhost', '127.0.0.1', '::1', ...(WILDCARD_BIND ? [] : [HOST.toLowerCase()]), ...(process.env.FIPS_UI_ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean)]);
 const HOST_CHECK = !WILDCARD_BIND || ALLOWED_HOSTS.size > 3; // a wildcard bind without an allow-list cannot know its names
 const STATIC_DIR = process.env.FIPS_UI_STATIC ?? path.join(ROOT, 'web', 'dist');
-const UI_VERSION: string = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version ?? '0.0.0'; } catch { return '0.0.0'; } })();
+const UI_VERSION = uiVersion(ROOT);
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
