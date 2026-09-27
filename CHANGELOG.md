@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Hosts file table**: a "Web UI" column shows each name's web UI access (not
   allowed, viewer, admin) and admins change it right there; granting admin asks
   for confirmation. The Access card and the table share one copy of the list.
+- With names synced from a master, the hosts card lists the synced names first
+  and folds the node's own entries into a "Local entries (N)" line (opened on
+  request, while editing, or from an "add a name…" link; remembered per browser).
 
 ## [0.3.0] - 2026-09-27
 

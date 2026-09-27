@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, RefreshCw, Save, Stethoscope, Trash2, Undo2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Plus, RefreshCw, Save, Stethoscope, Trash2, Undo2 } from 'lucide-react';
 import { Card, Chip, ConfirmDialog, Copyable, Empty, ErrorNote, useToast } from './ui';
 import { api, usePoll } from '../lib/api';
 import { NpubInline } from './PeerName';
@@ -45,6 +45,11 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
     setTimeout(() => nameInput.current?.focus(), 300);
   }, [prefillNpub]);
 
+  // With names synced from a master, the node's own (static) entries are folded away unless asked for, being
+  // edited, or the target of an "add a name…" link. The choice is remembered in this browser.
+  const [showLocal, setShowLocal] = useState(() => { try { return localStorage.getItem('fips-ui-hosts-local-open') === '1'; } catch { return false; } });
+  const toggleLocal = (open: boolean) => { setShowLocal(open); try { localStorage.setItem('fips-ui-hosts-local-open', open ? '1' : '0'); } catch { /* storage unavailable */ } };
+  const localOpen = !synced || showLocal || dirty || !!prefillNpub;
   const mode = data?.write?.mode ?? null;
   const editable = !readOnly && !!mode;
   const rows = draft ?? saved;
@@ -88,6 +93,25 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
         {error ? <div className="p-4"><ErrorNote>{error}</ErrorNote></div> : !data ? <Empty>Loading…</Empty> : (
           <div className="grid">
             {data.error && <div className="p-4"><ErrorNote>{data.error}</ErrorNote></div>}
+            {synced && (
+              <div className="border-t border-[var(--border)]">
+                <div className="px-4 pt-3 pb-1 text-xs text-ink-3 flex flex-wrap items-center gap-1.5">Synced from the master <NpubInline npub={synced.master} /> · {synced.entries.length} name{synced.entries.length === 1 ? '' : 's'} · read-only here, change them on the master</div>
+                <div className="overflow-auto max-h-[24rem]"><table className="data"><tbody>
+                  {synced.entries.map((h) => (
+                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>{showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}<td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
+                  ))}
+                </tbody></table></div>
+              </div>
+            )}
+            {synced && (
+              <button className="flex items-center gap-2 px-4 py-2.5 border-t border-[var(--border)] text-left text-sm hover:bg-[var(--surface-2)]" onClick={() => toggleLocal(!showLocal)} aria-expanded={localOpen}>
+                {localOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                <span className="font-medium">Local entries</span><span className="text-ink-3">({rows.length})</span>
+                <span className="text-xs text-ink-3">{localOpen ? 'this node\'s own names; the master\'s win on duplicates' : 'show'}</span>
+              </button>
+            )}
+            {localOpen && (
+              <>
             {rows.length === 0 ? <Empty>No names yet.</Empty> : (
               <div className="overflow-auto max-h-[32rem]"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Status</th>{accessHead}<th>Note</th><th /></tr></thead><tbody>
                 {rows.map((h, i) => { const p = peers.find((x) => x.npub === h.npub); const isNew = !saved.some((s) => s.hostname === h.hostname && s.npub === h.npub); return (
@@ -105,16 +129,6 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                 ); })}
               </tbody></table></div>
             )}
-            {synced && (
-              <div className="border-t border-[var(--border)]">
-                <div className="px-4 pt-3 pb-1 text-xs text-ink-3 flex flex-wrap items-center gap-1.5">Synced from the master <NpubInline npub={synced.master} /> · {synced.entries.length} name{synced.entries.length === 1 ? '' : 's'} · read-only here, change them on the master</div>
-                <div className="overflow-auto max-h-[24rem]"><table className="data"><tbody>
-                  {synced.entries.map((h) => (
-                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>{showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}<td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
-                  ))}
-                </tbody></table></div>
-              </div>
-            )}
             {!readOnly && data.write && !mode && <div className="px-4 pt-3"><ErrorNote>{data.write.hint}</ErrorNote></div>}
             {editable && (
               <div className="grid gap-3 p-4 border-t border-[var(--border)]">
@@ -130,6 +144,8 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                   <button className="btn primary" disabled={!dirty || busy} onClick={save}><Save size={14} />{busy ? 'Saving…' : 'Save'}</button>
                 </div>
               </div>
+            )}
+              </>
             )}
             {!readOnly && data.write && <SyncPanel peers={peers} />}
           </div>
