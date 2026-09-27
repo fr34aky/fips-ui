@@ -60,8 +60,8 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
               <div className="grid gap-3">
                 <div className="flex items-center gap-3">
                   {st.tableLoaded ? <ShieldCheck size={28} className="text-good" /> : <ShieldAlert size={28} className="text-crit" />}
-                  <div><div className="font-semibold">{st.tableLoaded && (!pf || pfSt?.pfEnabled) ? 'Protecting the FIPS interface' : 'Not protecting the FIPS interface'}</div><div className="text-xs text-ink-3">{pf
-                    ? (!pfSt?.anchorReferenced ? 'pf does not evaluate the fips-ui anchors yet' : !pfSt?.pfEnabled ? 'pf is not enabled' : st.tableLoaded ? `pf anchor ${pfSt?.anchor ?? ''} is loaded` : 'the anchor is empty: every listener is reachable from the mesh')
+                  <div><div className="font-semibold">{(pf ? st.unitActive : st.tableLoaded) ? 'Protecting the FIPS interface' : 'Not protecting the FIPS interface'}</div><div className="text-xs text-ink-3">{pf
+                    ? (!pfSt?.anchorReferenced ? 'pf does not evaluate the fips-ui anchors yet' : !pfSt?.pfEnabled ? 'pf is not enabled' : pfSt?.staleInterface ? `the rules are for ${pfSt.anchorTun}, but fips now uses ${pfSt.tun}: Reload` : st.tableLoaded ? `pf anchor ${pfSt?.anchor ?? ''} is loaded (${pfSt?.tun ?? ''})` : 'the anchor is empty: every listener is reachable from the mesh')
                     : st.tableLoaded ? 'table inet fips is loaded' : 'every listener bound to :: is reachable from the mesh'}</div></div>
                 </div>
                 <KV items={[

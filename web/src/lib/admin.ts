@@ -11,7 +11,7 @@ export interface Dropin { name: string; content: string; size: number; mtime: nu
 export interface FirewallState {
   /** nftables (Linux) or pf (FreeBSD, macOS), and where the drop-ins live. */
   backend?: 'nft' | 'pf'; dropinDir?: string; dropinExt?: string;
-  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null; pfEnabled?: boolean; anchorReferenced?: boolean; anchor?: string } | { error: string };
+  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null; pfEnabled?: boolean; anchorReferenced?: boolean; anchor?: string; tun?: string; anchorTun?: string; staleInterface?: boolean } | { error: string };
   unit: { active: string; sub: string; unitFileState?: string; since?: number } | null;
   managedRules: FirewallRule[];
   dropins: Dropin[];

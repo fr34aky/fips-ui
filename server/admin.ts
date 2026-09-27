@@ -279,14 +279,14 @@ export function createAdminHandler(opts: AdminOptions) {
   async function firewallStatus() {
     const fw = await fwTarget();
     const [st, dropins, units] = await Promise.all([
-      helperJson<{ unit_active: boolean; unit_enabled: string; table_loaded: boolean; ruleset: unknown; summary?: { dropPackets: number; dropBytes: number; rules: number }; pf_enabled?: boolean; anchor_referenced?: boolean; anchor?: string }>(['firewall-status']).catch((e: Error) => ({ error: e.message })),
+      helperJson<{ unit_active: boolean; unit_enabled: string; table_loaded: boolean; ruleset: unknown; summary?: { dropPackets: number; dropBytes: number; rules: number }; pf_enabled?: boolean; anchor_referenced?: boolean; anchor?: string; tun?: string; anchor_tun?: string; stale_interface?: boolean }>(['firewall-status']).catch((e: Error) => ({ error: e.message })),
       readDropins(fw),
       unitStates(),
     ]);
     const managed = dropins.find((d) => d.managed);
     return {
       backend: fw.backend, dropinDir: fw.dir, dropinExt: fw.ext,
-      status: 'error' in st ? { error: st.error } : { unitActive: st.unit_active, unitEnabled: st.unit_enabled, tableLoaded: st.table_loaded, summary: st.summary ?? summariseRuleset(st.ruleset), pfEnabled: st.pf_enabled, anchorReferenced: st.anchor_referenced, anchor: st.anchor },
+      status: 'error' in st ? { error: st.error } : { unitActive: st.unit_active, unitEnabled: st.unit_enabled, tableLoaded: st.table_loaded, summary: st.summary ?? summariseRuleset(st.ruleset), pfEnabled: st.pf_enabled, anchorReferenced: st.anchor_referenced, anchor: st.anchor, tun: st.tun, anchorTun: st.anchor_tun, staleInterface: st.stale_interface },
       unit: units.find((u) => u.id === 'fips-firewall') ?? null,
       managedRules: managed ? parseManagedDropin(managed.content) : [],
       dropins,
