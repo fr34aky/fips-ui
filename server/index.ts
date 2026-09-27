@@ -13,7 +13,7 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
-import { HostsFollowers, isSyncRequest } from './hosts-followers.ts';
+import { HostsFollowers, isSyncRequest, parseSubtree } from './hosts-followers.ts';
 import { SelfUpdate } from './self-update.ts';
 import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
@@ -346,6 +346,7 @@ const hostsSync = new HostsSync({
   meshAddress,
   write: writeHostsFile,
   label: async (npub) => (await readHosts()).local.find((e) => e.npub === npub)?.hostname,
+  subtree: () => hostsFollowers.subtreeHeader(),
 });
 if (!SELFTEST) void hostsSync.start();
 
@@ -430,9 +431,10 @@ async function route(req: Req, res: Res) {
     // A follower node syncing from this one (over the mesh, by its npub): remembered for the master's list.
     const pr = principalOf(req);
     const syncInfo = pr.kind === 'mesh' && method === 'GET' ? isSyncRequest(req) : null;
-    if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo).catch(() => {});
     // A sync is answered with this node's upstream chain, which lets followers detect loops.
     const own = syncInfo ? (lastSnapshot?.status as { npub?: string } | undefined)?.npub ?? await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 }).then((s) => s.npub, () => undefined) : undefined;
+    // With the nodes it reports below itself (its subtree), for the tree on this page.
+    if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo, parseSubtree(req.headers['x-fips-ui-subtree'], pr.npub, own)).catch(() => {});
     const chain = own ? await hostsSync.chainFor(own) : undefined;
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;

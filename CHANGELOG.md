@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sync hierarchy**: a node that syncs its hosts names shows where they come
+  from (`A (top) › B (parent) › this node`), and a master's followers list is a
+  tree of every node syncing below it, directly or further down. Each sync
+  request reports the sender's own subtree (header `x-fips-ui-subtree`, at most
+  128 nodes), so no extra requests are made; nodes that stop syncing drop out.
+  `npm test` runs the new unit tests, also in CI.
+
 - **Installing fips from scratch** (helper v9, verb `daemon-install`): on a
   machine without the fips daemon, `deploy/setup-local.sh` offers to install the
   newest fips release, and the Upgrade page shows an **Install fips** card. The

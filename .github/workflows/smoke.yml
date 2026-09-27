@@ -19,6 +19,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit:
+    name: Unit tests (npm test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: npm test
+
   fips-release:
     name: Fetch the fips daemon release
     runs-on: ubuntu-24.04
