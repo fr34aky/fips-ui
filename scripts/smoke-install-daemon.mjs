@@ -11,7 +11,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function call(path, body) {
   const r = await fetch(base + path, { method: body ? 'POST' : 'GET', headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10_000) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`${path}: HTTP ${r.status} ${j.error ?? ''}`);
+  if (!r.ok) throw Object.assign(new Error(`${path}: HTTP ${r.status} ${j.error ?? ''}`), { status: r.status });
   return j;
 }
 
@@ -32,6 +32,8 @@ for (let i = 0; i < 300; i++) {
     if (j.state === 'failed' || j.state === 'cancelled') { console.log(`FAIL job ${j.state}: ${j.error}`); process.exit(1); }
     if (j.state === 'succeeded' && !j.result?.restarted) break;
   } catch (e) {
+    // A 404 after the restart: the new process answers and has no job (the old one ended with it).
+    if (e.status === 404 && last?.state === 'succeeded' && last.result?.restarted) { console.log('ok   fips-ui restarted after the job (new process, no current job)'); break; }
     // Expected while fips-ui restarts into the fips group; anything longer is a failure.
     if (last?.state === 'succeeded' && last.result?.restarted) { if (++gone > 60) { console.log('FAIL fips-ui did not come back after its restart'); process.exit(1); } }
     else if (++gone > 10) { console.log(`FAIL ${e.message}`); process.exit(1); }
