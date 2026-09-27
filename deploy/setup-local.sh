@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # One-shot local setup, run with sudo from the repo checkout:
-#   sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [ui-user] [node-binary]
-# 1. checks preconditions (built frontend, Node 22.18+/23.6+/24+, the fips daemon); without fips it offers to
+#   sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [--fips-test-peer] [--fips-peer <peer>]... [ui-user] [node-binary]
+# 1. checks preconditions (built frontend, Node 22.18+/23.6+/24+)
+# 2. installs the privileged helper + its single sudoers rule for <ui-user>; without the fips daemon it offers to
 #    install the newest fips release (deploy/install-fips.sh): asks on a terminal, --install-fips installs without
-#    asking, --no-install-fips stops instead
-# 2. installs the privileged helper + its single sudoers rule for <ui-user>
+#    asking, --no-install-fips skips it (the Upgrade page can install it later). The new node keeps its identity and
+#    gets bootstrap peers: asked on a terminal, or --fips-test-peer / --fips-peer npub1...@udp/host:port
 # 3. installs a service that runs fips-ui from this checkout as <ui-user>, restarted when it exits (so the
 #    Upgrade page can update fips-ui itself):
 #      Linux with systemd  deploy/fips-ui.service + a drop-in           settings: /etc/default/fips-ui
@@ -17,14 +18,19 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 fail() { echo "error: $*" >&2; exit 1; }
 install_fips=ask
+fips_args=()   # passed to install-fips.sh: --test-peer, --peer <npub@udp/host:port>
+peer_asked=false
 args=()
-for a in "$@"; do
-  case "$a" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --install-fips) install_fips=yes ;;
     --no-install-fips) install_fips=no ;;
-    -*) fail "unknown option $a (usage: $0 [--install-fips|--no-install-fips] [ui-user] [node-binary])" ;;
-    *) args+=("$a") ;;
+    --fips-test-peer) fips_args+=(--test-peer); peer_asked=true ;;
+    --fips-peer) [[ $# -ge 2 ]] || fail "--fips-peer needs npub1...@udp/host:port"; fips_args+=(--peer "$2"); peer_asked=true; shift ;;
+    -*) fail "unknown option $1 (usage: $0 [--install-fips|--no-install-fips] [--fips-test-peer] [--fips-peer npub@udp/host:port]... [ui-user] [node-binary])" ;;
+    *) args+=("$1") ;;
   esac
+  shift
 done
 set -- ${args[@]+"${args[@]}"}
 user=${1:-${SUDO_USER:-}}
@@ -77,7 +83,11 @@ IFS=. read -r maj min _ <<<"$ver"
 svc_path="$(dirname "$node"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 echo "== $kind: node $ver at $node, UI user $user, checkout $here"
 
-# ---- the fips daemon (installed now if missing and wanted) ----
+# ---- helper + sudoers rule (prints its own self-test) ----
+echo "== helper"
+"$here/deploy/install-upgrade-helper.sh" "$user"
+
+# ---- the fips daemon (installed now if missing and wanted; else later from the Upgrade page) ----
 if ! "$here/deploy/install-fips.sh" --check >/dev/null; then
   if [[ "$install_fips" == ask ]]; then
     if [[ -t 0 ]]; then
@@ -85,17 +95,21 @@ if ! "$here/deploy/install-fips.sh" --check >/dev/null; then
       [[ "$answer" =~ ^[Yy] ]] && install_fips=yes || install_fips=no
     else install_fips=no; fi
   fi
-  [[ "$install_fips" == yes ]] || fail "the fips daemon is not installed; install it first, or run again with --install-fips"
-  echo "== fips daemon"
-  "$here/deploy/install-fips.sh"
+  if [[ "$install_fips" == yes ]]; then
+    # The release's fips.yaml has no peers: without any the node stays alone until someone dials it.
+    if ! $peer_asked && [[ -t 0 ]]; then
+      read -r -p "Connect to the public FIPS test node test-us01.fips.network? [Y/n] " answer
+      [[ "$answer" =~ ^[Nn] ]] || fips_args+=(--test-peer)
+      while read -r -p "Another peer as npub1...@udp/host:port (empty to finish): " answer && [[ -n "$answer" ]]; do fips_args+=(--peer "$answer"); done
+    fi
+    echo "== fips daemon"
+    "$here/deploy/install-fips.sh" ${fips_args[@]+"${fips_args[@]}"}
+  else
+    echo "note: the fips daemon is not installed; install it later from fips-ui's Upgrade page (or run again with --install-fips)"
+  fi
 fi
 # The daemon's control socket belongs to group fips on Linux and FreeBSD; on macOS the package may not create it.
 fips_group=true; group_exists fips || fips_group=false
-[[ "$kind" == macos ]] || $fips_group || fail "group 'fips' does not exist; install and start the fips daemon first"
-
-# ---- helper + sudoers rule (prints its own self-test) ----
-echo "== helper"
-"$here/deploy/install-upgrade-helper.sh" "$user"
 
 # ---- service ----
 echo "== service"
@@ -117,10 +131,14 @@ systemd)
   install -m 0644 -o 0 -g 0 "$here/deploy/fips-ui.service" /etc/systemd/system/fips-ui.service
   mkdir -p /etc/systemd/system/fips-ui.service.d
   extra_groups=""; getent group systemd-journal >/dev/null && extra_groups="systemd-journal"
+  # The base unit runs as group fips; without fips yet the user's own group (the user's group list, which gains
+  # fips once the Upgrade page installs it, applies either way).
+  group_line=""; $fips_group || group_line="Group="
   cat > /etc/systemd/system/fips-ui.service.d/local.conf <<UNIT
 # Generated by deploy/setup-local.sh; the base unit is deploy/fips-ui.service.
 [Service]
 User=$user
+$group_line
 SupplementaryGroups=$extra_groups
 WorkingDirectory=$here
 Environment=HOME=$home

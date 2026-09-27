@@ -56,8 +56,10 @@ jobs:
       - name: setup-local.sh, installing fips
         run: |
           sudo FIPS_UI_GITHUB_TOKEN=${{ github.token }} FIPS_UI_FIPS_ARTIFACT=${{ matrix.artifact }} \
-            ./deploy/setup-local.sh --install-fips "$USER" "$(command -v node)"
+            ./deploy/setup-local.sh --install-fips --fips-test-peer "$USER" "$(command -v node)"
           systemctl --no-pager status fips.service | head -4
+          # The initial fips.yaml: persistent identity and the bootstrap peer.
+          sudo grep -qx '    persistent: true' /etc/fips/fips.yaml && sudo grep -q 'addr: "test-us01.fips.network:2121"' /etc/fips/fips.yaml
       - name: Smoke test
         run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised
       - name: Restart after the process dies
@@ -69,6 +71,29 @@ jobs:
       - name: Logs
         if: failure()
         run: sudo journalctl -u fips-ui -u fips -n 80 --no-pager
+
+  linux-upgrade-page-install:
+    name: Linux with systemd (fresh fips install from the Upgrade page)
+    runs-on: ubuntu-24.04
+    env:
+      TEST_PEER: npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98@udp/test-us01.fips.network:2121
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Packages and build
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml nftables && npm run install:all && npm run build
+      - name: setup-local.sh without fips
+        run: sudo ./deploy/setup-local.sh --no-install-fips "$USER" "$(command -v node)"
+      - name: Install fips from the Upgrade page (helper daemon-install)
+        run: |
+          node scripts/smoke-install-daemon.mjs --peer "$TEST_PEER"
+          sudo grep -qx '    persistent: true' /etc/fips/fips.yaml && sudo grep -q 'test-us01.fips.network:2121' /etc/fips/fips.yaml
+      - name: Smoke test (fips-ui restarted into the fips group)
+        run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised
+      - name: Logs
+        if: failure()
+        run: sudo journalctl -u fips-ui -u fips -n 100 --no-pager
 
   linux-containers:
     name: Linux ${{ matrix.distro }} (no systemd, run by hand)
@@ -160,14 +185,38 @@ jobs:
             pw useradd smoke -m -s /usr/local/bin/bash
             chmod -R a+rX "$GITHUB_WORKSPACE"
             p=$GITHUB_WORKSPACE; while [ "$p" != / ]; do chmod a+x "$p"; p=$(dirname "$p"); done
-            ./deploy/setup-local.sh --install-fips smoke /usr/local/bin/node
+            ./deploy/setup-local.sh --install-fips --fips-test-peer smoke /usr/local/bin/node
             service fips status
+            grep -qx '    persistent: true' /usr/local/etc/fips/fips.yaml && grep -q 'test-us01.fips.network:2121' /usr/local/etc/fips/fips.yaml
             node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised
             killed=$(date +%s); sleep 1
             pkill -KILL -u smoke node
             sleep 6
             node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised --killed-at "$killed" \
               || { tail -n 40 /var/log/fips-ui.log; exit 1; }
+
+  freebsd-upgrade-page-install:
+    name: FreeBSD 15.1 (fresh fips install from the Upgrade page)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          usesh: true
+          prepare: |
+            pkg install -y git bash sudo curl node24 npm-node24 python3 py312-pyyaml
+          run: |
+            set -e
+            npm run install:all && npm run build
+            pw useradd smoke -m -s /usr/local/bin/bash
+            chmod -R a+rX "$GITHUB_WORKSPACE"
+            p=$GITHUB_WORKSPACE; while [ "$p" != / ]; do chmod a+x "$p"; p=$(dirname "$p"); done
+            ./deploy/setup-local.sh --no-install-fips smoke /usr/local/bin/node
+            node scripts/smoke-install-daemon.mjs --peer npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98@udp/test-us01.fips.network:2121 \
+              || { tail -n 40 /var/log/fips-ui.log; exit 1; }
+            grep -qx '    persistent: true' /usr/local/etc/fips/fips.yaml && grep -q 'test-us01.fips.network:2121' /usr/local/etc/fips/fips.yaml
+            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised || { tail -n 40 /var/log/fips-ui.log; exit 1; }
 
   macos:
     name: macOS (setup-local.sh --install-fips, experimental)
@@ -185,7 +234,9 @@ jobs:
       - name: Build
         run: npm run install:all && npm run build
       - name: setup-local.sh, installing fips
-        run: sudo FIPS_UI_GITHUB_TOKEN=${{ github.token }} ./deploy/setup-local.sh --install-fips "$USER" "$(command -v node)"
+        run: |
+          sudo FIPS_UI_GITHUB_TOKEN=${{ github.token }} ./deploy/setup-local.sh --install-fips --fips-test-peer "$USER" "$(command -v node)"
+          sudo grep -q 'test-us01.fips.network:2121' /usr/local/etc/fips/fips.yaml || { echo "no peer in the macOS fips.yaml"; sudo ls -l /usr/local/etc/fips /etc/fips 2>&1; exit 1; }
       - name: Smoke test
         run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised
       - name: Restart after the process dies
@@ -216,3 +267,27 @@ jobs:
       - name: Logs
         if: failure()
         run: Get-Content fips-ui.log, fips-ui.err -ErrorAction SilentlyContinue
+
+  macos-upgrade-page-install:
+    name: macOS (fresh fips install from the Upgrade page, experimental)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: PyYAML and build
+        run: |
+          py=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v python3)
+          sudo PIP_BREAK_SYSTEM_PACKAGES=1 "$py" -m pip install -q pyyaml
+          npm run install:all && npm run build
+      - name: setup-local.sh without fips
+        run: sudo ./deploy/setup-local.sh --no-install-fips "$USER" "$(command -v node)"
+      - name: Install fips from the Upgrade page (helper daemon-install)
+        run: |
+          node scripts/smoke-install-daemon.mjs --peer npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98@udp/test-us01.fips.network:2121
+          sudo grep -q 'test-us01.fips.network:2121' /usr/local/etc/fips/fips.yaml
+      - name: Smoke test
+        run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised
+      - name: Logs
+        if: failure()
+        run: tail -n 60 /usr/local/var/log/fips-ui.log || true

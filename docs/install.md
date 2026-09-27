@@ -19,8 +19,9 @@ What `setup-local.sh` does on every supported system:
    or 24+.
 2. Finds node the way your login shell does (nvm, mise, volta, Homebrew) and pins the real binary, so the
    service does not depend on shims.
-3. Checks that the fips daemon is installed. If it is not, it offers to install the newest fips release
-   ([below](#installing-the-fips-daemon)); without it, it stops.
+3. Checks that the fips daemon is installed. If it is not, it offers to install the newest fips release with a
+   persistent identity and bootstrap peers ([below](#installing-the-fips-daemon)), or leaves it for the
+   Upgrade page.
 4. Installs the privileged helper `/usr/local/libexec/fips-ui-helper` and one sudoers rule for the UI user
    ([node-management.md](node-management.md)).
 5. Adds the UI user to the `fips` group (the daemon's control socket), and on systemd to `systemd-journal`.
@@ -28,31 +29,51 @@ What `setup-local.sh` does on every supported system:
    when it exits, which is how fips-ui restarts after [updating itself](self-update.md).
 7. (Re)starts it and checks `/api/health`.
 
-Arguments: `sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [ui-user] [node-binary]`. The UI
+Arguments: `sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [--fips-test-peer]
+[--fips-peer npub1...@udp/host:port]... [ui-user] [node-binary]`. The UI
 user defaults to the one running sudo. Run it again after moving the checkout, changing node, or when a release ships a newer helper; it keeps an
 existing settings file.
 
 ## Installing the fips daemon
 
-On a machine without fips, `setup-local.sh` asks whether to install the newest fips release first
-(`--install-fips` installs without asking, for scripts; `--no-install-fips` stops instead). The same step on its
-own is `sudo ./deploy/install-fips.sh [--tag vX.Y.Z]`. It downloads the release from
-[jmcorgan/fips](https://github.com/jmcorgan/fips/releases), checks it against the release's
-`checksums-<os>.txt`, installs it and starts the daemon:
+fips-ui can install fips on a machine that does not have it yet, in two places:
+
+- **`setup-local.sh`** asks whether to install the newest fips release (`--install-fips` installs without
+  asking, for scripts; `--no-install-fips` skips it). It then asks for bootstrap peers, or takes them as
+  `--fips-test-peer` (the public test node) and `--fips-peer npub1...@udp/host:port` (repeatable). The same step on
+  its own is `sudo ./deploy/install-fips.sh [--tag vX.Y.Z] [--test-peer] [--peer npub1...@udp/host:port]...`.
+- **The Upgrade page**, when fips-ui runs without fips (for example after `setup-local.sh --no-install-fips`),
+  shows an **Install fips** card instead of the upgrade sources, with the same peer choices. It needs helper v9.
+
+Both run the privileged helper's `daemon-install` verb. It downloads the release from
+[jmcorgan/fips](https://github.com/jmcorgan/fips/releases) itself, so the web UI chooses at most the version,
+never the file, and checks it against the release's `checksums-<os>.txt`:
 
 | System | Package | How |
 | ------ | ------- | --- |
-| Debian, Ubuntu | `fips_<version>_<amd64\|arm64>.deb` | `apt-get install`, then `systemctl enable --now fips` |
-| Other Linux with systemd | `fips-<version>-linux-<x86_64\|aarch64>.tar.gz` | the tarball's `install.sh`, then `systemctl enable --now fips` |
-| FreeBSD | `fips-<version>-freebsd-<arch>.pkg` | `pkg add`, `sysrc fips_enable=YES`, `service fips start` |
-| pfSense | `fips-<version>-pfsense-<product>-<arch>.pkg` for this pfSense's ABI | `pkg add`, its boot script `rc.d/fips.sh start` |
-| macOS | `fips-<version>-macos-<arm64\|x86_64>.pkg` | `installer -pkg` (the package starts the daemon) |
+| Debian, Ubuntu | `fips_<version>_<amd64\|arm64>.deb` | `apt-get install` |
+| Other Linux with systemd | `fips-<version>-linux-<x86_64\|aarch64>.tar.gz` | the tarball's `install.sh` |
+| FreeBSD | `fips-<version>-freebsd-<arch>.pkg` | `pkg add`, `sysrc fips_enable=YES` |
+| pfSense | `fips-<version>-pfsense-<product>-<arch>.pkg` for this pfSense's ABI | `pkg add` |
+| macOS | `fips-<version>-macos-<arm64\|x86_64>.pkg` | `installer -pkg` |
 
-The daemon starts with the release's default configuration: an identity that changes at every start and no
-peers. Set a persistent identity and add peers on fips-ui's **Configuration** page (or in `fips.yaml`), then
-restart fips. An installed fips is never touched by this step; upgrade it from the **Upgrade** page
-([upgrade.md](upgrade.md)). `FIPS_UI_GITHUB_TOKEN` lifts GitHub's API limit, `FIPS_UI_FIPS_REPO` installs from
-another repository.
+Before the daemon's first start it adjusts the release's `fips.yaml`, which would otherwise start an isolated
+node with a new identity at every start and no peers:
+
+- `node.identity.persistent: true`: the key is generated once and kept (`fips.key` next to `fips.yaml`), so the
+  node's npub stays the same. fips-ui's mesh access and hosts names are per npub.
+- `peers:` the bootstrap peers chosen, each with `connect_policy: auto_connect`. The public test node is the
+  one upstream's template lists (`test-us01.fips.network:2121`). Without any peer the node only reaches peers
+  that connect to it.
+
+Everything else stays as the release ships it; change it on the **Configuration** page. The helper then starts
+fips, waits for its control socket and adds the UI's user to the `fips` group. On the Upgrade page fips-ui then
+restarts itself to join that group (under the services `setup-local.sh` installs), and the page reloads.
+
+An installed fips (a binary, its socket, service or group) is never touched by this step; upgrade it from the
+**Upgrade** page ([upgrade.md](upgrade.md)). Run as root, `FIPS_UI_FIPS_ARTIFACT=tarball` prefers the tarball,
+`FIPS_UI_PFSENSE_PRODUCT` names the pfSense product and `FIPS_UI_FIPS_REPO` installs from another repository;
+through the UI (sudo) they do not apply.
 
 ## After the setup
 
