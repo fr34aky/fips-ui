@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-27
+
 ### Added
 
 - **`deploy/setup-local.sh` on FreeBSD, pfSense and macOS**: besides a systemd
@@ -442,7 +444,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/fr34aky/fips-ui/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/fr34aky/fips-ui/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/fr34aky/fips-ui/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/fr34aky/fips-ui/compare/v0.5.3...v0.5.4
