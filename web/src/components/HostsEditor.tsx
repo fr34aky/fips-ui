@@ -152,6 +152,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
             )}
               </>
             )}
+            {data.write && <FollowersPanel readOnly={readOnly} />}
             {!readOnly && data.write && <SyncPanel peers={peers} />}
           </div>
         )}
@@ -256,5 +257,39 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
         title={`Give ${hostname} admin access?`} confirmLabel="Give admin access"
         body={<>Admin over the mesh has the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to an npub whose key you trust as much as this host's own login; every local user of that node shares the grant.</>} />
     </>
+  );
+}
+
+interface Follower { npub: string; address: string; firstSeen: number; lastSeen: number; count: number; entries: number; version?: string; intervalMin?: number }
+
+/** On a master: the nodes that sync their hosts names from this one, and when they last did. */
+function FollowersPanel({ readOnly }: { readOnly: boolean }) {
+  const toast = useToast();
+  const r = usePoll(() => api.get<{ followers: Follower[] }>('/api/hosts/followers'), [], 30000);
+  const list = r.data?.followers ?? [];
+  if (!list.length) return null;
+  const forget = async (npub: string) => {
+    try { await api.post('/api/hosts/followers/forget', { npub }); r.refresh(); } catch (x) { toast('err', (x as Error).message); }
+  };
+  return (
+    <div className="border-t border-[var(--border)]">
+      <div className="px-4 pt-3 pb-1 text-xs text-ink-3">Nodes syncing their names from this node · {list.length}</div>
+      <div className="overflow-auto max-h-[20rem]"><table className="data"><thead><tr><th>Node</th><th>Last sync</th><th>Names</th><th>Every</th><th>fips-ui</th><th /></tr></thead><tbody>
+        {list.map((f) => {
+          // Overdue after three missed intervals (5 minutes when the follower does not report its interval).
+          const overdue = Date.now() - f.lastSeen > 3 * (f.intervalMin ?? 5) * 60_000;
+          return (
+            <tr key={f.npub}>
+              <td><NpubInline npub={f.npub} /></td>
+              <td>{overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>
+              <td className="tabular">{f.entries}</td>
+              <td className="text-xs text-ink-3">{f.intervalMin ? `${f.intervalMin} min` : '–'}</td>
+              <td className="text-xs text-ink-3">{f.version ?? 'older'}</td>
+              <td className="text-right">{!readOnly && <button className="btn ghost icon sm" title="Forget (it reappears on its next sync)" onClick={() => void forget(f.npub)}><Trash2 size={13} /></button>}</td>
+            </tr>
+          );
+        })}
+      </tbody></table></div>
+    </div>
   );
 }

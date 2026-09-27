@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Followers on the master**: the hosts card of a master lists the nodes that
+  sync their names from it (by name and npub), with the last sync (flagged when
+  overdue), the number of names, their interval and fips-ui version. Followers
+  identify their sync with a header; older followers are recognised too.
+
 ## [0.5.4] - 2026-09-27
 
 ### Fixed

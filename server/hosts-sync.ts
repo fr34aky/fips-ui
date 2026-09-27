@@ -40,6 +40,8 @@ export interface SyncDeps {
   write: (content: string, base: string) => Promise<void>;
   /** A name for the master to put in the block header, if known. */
   label: (npub: string) => Promise<string | undefined>;
+  /** This node's fips-ui version, reported to the master. */
+  version?: string;
 }
 
 export function validateSyncConfig(input: unknown): SyncConfig {
@@ -150,7 +152,9 @@ export class HostsSync {
     const addr = await this.deps.meshAddress(master).catch((e: Error) => { throw new SyncError(`cannot derive the master's address: ${e.message}`); });
     const url = `http://[${addr}]:${port}/api/hosts`;
     let res: Response;
-    try { res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }); }
+    // The header tells the master this is a sync (it lists its followers), with this node's version and interval.
+    const sync = `version=${this.deps.version ?? ''};interval=${this.config.intervalMin}`;
+    try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync' }, signal: AbortSignal.timeout(15_000) }); }
     catch (e) { throw new SyncError(`cannot reach the master at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
     const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string } | null;
     if (res.status === 403) {
