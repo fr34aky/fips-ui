@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-27
+
 ### Added
 
 - **Hosts file editor** on the Access page: add and remove names for npubs in the
@@ -29,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name from their own hosts file. A bare name without `.fips` is still refused.
 - When the server refuses the browser (for example an address it does not
   accept), the page shows the reason instead of "Cannot reach the FIPS UI server".
+- Listener tables (Overview, Access, Firewall) scroll when long and show how
+  many listeners the mesh can reach.
+- README screenshots show the current pages, including the Services card.
+
+### Upgrading
+
+- Re-run `sudo ./deploy/setup-local.sh` to install helper v6 (needed for the
+  hosts-file editor on Linux) and restart the service.
 
 ## [0.2.0] - 2026-09-26
 
@@ -246,7 +256,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/fr34aky/fips-ui/compare/v0.1.1...v0.1.2
