@@ -162,7 +162,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
 }
 
 interface SyncConfig { enabled: boolean; master: string; port: number; intervalMin: number }
-interface SyncStatus { running: boolean; lastAttempt?: number; lastSuccess?: number; lastChange?: number; received?: number; skipped?: number; error?: string; unreachableSince?: number; nextAttempt?: number; chain?: string[] }
+interface SyncStatus { running: boolean; lastAttempt?: number; lastSuccess?: number; lastChange?: number; received?: number; skipped?: number; error?: string; unreachableSince?: number; nextAttempt?: number; chain?: string[]; chainConfirmed?: boolean }
 
 /** Follow a master node: its hosts entries are fetched over the mesh and kept in a synced block of this file. */
 function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | null }[] }) {
@@ -202,7 +202,7 @@ function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | n
       )}
       {!config.enabled && status.error && <div className="flex items-center gap-2"><ErrorNote>{status.error}</ErrorNote><button className="btn sm shrink-0" disabled={busy} onClick={() => post('/api/hosts/sync/run', {}, 'Synced names removed')}><RefreshCw size={13} />Retry</button></div>}
       {config.enabled && status.error && <ErrorNote>{status.error}{status.unreachableSince ? <> Offline since {fmtAgo(status.unreachableSince)}; the names synced last stay in effect.</> : null}{status.nextAttempt ? <> Next automatic try {fmtIn(status.nextAttempt)}.</> : null}</ErrorNote>}
-      {config.enabled && status.chain && status.chain.length > 0 && <SyncChain chain={status.chain} />}
+      {config.enabled && status.chain && status.chain.length > 0 && <SyncChain chain={status.chain} confirmed={!!status.chainConfirmed} failing={!!status.error} />}
       {config.enabled && !status.error && status.lastSuccess && <p className="text-xs text-ink-3">{status.received} name{status.received === 1 ? '' : 's'} from the master{status.skipped ? `, ${status.skipped} invalid left out` : ''}; last change {status.lastChange ? fmtAgo(status.lastChange) : 'none since start'}.</p>}
       <div className="flex items-center gap-2">
         <p className="text-xs text-ink-3 mr-auto">The master's names are fetched over the mesh from its web UI and kept in a marked block at the end of this file; on a duplicate name the master's entry wins. On the master, enable <b>Web UI over the mesh</b> and add {r.data.own ? <span className="mono">{shortKey(r.data.own, 12, 6)}</span> : "this node's npub"} as a <b>viewer</b>. Turning sync off removes the synced names.</p>
@@ -214,16 +214,18 @@ function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | n
 }
 
 /** Where this node's names come from: the top master, the masters in between and the parent (nearest first in `chain`). */
-function SyncChain({ chain }: { chain: string[] }) {
+function SyncChain({ chain, confirmed, failing }: { chain: string[]; confirmed: boolean; failing: boolean }) {
   const path = [...chain].reverse();
   return (
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs" aria-label="Sync hierarchy">
       <span className="text-ink-3 mr-1">Names flow</span>
+      {/* Only the master's own report shows what is above it; otherwise just the configured master is known. */}
+      {!confirmed && <span className="text-ink-3 inline-flex items-center gap-1.5" title={failing ? 'Known again after the next successful sync' : 'The master runs a fips-ui version that does not report its own masters'}>{failing ? 'upstream unknown' : 'further up not reported'}<ChevronRight size={13} /></span>}
       {path.map((n, i) => (
         <span key={n} className="inline-flex items-center gap-1.5">
           <span className="rounded-md bg-surface-2 px-2 py-0.5 inline-flex items-center gap-1.5">
             <NpubInline npub={n} head={8} tail={4} />
-            {i === 0 && <Chip tone="accent">top</Chip>}
+            {i === 0 && confirmed && <Chip tone="accent">top</Chip>}
             {i === path.length - 1 && <Chip>parent</Chip>}
           </span>
           <ChevronRight size={13} className="text-ink-3" />

@@ -26,6 +26,9 @@ export interface SyncStatus {
   nextAttempt?: number;
   /** The master and the nodes it syncs from in turn, nearest first (as the master reported it). */
   chain?: string[];
+  /** Whether `chain` is the master's own report; otherwise it is just the configured master (after a failed sync, or
+   *  from a master too old to send one), and what is above it is unknown. */
+  chainConfirmed?: boolean;
 }
 
 /** Longest chain of masters accepted (a deeper one is treated like a loop). */
@@ -151,6 +154,7 @@ export class HostsSync {
       // Without a fresh answer only the configured master is certain: report just that upstream, so an old chain
       // cannot make another node refuse a sync as a loop that no longer exists.
       this.status.chain = [master];
+      this.status.chainConfirmed = false;
       const offline = e instanceof SyncError && e.kind === 'offline';
       this.status = {
         ...this.status, error: (e as Error).message,
@@ -203,6 +207,7 @@ export class HostsSync {
     }
     if (chain.length > MAX_CHAIN) throw new SyncError(`the chain of masters is longer than ${MAX_CHAIN} nodes; this node keeps its current names`);
     this.status.chain = chain;
+    this.status.chainConfirmed = Array.isArray(body.chain);
     return { valid: [...byName].map(([hostname, npub]) => ({ hostname, npub })), skipped };
   }
 
