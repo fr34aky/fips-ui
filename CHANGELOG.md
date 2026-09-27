@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-27
+
 ### Added
 
 - **fips.yaml follows the template across daemon upgrades** (release and source
@@ -18,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back one) waits on the Configuration page for review. Deprecation warnings the
   new daemon logs about the configuration are reported in the job. Option on the
   Upgrade page: "Update fips.yaml to the new template" (on by default).
+
+### Upgrading
+
+- Install from the Upgrade page (fips-ui card) or `git pull && npm run build`
+  and restart fips-ui.
 
 ## [0.4.0] - 2026-09-27
 
@@ -301,7 +308,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...v0.2.0
