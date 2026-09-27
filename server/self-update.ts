@@ -24,10 +24,19 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+// A service often runs node by absolute path (nvm, mise, a tarball) with a PATH that does not contain it; npm lives
+// next to that node and starts with "#!/usr/bin/env node", so both must be found through PATH.
+const CHILD_ENV: NodeJS.ProcessEnv = { ...process.env, PATH: [path.dirname(process.execPath), process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'].join(path.delimiter), GIT_TERMINAL_PROMPT: '0' };
+
 function run(cmd: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (err, stdout, stderr) => {
-      resolve({ code: err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1) : 0, out: `${stdout}${stderr}`.trim() });
+    execFile(cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: CHILD_ENV }, (err, stdout, stderr) => {
+      const out = `${stdout}${stderr}`.trim();
+      if (!err) return resolve({ code: 0, out });
+      const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string };
+      // Say why when the command printed nothing: it could not start (ENOENT), or was killed (timeout).
+      const why = e.killed || e.signal ? `${cmd} was stopped (${e.signal ?? 'timeout'} after ${Math.round(timeoutMs / 1000)} s)` : typeof e.code === 'string' ? `${cmd} could not be started: ${e.message}` : '';
+      resolve({ code: typeof e.code === 'number' ? e.code : 1, out: [out, why].filter(Boolean).join('\n') });
     });
   });
 }
@@ -92,7 +101,7 @@ export class SelfUpdate {
   /** Start the checkout's server in self-test mode (FIPS_UI_SELFTEST=1) and wait for it to report that it runs. */
   private selftest(): Promise<{ ok: boolean; out: string }> {
     return new Promise((resolve) => {
-      const child = spawn(process.execPath, [...process.execArgv, 'server/index.ts'], { cwd: this.root, env: { ...process.env, FIPS_UI_SELFTEST: '1', INVOCATION_ID: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(process.execPath, [...process.execArgv, 'server/index.ts'], { cwd: this.root, env: { ...CHILD_ENV, FIPS_UI_SELFTEST: '1', INVOCATION_ID: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
       const done = (ok: boolean) => { clearTimeout(timer); child.kill('SIGKILL'); resolve({ ok, out: out.trim() }); };
       const timer = setTimeout(() => done(false), 30_000);

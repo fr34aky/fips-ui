@@ -51,6 +51,8 @@ User=$user
 SupplementaryGroups=$extra_groups
 WorkingDirectory=$here
 Environment=HOME=$home
+# node's own directory first: npm (self-update) lives next to it when node comes from nvm, mise or a tarball.
+Environment=PATH=$(dirname "$node"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=
 ExecStart=$node server/index.ts
 UNIT

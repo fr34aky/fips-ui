@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-27
+
+### Fixed
+
+- Updating fips-ui from the Upgrade page failed silently at `npm ci` when node
+  comes from nvm, mise or a tarball: the service starts node by its absolute
+  path, and `npm` (next to it) was not on the service's PATH. The updater now
+  puts node's directory first on PATH for its commands, and the job log says why
+  a command could not start or was stopped. `deploy/setup-local.sh` also adds
+  node's directory to the service's PATH.
+
+### Upgrading
+
+- Nodes on 0.5.2 or older run the previous updater: update them once from a
+  shell (`git pull && npm ci --prefix web && npm run build`, then restart
+  fips-ui), or re-run `sudo ./deploy/setup-local.sh` first, which fixes the
+  service's PATH so the Update button works.
+
 ## [0.5.2] - 2026-09-27
 
 ### Fixed
@@ -327,7 +345,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/fr34aky/fips-ui/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/fr34aky/fips-ui/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/fr34aky/fips-ui/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...v0.5.0
