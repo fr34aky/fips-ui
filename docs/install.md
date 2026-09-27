@@ -59,7 +59,7 @@ account instead of your own user is described in the README (Running as a servic
 
 ```sh
 # Prerequisites (as root); python and PyYAML only for the configuration editor
-pkg install git bash sudo node24 npm-node24 python3 py311-pyyaml
+pkg install git bash sudo node24 npm-node24 python3 py312-pyyaml
 
 git clone https://github.com/fr34aky/fips-ui.git && cd fips-ui
 npm run install:all && npm run build
@@ -67,7 +67,7 @@ sudo ./deploy/setup-local.sh
 ```
 
 - The fips daemon must be installed first (its package creates the `fips` group). The PyYAML package is named
-  after the Python version (`py311-pyyaml`, `py312-pyyaml`, …: `pkg search pyyaml`).
+  after the Python version (`py312-pyyaml`, `py311-pyyaml`, …: `pkg search pyyaml`).
 - `bash` is needed by the setup script and the helper; they are started through `#!/usr/bin/env bash`.
 - The service is `/usr/local/etc/rc.d/fips_ui`, enabled with `sysrc fips_ui_enable=YES`. It runs node under
   daemon(8), which restarts it after it exits. Manage it with `sudo service fips_ui restart|stop|status`.

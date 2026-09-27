@@ -1,0 +1,214 @@
+# Smoke tests: install fips-ui the way docs/install.md describes on each system, next to the newest fips daemon
+# release where upstream ships one for it, and check the running UI with scripts/smoke-test.mjs.
+# pfSense and OpenWrt have no images that run on GitHub's runners; they are not covered.
+name: Smoke tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fips-release:
+    name: Fetch the fips daemon release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download the newest release's packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir fips-pkg && cd fips-pkg
+          gh release download -R jmcorgan/fips \
+            -p 'fips_*_amd64.deb' -p 'fips-*-linux-x86_64.tar.gz' -p 'fips-*-freebsd-amd64.pkg' \
+            -p 'fips-*-macos-arm64.pkg' -p 'fips-*-windows-x86_64.zip'
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fips-pkg
+          path: fips-pkg
+          retention-days: 1
+
+  linux-systemd:
+    name: Linux with systemd (Ubuntu 24.04, setup-local.sh)
+    needs: fips-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: fips-pkg, path: /tmp/fips-pkg }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Install the fips daemon (.deb)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-yaml nftables /tmp/fips-pkg/fips_*_amd64.deb
+          sudo systemctl enable --now fips.service
+          sleep 3; systemctl --no-pager status fips.service | head -5
+      - name: Build
+        run: npm run install:all && npm run build
+      - name: setup-local.sh
+        run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
+      - name: Smoke test
+        run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised | tee /tmp/smoke.out
+      - name: Restart after the process dies
+        run: |
+          sudo systemctl kill -s KILL fips-ui.service
+          sleep 5
+          node scripts/smoke-test.mjs --os linux --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
+      - name: Logs
+        if: failure()
+        run: sudo journalctl -u fips-ui -u fips -n 80 --no-pager
+
+  linux-containers:
+    name: Linux ${{ matrix.distro }} (no systemd, run by hand)
+    needs: fips-release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:trixie
+            deps: apt-get update -qq && apt-get install -y -qq git bash procps python3-yaml ca-certificates
+            setup-node: true
+          - distro: fedora
+            image: fedora:latest
+            deps: dnf install -y -q git bash procps-ng python3-pyyaml nodejs npm
+          - distro: arch
+            image: archlinux:latest
+            deps: pacman -Syu --noconfirm --quiet git bash procps-ng python-yaml nodejs npm
+          - distro: alpine
+            image: alpine:latest
+            deps: apk add --no-cache git bash procps coreutils py3-yaml nodejs-current npm gcompat
+    container:
+      image: ${{ matrix.image }}
+      options: --cap-add NET_ADMIN --device /dev/net/tun
+    steps:
+      - name: Install packages
+        run: ${{ matrix.deps }}
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: fips-pkg, path: /tmp/fips-pkg }
+      - uses: actions/setup-node@v4
+        if: matrix.setup-node
+        with: { node-version: 24 }
+      - name: Node version
+        run: node -v
+      - name: Start the fips daemon (release tarball)
+        shell: bash
+        run: |
+          tar xzf /tmp/fips-pkg/fips-*-linux-x86_64.tar.gz -C /tmp
+          d=$(echo /tmp/fips-*-linux-x86_64)
+          install -m 0755 "$d/fips" "$d/fipsctl" /usr/local/bin/
+          mkdir -p /etc/fips /run/fips
+          install -m 0600 "$d/fips.yaml" /etc/fips/fips.yaml
+          install -m 0644 "$d/hosts" /etc/fips/hosts
+          (fips --config /etc/fips/fips.yaml >/tmp/fips.log 2>&1 &)
+          for _ in $(seq 1 20); do [ -S /run/fips/control.sock ] && break; sleep 0.5; done
+          ls -l /run/fips || true
+      - name: Build
+        run: npm run install:all && npm run build
+      - name: setup-local.sh refuses without systemd
+        shell: bash
+        run: |
+          id smoke >/dev/null 2>&1 || useradd -m smoke 2>/dev/null || adduser -D smoke
+          if out=$(./deploy/setup-local.sh smoke 2>&1); then echo "expected a refusal, got: $out"; exit 1; fi
+          echo "$out"; grep -q "docs/install.md" <<<"$out"
+      - name: Helper self-check
+        shell: bash
+        run: bash scripts/fips-ui-helper check | tee /tmp/check.json && node -e 'JSON.parse(require("fs").readFileSync("/tmp/check.json","utf8"))'
+      - name: Run fips-ui and smoke test
+        shell: bash
+        run: |
+          (NODE_ENV=production node server/index.ts >/tmp/fips-ui.log 2>&1 &)
+          node scripts/smoke-test.mjs --os linux --daemon
+      - name: Logs
+        if: failure()
+        run: cat /tmp/fips-ui.log /tmp/fips.log || true
+
+  freebsd:
+    name: FreeBSD 15.1 (setup-local.sh)
+    needs: fips-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: fips-pkg, path: fips-pkg }
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          usesh: true
+          prepare: |
+            pkg install -y git bash sudo node24 npm-node24 python3 py312-pyyaml
+          run: |
+            set -e
+            pkg add fips-pkg/fips-*-freebsd-amd64.pkg
+            sysrc fips_enable=YES
+            service fips start </dev/null >/dev/null 2>&1
+            sleep 3; service fips status || true
+            npm run install:all && npm run build
+            pw useradd smoke -m -s /usr/local/bin/bash
+            chmod -R a+rX "$GITHUB_WORKSPACE"
+            p=$GITHUB_WORKSPACE; while [ "$p" != / ]; do chmod a+x "$p"; p=$(dirname "$p"); done
+            ./deploy/setup-local.sh smoke /usr/local/bin/node
+            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised | tee /tmp/smoke.out
+            pkill -KILL -u smoke node
+            sleep 6
+            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)" \
+              || { tail -n 40 /var/log/fips-ui.log; exit 1; }
+
+  macos:
+    name: macOS (setup-local.sh, experimental)
+    needs: fips-release
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: fips-pkg, path: /tmp/fips-pkg }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Install the fips daemon (.pkg)
+        run: |
+          sudo installer -pkg /tmp/fips-pkg/fips-*-macos-arm64.pkg -target /
+          sleep 5; sudo launchctl list | grep -i fips || true; ls -l /var/run/fips || true
+      - name: Build
+        run: npm run install:all && npm run build
+      - name: setup-local.sh
+        run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
+      - name: Smoke test
+        run: node scripts/smoke-test.mjs --os macos --helper --supervised | tee /tmp/smoke.out
+      - name: Restart after the process dies
+        run: |
+          sudo pkill -KILL -u "$USER" -f 'server/index.ts'
+          sleep 12
+          node scripts/smoke-test.mjs --os macos --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
+      - name: Logs
+        if: failure()
+        run: tail -n 60 /usr/local/var/log/fips-ui.log || true
+
+  windows:
+    name: Windows (run by hand, experimental)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Build
+        run: npm run install:all; npm run build
+      - name: Run fips-ui and smoke test
+        shell: pwsh
+        run: |
+          $env:NODE_ENV = 'production'
+          Start-Process -FilePath node -ArgumentList 'server/index.ts' -RedirectStandardOutput fips-ui.log -RedirectStandardError fips-ui.err -NoNewWindow
+          node scripts/smoke-test.mjs --os windows
+      - name: Logs
+        if: failure()
+        run: Get-Content fips-ui.log, fips-ui.err -ErrorAction SilentlyContinue

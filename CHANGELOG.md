@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit it now installs an rc.d service (FreeBSD, run by daemon(8)), a boot
   script (pfSense) or a LaunchDaemon (macOS, experimental), with the helper, the
   `fips` group and a health check, as on Linux.
+- **Smoke tests in CI** (`.github/workflows/smoke.yml`, `scripts/smoke-test.mjs`):
+  every pull request installs fips-ui next to the newest fips daemon release on
+  Ubuntu with systemd (via `setup-local.sh`), Debian, Fedora, Arch and Alpine
+  (containers, run by hand), FreeBSD 15.1 (`setup-local.sh` in a VM), macOS
+  (`setup-local.sh`) and Windows, and checks the API, the helper, and that the
+  service restarts fips-ui after it dies. pfSense and OpenWrt are not covered.
 - **Installation guide per system** (`docs/install.md`): Linux, FreeBSD, pfSense,
   macOS, OpenRC/OpenWrt and Windows.
 
