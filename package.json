@@ -1,6 +1,6 @@
 {
   "name": "fips-ui",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Web dashboard to watch and manage a FIPS mesh node",
