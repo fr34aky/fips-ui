@@ -126,13 +126,24 @@ svc_active() {
     *) return 1 ;;
   esac
 }
+# rc.d scripts on FreeBSD and pfSense start fips under daemon(8) without detaching its stdout/stderr, so the
+# supervisor would keep the caller's pipes open for good (the helper's $(...) and the UI's pipe then never see
+# EOF). Their output goes to a file instead, and is passed on to stderr once the script returns.
+rc_script() {
+  local out rc
+  out=$(mktemp)
+  "$@" >"$out" 2>&1 </dev/null 9>&-; rc=$?
+  [[ -s "$out" ]] && sed 's/^/  /' "$out" >&2
+  rm -f "$out"
+  return $rc
+}
 # 9>&- : a daemon started by the service manager must not inherit the helper lock.
 svc_restart() {
   case "$SM" in
     systemd) systemctl restart "$1" 9>&- ;;
     launchd) launchctl kickstart -k "system/$1" 9>&- ;;
-    rc)      service "$1" restart 9>&- ;;
-    pfsense) "/usr/local/etc/rc.d/$1.sh" restart 9>&- ;;
+    rc)      rc_script service "$1" restart ;;
+    pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" restart ;;
     openrc)  rc-service "$1" restart 9>&- ;;
     sysv)    "/etc/init.d/$1" restart 9>&- ;;
     *) return 1 ;;

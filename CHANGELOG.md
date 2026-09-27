@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed (`ce2.8`, `ce2.9-plus26` or `plus26`); a release without one is
   refused. Source builds are not offered on pfSense. Helper v7 restarts fips
   through pfSense's boot script (`rc.d/fips.sh`).
+- Restarting fips through an rc.d script (FreeBSD, pfSense) could hang the
+  upgrade: daemon(8) kept the helper's output pipe open. The script's output now
+  goes through a file. pfSense upgrades require helper v7.
 
 ### Documentation
 

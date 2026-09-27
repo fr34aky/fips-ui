@@ -512,7 +512,7 @@ interface InstallResult { backup_id?: string; restarted?: boolean; installed_ver
 
 interface Installer {
   kind: string
-  check(): Promise<{ available: boolean; error?: string; detail?: string }>
+  check(): Promise<{ available: boolean; error?: string; detail?: string; version?: number }>
   install(job: Job, stageDir: string, restart: boolean): Promise<InstallResult>
   rollback(job: Job, backupId: string): Promise<InstallResult>
   restart(): Promise<string>
@@ -532,7 +532,7 @@ class HelperInstaller implements Installer {
     const [c, a] = this.cmd(['check'])
     const r = await run(c, a, { timeout: 15_000 })
     if (r.code !== 0) return { available: false, error: (r.stderr || r.stdout).trim().split('\n')[0] || `helper exited ${r.code}` }
-    try { const j = JSON.parse(r.stdout); return { available: j.ok === true, detail: `helper v${j.version} · ${j.service_manager ?? '?'} · bin ${j.bin_dir}` } }
+    try { const j = JSON.parse(r.stdout); return { available: j.ok === true, version: Number(j.version) || 0, detail: `helper v${j.version} · ${j.service_manager ?? '?'} · bin ${j.bin_dir}` } }
     catch { return { available: false, error: 'helper returned invalid JSON' } }
   }
   async install(job: Job, stageDir: string, restart: boolean) { const [c, a] = this.cmd(['install', stageDir, ...(restart ? [] : ['--no-restart'])]); return JSON.parse(lastJsonLine(await job.exec(c, a))) as InstallResult }
@@ -843,9 +843,11 @@ export class UpgradeManager {
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
     this.claimSlot()
     if (!req.dryRun) {
-      let h: { available: boolean; error?: string }
+      let h: { available: boolean; error?: string; version?: number }
       try { h = await this.installer.check() } catch (e) { this.publish(null); throw e }
       if (!h.available) { this.publish(null); throw new Error(`cannot install: ${h.error ?? 'privileged installer unavailable'}. Install the helper first, or start a dry run.`) }
+      // Helpers before v7 do not know pfSense's boot scripts: they would install the package but never restart fips.
+      if (this.platform.pfsense && (h.version ?? 0) < 7) { this.publish(null); throw new Error(`pfSense needs helper v7 or newer (installed: v${h.version ?? '?'}); install it with deploy/install-upgrade-helper.sh from this fips-ui version first`) }
     }
     const job = new Job(req.source, req)
     this.publish(job)
