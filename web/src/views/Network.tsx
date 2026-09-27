@@ -3,6 +3,7 @@ import { Card, Chip, StatusChip, Copyable, KV, Empty, ErrorNote, useNow } from '
 import { CounterTable } from '../components/CounterTable';
 import { fmtBytes, fmtAgo, shortKey, fmtDuration, fmtMs, fmtPct, fmtBits } from '../lib/format';
 import { api, usePoll } from '../lib/api';
+import { NameText } from '../components/PeerName';
 
 export function Network({ snap, onSelectPeer }: { snap: Snapshot; onSelectPeer: (npub: string) => void }) {
   const now = useNow(1000);
@@ -54,7 +55,7 @@ export function Network({ snap, onSelectPeer }: { snap: Snapshot; onSelectPeer: 
       <Card title={`End-to-end sessions (${sessions.length})`} hint="Noise XK sessions to remote mesh endpoints, independent of the hop-by-hop peer links" pad={false}>
         {sessions.length === 0 ? <Empty>No active sessions. Sessions appear when traffic flows to a remote node.</Empty> : (
           <div className="overflow-x-auto"><table className="data"><thead><tr><th>Remote</th><th>State</th><th>Role</th><th className="num">RTT</th><th className="num">Loss</th><th className="num">Goodput</th><th>Last activity</th></tr></thead><tbody>
-            {sessions.map((s, i) => <tr key={s.remote_addr + i}><td><div className="font-medium">{s.display_name || shortKey(s.npub ?? s.remote_addr, 10, 6)}</div><div className="text-[11px] text-ink-3 mono">{shortKey(s.remote_addr, 10, 6)}</div></td><td><StatusChip value={s.state} />{s.is_draining && <Chip tone="warn" className="ml-1">draining</Chip>}</td><td className="text-xs">{s.is_initiator ? 'initiator' : 'responder'}</td><td className="num">{fmtMs(s.mmp?.srtt_ms)}</td><td className="num">{fmtPct(s.mmp?.loss_rate)}</td><td className="num">{fmtBits(s.mmp?.goodput_bps)}</td><td className="text-xs text-ink-3">{fmtAgo(s.last_activity_ms, now)}</td></tr>)}
+            {sessions.map((s, i) => <tr key={s.remote_addr + i}><td><div className="font-medium"><NameText npub={s.npub} name={s.display_name} fallback={shortKey(s.npub ?? s.remote_addr, 10, 6)} /></div><div className="text-[11px] text-ink-3 mono">{s.npub ? shortKey(s.npub, 10, 6) : shortKey(s.remote_addr, 10, 6)}</div></td><td><StatusChip value={s.state} />{s.is_draining && <Chip tone="warn" className="ml-1">draining</Chip>}</td><td className="text-xs">{s.is_initiator ? 'initiator' : 'responder'}</td><td className="num">{fmtMs(s.mmp?.srtt_ms)}</td><td className="num">{fmtPct(s.mmp?.loss_rate)}</td><td className="num">{fmtBits(s.mmp?.goodput_bps)}</td><td className="text-xs text-ink-3">{fmtAgo(s.last_activity_ms, now)}</td></tr>)}
           </tbody></table></div>
         )}
       </Card>

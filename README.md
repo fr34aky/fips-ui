@@ -19,7 +19,7 @@ reachability probes, and (optionally) upgrade the node.
 | **Internals** | Every protocol counter family (searchable), routing state (pending lookups, retries, congestion), Bloom filters with fill meters, coordinate and identity caches. |
 | **Logs** | Live `journalctl -u fips` with level filter, search, pause, and target highlighting. |
 | **Diagnostics** | Staged reachability probes (bloom → discovery → path → session → RTT) against any npub or hosts-file name, with path visualisation and a run history. |
-| **Access** | **Web UI over the mesh**: let other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). Also peer ACL state, firewall exposure of local listeners, the `/etc/fips/hosts` table, identity file facts. |
+| **Access** | **Web UI over the mesh**: let other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). Also peer ACL state, firewall exposure of local listeners, identity file facts, and an editor for the FIPS **hosts file**: names for npubs, resolved as `<name>.fips` and shown next to npubs everywhere in the UI. |
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
 | **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
@@ -48,7 +48,8 @@ for everything else, so the read-only pages work wherever FIPS runs:
 | Windows | TCP `127.0.0.1:21210` | Service Control Manager | `%ProgramData%\fips\logs\fips.log` |
 
 The node-management pages (configuration editor, firewall) and remote access over the mesh currently need
-Linux with systemd; the upgrade flow targets all of the above but has only been tested on Linux.
+Linux with systemd. The hosts-file editor works everywhere: through the helper on Linux with systemd, elsewhere
+directly when the UI's user may write the hosts file (the per-OS path is in the Access page); the upgrade flow targets all of the above but has only been tested on Linux.
 `deploy/setup-local.sh` is systemd-only.
 
 ## Quick start

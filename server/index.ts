@@ -9,7 +9,8 @@ import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, type FirewallRule } from './admin.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, type FirewallRule } from './admin.ts';
+import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect } from './hosts.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -260,6 +261,27 @@ const admin = createAdminHandler({
   authorize: (req) => canChange(req),
   busy: () => { const j = upgrade.manager.job; return upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued')) ? 'an upgrade job is running; wait for it to finish' : null; },
 });
+/**
+ * How this instance can write the hosts file: through the helper (Linux with systemd, the standard path), directly
+ * (the process may write the file, e.g. running as root or an elevated Windows service), or not at all.
+ */
+async function hostsWriteMode(): Promise<{ mode: 'helper' | 'direct' | null; hint: string }> {
+  if (READ_ONLY) return { mode: null, hint: 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)' };
+  if (PLATFORM.serviceManager === 'systemd' && HOSTS_PATH === '/etc/fips/hosts') {
+    const h = await admin.helperInfo();
+    if (h.available && (h.version ?? 0) >= HOSTS_HELPER_VERSION) return { mode: 'helper', hint: 'saved through the privileged helper' };
+  }
+  const target = fs.existsSync(HOSTS_PATH) ? HOSTS_PATH : path.dirname(HOSTS_PATH);
+  try { await fs.promises.access(target, fs.constants.W_OK); return { mode: 'direct', hint: `written directly to ${HOSTS_PATH}` }; }
+  catch {
+    return { mode: null, hint: PLATFORM.serviceManager === 'systemd'
+      ? `editing ${HOSTS_PATH} needs the privileged helper v${HOSTS_HELPER_VERSION}: run sudo ./deploy/setup-local.sh`
+      : PLATFORM.os === 'windows'
+        ? `the UI cannot write ${HOSTS_PATH}: run it elevated or give its user write access to that file`
+        : `the UI cannot write ${HOSTS_PATH}: give its user write access to that file (e.g. group-writable) or run it as root` };
+  }
+}
+
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   if (READ_ONLY) return null;
@@ -325,7 +347,12 @@ async function route(req: Req, res: Res) {
     const h = await admin.helperInfo();
     return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
   }
-  if (p === '/api/hosts') return json(res, 200, await readHosts());
+  if (p === '/api/hosts' && method !== 'POST') {
+    const h = await readHosts();
+    // Admins also learn whether (and how) this instance can write the file.
+    const write = canChange(req) ? await hostsWriteMode() : undefined;
+    return json(res, 200, { path: h.path, entries: h.entries, base: h.base, error: h.error, ...(write !== undefined ? { write } : {}) });
+  }
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {
     const requested = Number(url.searchParams.get('lines') ?? 300);
@@ -358,6 +385,29 @@ async function route(req: Req, res: Res) {
       : await syncMesh().catch((e) => ({ ok: false, guard: (e as Error).message }));
     await mesh.reconcile();
     return json(res, 200, { config: mesh.config, status: mesh.status(), firewall });
+  }
+
+  if (p === '/api/hosts') {
+    const { entries, base } = body as { entries?: unknown; base?: unknown };
+    const cur = await readHosts();
+    if (cur.error) throw new HttpError(500, `cannot read ${cur.path}: ${cur.error}`);
+    let want: { hostname: string; npub: string }[];
+    try { want = validateEntries(entries, cur.entries); } catch (e) { throw new HttpError(400, (e as Error).message); }
+    if (base !== cur.base) throw new HttpError(409, `${cur.path} changed since it was loaded; reload and make the change again`);
+    const content = renderHosts(cur.raw, want);
+    const mode = await hostsWriteMode();
+    if (!mode.mode) throw new HttpError(403, mode.hint);
+    try {
+      if (mode.mode === 'helper') {
+        const r = await admin.hostsApply(content, cur.base);
+        if (!r.ok) throw new HttpError(422, r.error ?? 'the helper refused the change');
+      } else if (content !== cur.raw) await writeHostsDirect(content);
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      throw new HttpError(e instanceof HostsError ? 403 : /changed since/.test((e as Error).message) ? 409 : /in progress/.test((e as Error).message) ? 409 : 500, (e as Error).message);
+    }
+    const after = await readHosts();
+    return json(res, 200, { ok: true, path: after.path, entries: after.entries, base: after.base });
   }
 
   if (p === '/api/connect') {

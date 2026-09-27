@@ -5,6 +5,7 @@ import { Card, Chip, Copyable, KV, Empty, ErrorNote, Segmented, useNow } from '.
 import { CounterTable } from '../components/CounterTable';
 import { fmtPct, fmtNum, shortKey, fmtDuration, fmtAgo, titleCase } from '../lib/format';
 import { api, usePoll } from '../lib/api';
+import { NameText } from '../components/PeerName';
 
 type Tab = 'counters' | 'routing' | 'bloom' | 'caches';
 
@@ -118,7 +119,7 @@ function Caches() {
       <Card title="Identity cache" hint="Known node public keys and their derived addresses" pad={false}>
         {idc.error ? <div className="p-4"><ErrorNote>{idc.error}</ErrorNote></div> : !idc.data ? <Empty>Loading…</Empty> : idc.data.entries.length === 0 ? <Empty>No identities cached.</Empty> : (
           <div className="overflow-x-auto"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Node addr</th><th>IPv6</th><th>Last seen</th></tr></thead><tbody>
-            {idc.data.entries.map((e) => <tr key={e.node_addr}><td className="font-medium">{e.display_name || <span className="text-ink-3">–</span>}</td><td><Copyable text={e.npub} display={shortKey(e.npub, 12, 6)} /></td><td><Copyable text={e.node_addr} display={shortKey(e.node_addr, 8, 6)} /></td><td><Copyable text={e.ipv6_addr} /></td><td className="text-xs text-ink-3">{fmtAgo(e.last_seen_ms, now)}</td></tr>)}
+            {idc.data.entries.map((e) => <tr key={e.node_addr}><td className="font-medium"><NameText npub={e.npub} name={e.display_name} fallback={<span className="text-ink-3">–</span>} /></td><td><Copyable text={e.npub} display={shortKey(e.npub, 12, 6)} /></td><td><Copyable text={e.node_addr} display={shortKey(e.node_addr, 8, 6)} /></td><td><Copyable text={e.ipv6_addr} /></td><td className="text-xs text-ink-3">{fmtAgo(e.last_seen_ms, now)}</td></tr>)}
           </tbody></table></div>
         )}
       </Card>

@@ -6,6 +6,7 @@ import { adminApi, withResult, type DropinResult, type FirewallRule, type RuleSo
 import { api, usePoll } from '../lib/api';
 import { fmtAgo, fmtBytes, fmtNum, shortKey } from '../lib/format';
 import { HelperGate } from '../components/HelperGate';
+import { NpubInline } from '../components/PeerName';
 
 type Prefill = { proto?: 'tcp' | 'udp'; port?: string; comment?: string } | null;
 
@@ -138,7 +139,7 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
 
 function Sources({ sources }: { sources: RuleSource[] }) {
   if (sources.some((s) => s.kind === 'any')) return <Chip tone="warn">anyone on the mesh</Chip>;
-  return <div className="flex flex-wrap gap-1">{sources.map((s, i) => s.kind === 'npub' ? <span key={i} className="chip" title={`${s.npub}\n${s.addr ?? ''}`}>{s.label || shortKey(s.npub, 10, 4)}</span> : s.kind === 'prefix' ? <span key={i} className="chip mono" title={s.prefix}>{s.label || s.prefix}</span> : null)}</div>;
+  return <div className="flex flex-wrap gap-1">{sources.map((s, i) => s.kind === 'npub' ? <span key={i} className="chip" title={`${s.npub}\n${s.addr ?? ''}`}><NpubInline npub={s.npub} name={s.label} head={8} tail={4} /></span> : s.kind === 'prefix' ? <span key={i} className="chip mono" title={s.prefix}>{s.label || s.prefix}</span> : null)}</div>;
 }
 
 type SourceMode = 'any' | 'npubs' | 'prefix';

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hosts file editor** on the Access page: add and remove names for npubs in the
+  FIPS hosts file (`<name>.fips`), with comments, order and line endings kept and
+  a refusal when the file changed meanwhile. The daemon picks changes up on its
+  next lookup. On Linux with systemd it is written through the helper (new verb
+  `hosts-apply`, helper v6, previous file kept as a backup); on other systems
+  directly when the UI may write the file (`%ProgramData%\fips\hosts` on
+  Windows, `/usr/local/etc/fips/hosts` or `/etc/fips/hosts` on macOS and
+  FreeBSD). Peer details link to it ("add a name…").
+- **Names next to npubs** throughout the UI: the header, overview, peers,
+  topology, sessions, identity cache, diagnostics, peer ACL, firewall rules and
+  the mesh-access list show the hosts-file name together with the shortened npub.
+  The daemon's placeholder names for unnamed peers ("npub1ab...cdef") are no
+  longer shown as names.
+
 ## [0.2.0] - 2026-09-26
 
 ### Added

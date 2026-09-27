@@ -4,6 +4,7 @@ import { Card, Chip, Copyable, Empty, ErrorNote, useToast } from './ui';
 import { api, usePoll } from '../lib/api';
 import { shortKey } from '../lib/format';
 import type { Principal } from '../lib/types';
+import { NameText } from './PeerName';
 
 type Role = 'viewer' | 'admin';
 interface Entry { npub: string; label?: string; role: Role }
@@ -76,7 +77,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
             <div className="overflow-x-auto -mx-1"><table className="data"><tbody>
               {draft.allowed.map((e, i) => (
                 <tr key={e.npub}>
-                  <td><div className="font-medium">{e.label || <span className="text-ink-3">no label</span>}</div><Copyable text={e.npub} display={shortKey(e.npub, 14, 6)} className="text-[11px] text-ink-3" /></td>
+                  <td><div className="font-medium"><NameText npub={e.npub} name={e.label} fallback={<span className="text-ink-3">no label</span>} /></div><Copyable text={e.npub} display={shortKey(e.npub, 14, 6)} className="text-[11px] text-ink-3" /></td>
                   <td>{readOnly ? <Chip tone={e.role === 'admin' ? 'accent' : 'neutral'}>{e.role}</Chip> : <select className="input h-8 w-auto" value={e.role} onChange={(x) => setDraft({ ...draft, allowed: draft.allowed.map((y, j) => (j === i ? { ...y, role: x.target.value as Role } : y)) })}><option value="viewer">viewer</option><option value="admin">admin</option></select>}</td>
                   <td className="text-right">{!readOnly && <button className="btn ghost icon sm" title="Remove" onClick={() => setDraft({ ...draft, allowed: draft.allowed.filter((_, j) => j !== i) })}><Trash2 size={13} /></button>}</td>
                 </tr>

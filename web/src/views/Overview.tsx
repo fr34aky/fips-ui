@@ -6,6 +6,8 @@ import { fmtBytes, fmtDuration, fmtPct, fmtNum, fmtMs, shortKey, fmtAgo, fmtComp
 import { api } from '../lib/api';
 import { useState } from 'react';
 import type { ViewId } from '../components/Shell';
+import { PeerName } from '../components/PeerName';
+import { useHostName } from '../lib/names';
 
 export function Overview({ snap, health, onNav }: { snap: Snapshot; health: Health | null; onNav: (v: ViewId) => void }) {
   const s = snap.status;
@@ -43,6 +45,7 @@ export function Overview({ snap, health, onNav }: { snap: Snapshot; health: Heal
             </div>
           </div>
           <dl className="kv lg:flex-1 lg:grid-cols-[auto_1fr] gap-x-4">
+            <OwnName npub={s.npub} />
             <dt>npub</dt><dd><Copyable text={s.npub} display={s.npub} /></dd>
             <dt>IPv6</dt><dd><Copyable text={s.ipv6_addr} /></dd>
             <dt>node addr</dt><dd><Copyable text={s.node_addr} /></dd>
@@ -66,7 +69,7 @@ export function Overview({ snap, health, onNav }: { snap: Snapshot; health: Heal
           {s.is_root ? <Empty>This node is the spanning-tree root.</Empty> : parent ? (
             <div className="grid gap-3">
               <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0"><div className="font-medium truncate">{parent.display_name ?? shortKey(parent.npub, 12, 6)}</div><div className="text-xs text-ink-3 mono truncate">{parent.transport_type} · {parent.transport_addr}</div></div>
+                <div className="min-w-0 grid gap-0.5"><PeerName name={parent.display_name} npub={parent.npub} /><div className="text-xs text-ink-3 mono truncate">{parent.transport_type} · {parent.transport_addr}</div></div>
                 <StatusChip value={parent.connectivity} />
               </div>
               <div className="grid grid-cols-3 gap-2 text-center">
@@ -173,4 +176,10 @@ export function Services({ units, health, now }: { units: UnitState[]; health: H
       <ConfirmDialog open={!!confirm} onClose={() => setConfirm(null)} onConfirm={run} busy={busy} danger title={`${confirm?.action} ${confirm?.id}?`} body={confirm?.id === 'fips' && confirm.action !== 'start' ? 'Restarting the daemon drops every peer link and session. Peers reconnect automatically, but traffic over the mesh will pause for a few seconds.' : `The service manager will ${confirm?.action} ${confirm?.unit} on this host.`} confirmLabel={confirm?.action ?? 'Confirm'} />
     </div>
   );
+}
+
+/** This node's own hosts-file name, when it has one. */
+function OwnName({ npub }: { npub: string }) {
+  const name = useHostName(npub);
+  return name ? <><dt>name</dt><dd><Copyable text={`${name}.fips`} display={<b>{name}</b>} mono={false} /></dd></> : null;
 }

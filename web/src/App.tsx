@@ -17,6 +17,7 @@ import { Upgrade } from './views/Upgrade';
 const Config = lazy(() => import('./views/Config'));
 import { Firewall } from './views/Firewall';
 import { shortKey } from './lib/format';
+import { useHostName } from './lib/names';
 
 function parseHash(): { view: ViewId; params: URLSearchParams } {
   const h = location.hash.replace(/^#\/?/, '');
@@ -43,7 +44,8 @@ export default function App() {
 
   const snap = live.snapshot;
   const viewer = health?.principal?.role === 'viewer';
-  const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${shortKey(snap.status.npub, 12, 6)}` : '', [snap]);
+  const ownName = useHostName(snap?.status?.npub);
+  const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
   const gwBadge = snap?.gateway ? <Chip tone="good" className="ml-auto" dot={false}>on</Chip> : undefined;
 
   let body: React.ReactNode;
@@ -60,7 +62,7 @@ export default function App() {
       case 'internals': body = <Internals snap={snap} />; break;
       case 'logs': body = <Logs />; break;
       case 'diagnostics': body = <Diagnostics initialPeer={route.params.get('peer')} snap={snap} readOnly={!!health?.readOnly} />; break;
-      case 'access': body = <Access snap={snap} onProbe={probe} readOnly={!!health?.readOnly} />; break;
+      case 'access': body = <Access snap={snap} onProbe={probe} readOnly={!!health?.readOnly} prefillNpub={route.params.get('name')} />; break;
       case 'gateway': body = <Gateway snap={snap} />; break;
       case 'upgrade': body = <Upgrade />; break;
       case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;

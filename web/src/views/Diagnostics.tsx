@@ -4,6 +4,7 @@ import type { ProbeReport, ProbeStage, HostEntry, Snapshot } from '../lib/types'
 import { Card, Chip, Copyable, KV, Empty, ErrorNote, useToast } from '../components/ui';
 import { api } from '../lib/api';
 import { shortKey, fmtMs, fmtDuration } from '../lib/format';
+import { NameText } from '../components/PeerName';
 
 const STAGES: { key: keyof Pick<ProbeReport, 'bloom' | 'discovery' | 'path' | 'session' | 'rtt'>; label: string; desc: string }[] = [
   { key: 'bloom', label: 'Bloom', desc: 'Does any peer\'s filter claim the address?' },
@@ -113,7 +114,7 @@ function Report({ run, onCancel }: { run: Run; onCancel: () => void }) {
         <div className="grid gap-4 md:grid-cols-2">
           <div>
             <div className="card-title mb-2">Target</div>
-            <KV items={[['Name', r.target.display_name ?? '–'], ['npub', <Copyable text={r.target.npub} display={shortKey(r.target.npub, 14, 8)} />], ['Node addr', <Copyable text={r.target.node_addr} />], ['IPv6', <Copyable text={r.target.ipv6_addr} />], ['Total', fmtMs(r.elapsed_ms, 0)]]} />
+            <KV items={[['Name', <NameText npub={r.target.npub} name={r.target.display_name} fallback="–" />], ['npub', <Copyable text={r.target.npub} display={shortKey(r.target.npub, 14, 8)} />], ['Node addr', <Copyable text={r.target.node_addr} />], ['IPv6', <Copyable text={r.target.ipv6_addr} />], ['Total', fmtMs(r.elapsed_ms, 0)]]} />
           </div>
           <div>
             <div className="card-title mb-2">Path</div>

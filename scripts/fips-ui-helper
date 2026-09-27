@@ -9,7 +9,7 @@
 # native package installer), restart the service.
 #
 # Commands:
-#   check                          -> {"ok":true,"version":4,...}
+#   check                          -> {"ok":true,"version":6,...}
 #   install <stagedir> [--no-restart]
 #   rollback <backup-id>
 #   restart
@@ -29,6 +29,9 @@
 #   mesh-guard <ports|off|status> [tun] [canary] -> load, remove or inspect table inet fips_ui_guard: TCP from fd00::/8 to the
 #                                     web UI's ports is dropped unless it arrives on lo or the FIPS TUN, so
 #                                     a mesh source address can be trusted as the npub it derives from
+#   hosts-apply --base <sha256|none> <- new /etc/fips/hosts on stdin (hostname npub lines, comments); refused
+#                                     if the file changed since it was read; backed up and replaced
+#                                     atomically, root:root 0644 (the daemon reloads it on the next query)
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -40,7 +43,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=5
+HELPER_VERSION=6
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -202,11 +205,13 @@ install_package() {
 FIPS_CONFIG=/etc/fips/fips.yaml
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
+FIPS_HOSTS=/etc/fips/hosts
 # Fixed per OS and deliberately not derived from FIPS_UI_BACKUPS, which sudo forwards from the caller.
 CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DEFAULT")/config-backups"
 LOCK_FILE=/var/run/fips-ui-helper.lock
 MAX_CONFIG_BYTES=262144
 MAX_DROPIN_BYTES=65536
+MAX_HOSTS_BYTES=65536
 # Keys whose values never leave this script, matched case-insensitively against the whole key.
 SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
 # Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
@@ -214,6 +219,7 @@ SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase
 if [[ ${FIPS_UI_HELPER_TEST:-0} == 1 ]]; then
   FIPS_CONFIG=${FIPS_TEST_CONFIG:-$FIPS_CONFIG}; FIPS_NFT=${FIPS_TEST_NFT:-$FIPS_NFT}; DROPIN_DIR=${FIPS_TEST_DROPIN_DIR:-$DROPIN_DIR}
   CONFIG_BACKUPS_DIR=${FIPS_TEST_CONFIG_BACKUPS:-$CONFIG_BACKUPS_DIR}; LOCK_FILE=${FIPS_TEST_LOCK:-$LOCK_FILE}
+  FIPS_HOSTS=${FIPS_TEST_HOSTS:-$FIPS_HOSTS}
 fi
 
 # One privileged change at a time, across every caller (UI, upgrade jobs, a second tab, a shell).
@@ -988,6 +994,32 @@ case "$cmd" in
     mkdir -p "$DROPIN_DIR"
     install -m 0644 -o 0 -g 0 "$tmp/new" "$DROPIN_DIR/$name.nft"
     printf '{"ok":true,"file":%s,"reloaded":%s}\n' "$(json_escape "$DROPIN_DIR/$name.nft")" "$(firewall_reload_if_active)"
+    ;;
+
+  hosts-apply)
+    require_systemd; take_lock
+    [[ "${2:-}" == --base && "${3:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "usage: hosts-apply --base <sha256|none>"
+    base=$3
+    tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+    read_stdin_limited "$tmp" "$MAX_HOSTS_BYTES"
+    # Every line is blank, a comment, or "hostname npub [# comment]" (docs/how-to/host-aliases.md upstream);
+    # lines already in the current file are accepted as they are, so one hand-written line cannot block edits.
+    cur_lines=$(mktemp); trap 'rm -f "$tmp" "$cur_lines"' EXIT
+    { [[ -f "$FIPS_HOSTS" ]] && tr -d '\r' < "$FIPS_HOSTS"; } > "$cur_lines" || true
+    bad=$(tr -d '\r' < "$tmp" | grep -nvxFf "$cur_lines" | grep -vE '^[0-9]+:[[:space:]]*(#.*)?$|^[0-9]+:[[:space:]]*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[[:space:]]+npub1[02-9ac-hj-np-z]{58}[[:space:]]*(#.*)?$' | head -n 3 || true)
+    [[ -z "$bad" ]] || die "invalid hosts line(s): $(printf '%s' "$bad" | tr '\n' ' ')"
+    cur=none; [[ -f "$FIPS_HOSTS" ]] && cur=$(sha256sum < "$FIPS_HOSTS" | cut -d' ' -f1)
+    [[ "$cur" == "$base" ]] || die "$FIPS_HOSTS changed since it was read; reload and make the change again"
+    if [[ -f "$FIPS_HOSTS" ]] && cmp -s "$tmp" "$FIPS_HOSTS"; then printf '{"ok":true,"changed":false}\n'; exit 0; fi
+    if [[ -f "$FIPS_HOSTS" ]]; then
+      mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+      cp -p "$FIPS_HOSTS" "$CONFIG_BACKUPS_DIR/hosts-$(date +%Y%m%d-%H%M%S)"
+      # Keep the newest 20 hosts backups.
+      ls -1t "$CONFIG_BACKUPS_DIR"/hosts-* 2>/dev/null | tail -n +21 | xargs -r rm -f --
+    fi
+    mkdir -p "$(dirname "$FIPS_HOSTS")"
+    install -m 0644 -o 0 -g 0 "$tmp" "$FIPS_HOSTS.fips-ui.new" && mv -f "$FIPS_HOSTS.fips-ui.new" "$FIPS_HOSTS"
+    printf '{"ok":true,"changed":true,"file":%s}\n' "$(json_escape "$FIPS_HOSTS")"
     ;;
 
   dropin-delete)
