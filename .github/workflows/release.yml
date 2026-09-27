@@ -30,11 +30,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::tag $TAG is not vX.Y.Z or vX.Y.Z-pre"; exit 1; }
+          pre=${BASH_REMATCH[2]}
+          # Annotated only: git describe (the nodes' version) prefers annotated tags over lightweight ones.
+          git fetch -q --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          [[ $(git cat-file -t "refs/tags/$TAG") == tag ]] || { echo "::error::$TAG is a lightweight tag; use git tag -a"; exit 1; }
           # Nodes fast-forward their checkout of main to the tag: it must be on main.
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
           if gh release view "$TAG" >/dev/null 2>&1; then echo "::error::release $TAG exists already"; exit 1; fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$([[ -n "${BASH_REMATCH[2]}" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$([[ -n "$pre" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   smoke:
     name: Smoke tests

@@ -5,6 +5,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { RELEASE_MARKER } from './version.ts';
 
 const REPO = process.env.FIPS_UI_REPO ?? 'fr34aky/fips-ui';
 const CHECK_MS = 6 * 60 * 60_000;
@@ -172,7 +173,10 @@ export class SelfUpdate {
       const t = await this.selftest();
       job.log.push(...t.out.split('\n').slice(-15));
       if (!t.ok) throw new Error('the new version did not start (self-test failed)');
+      const after = (await step('git rev-parse HEAD', 'git', ['rev-parse', 'HEAD'])).trim();
       this.remember(before, tag, job);
+      // The installed release, for when git cannot tell the version later (see version.ts).
+      try { writeFileSync(path.join(this.root, '.git', RELEASE_MARKER), `${tag} ${after}\n`); } catch { /* not essential */ }
       job.state = 'done';
       job.finishedAt = Date.now();
       if (this.canRestart) { job.restarting = true; job.log.push('restarting the service…'); setTimeout(onRestart, 1500); }
