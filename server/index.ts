@@ -12,6 +12,7 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
+import { SelfUpdate } from './self-update.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -303,13 +304,30 @@ function hostsView(h: HostsFile) {
   return { path: h.path, entries: h.entries, local: h.local, synced: h.synced, base: h.base, error: h.error };
 }
 
+/**
+ * Self-test mode (FIPS_UI_SELFTEST=1): the self-update starts a freshly built version this way before restarting
+ * the service. It loads every module, listens on a spare loopback port, prints "fips-ui selftest ok" and exits;
+ * nothing with side effects (mesh listener and guard, hosts sync, release checks, pollers) is started.
+ */
+const SELFTEST = process.env.FIPS_UI_SELFTEST === '1';
+const selfUpdate = new SelfUpdate(ROOT, UI_VERSION);
+// Look for a new fips-ui release shortly after start and every 6 hours.
+if (!SELFTEST) setTimeout(() => { void selfUpdate.check(); setInterval(() => void selfUpdate.check(), 6 * 60 * 60_000).unref(); }, 10_000).unref();
+/** Why fips-ui must not restart now (a node upgrade or node-management change would be killed with it). */
+const restartBlocker = (): string | null => {
+  const j = upgrade.manager.job;
+  if (upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued'))) return 'a fips upgrade job is running';
+  if (admin.changePending()) return 'a node-management change is in progress';
+  return null;
+};
+
 const hostsSync = new HostsSync({
   ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
   meshAddress,
   write: writeHostsFile,
   label: async (npub) => (await readHosts()).local.find((e) => e.npub === npub)?.hostname,
 });
-void hostsSync.start();
+if (!SELFTEST) void hostsSync.start();
 
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
@@ -382,6 +400,14 @@ async function route(req: Req, res: Res) {
     const write = canChange(req) ? await hostsWriteMode() : undefined;
     return json(res, 200, { ...hostsView(h), ...(write !== undefined ? { write } : {}) });
   }
+  if (p === '/api/ui-update' && method === 'GET') {
+    const admin_ = canChange(req);
+    await selfUpdate.check(admin_ && url.searchParams.get('refresh') === '1');
+    const base = { current: selfUpdate.current, latest: selfUpdate.latest, newer: selfUpdate.newer, checkedAt: selfUpdate.checkedAt, error: selfUpdate.checkError };
+    if (!admin_) return json(res, 200, base);
+    const h = await admin.helperInfo().catch(() => null);
+    return json(res, 200, { ...base, job: selfUpdate.job, install: await selfUpdate.installMode(), canRestart: selfUpdate.canRestart, helper: { installed: h?.version ?? null, shipped: selfUpdate.repoHelperVersion() } });
+  }
   if (p === '/api/hosts/sync' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
     return json(res, 200, { config: hostsSync.config, status: hostsSync.status, file: hostsSync.file, own: lastSnapshot?.status && (lastSnapshot.status as { npub?: string }).npub });
@@ -442,6 +468,21 @@ async function route(req: Req, res: Res) {
       const status = await hostsSync.save({ ...b, master });
       return json(res, 200, { config: hostsSync.config, status });
     } catch (e) { throw e instanceof HttpError ? e : new HttpError(e instanceof SyncError ? 400 : 500, (e as Error).message); }
+  }
+  if (p === '/api/ui-update/install') {
+    const { tag } = body as { tag?: unknown };
+    await selfUpdate.check();
+    if (!selfUpdate.latest || !selfUpdate.newer || tag !== selfUpdate.latest.tag) throw new HttpError(400, `only the newest release (${selfUpdate.latest?.tag ?? 'unknown'}) can be installed, and only when it is newer than ${selfUpdate.current}`);
+    if (selfUpdate.job?.state === 'running') throw new HttpError(409, 'an update is already running');
+    const blocked = restartBlocker();
+    if (blocked) throw new HttpError(409, `${blocked}; update fips-ui when it has finished`);
+    // The restart waits for anything privileged that started meanwhile: exiting would kill it with the service.
+    const exitWhenIdle = () => {
+      if (restartBlocker()) { setTimeout(exitWhenIdle, 2000); return; }
+      console.log(`fips-ui updated to ${tag}; exiting so systemd restarts it`); server.close(); mesh.close(); hostsSync.close(); process.exit(75);
+    };
+    void selfUpdate.install(tag, exitWhenIdle);
+    return json(res, 202, { job: selfUpdate.job });
   }
   if (p === '/api/hosts/sync/run') {
     // Syncs now, or with sync turned off retries removing names a failed removal left behind.
@@ -687,16 +728,17 @@ mesh.onChange = async () => { meshSync.dirty = true; };
 mesh.onTunChange = () => { meshGuardDirty = true; };
 mesh.onGuardLost = () => { void reapplyGuard().then(() => mesh.reconcile()); };
 let meshTicks = 0;
-setInterval(() => {
+if (!SELFTEST) setInterval(() => {
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
   else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
   // The 30 s guard check always gets its tick; a failing rule retry cannot starve it.
   else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
   else if (meshRuleDirty) void syncRule();
 }, 15_000).unref();
-void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
+if (!SELFTEST) void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 
-server.listen(PORT, HOST, () => {
+server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
+  if (SELFTEST) { console.log('fips-ui selftest ok'); process.exit(0); }
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
   console.log(`  platform       : ${PLATFORM.os}${PLATFORM.distro ? ` (${PLATFORM.distro})` : ''}, services via ${PLATFORM.serviceManager}, logs via ${LOG_SOURCE ?? 'none'}`);
