@@ -9,8 +9,8 @@ The server asks GitHub for the newest release of `fr34aky/fips-ui` about 10 seco
 every 6 hours; **Check now** asks at once. A newer release shows as **vX available** next to the version in the
 sidebar (admins go to the Upgrade page from it, others to the release notes), and the card shows its release
 notes. Each check is one GitHub API request; unauthenticated requests are limited to 60 per hour per public IP
-address. Set `FIPS_UI_GITHUB_TOKEN` (a token without any permissions is enough) in `/etc/default/fips-ui` to
-lift that.
+address. Set `FIPS_UI_GITHUB_TOKEN` (a token without any permissions is enough) in the settings file
+(`/etc/default/fips-ui`, on FreeBSD and pfSense `/usr/local/etc/fips-ui.env`) to lift that.
 
 ## What Update does
 
@@ -25,8 +25,8 @@ lift that.
 5. If any step fails, the checkout is put back to the previous commit and rebuilt; the running service is
    never touched. The previous commit is also written to `.git/fips-ui-previous`, with the command to go back
    by hand (`git reset --hard <commit> && npm run build`).
-6. **Restart**: under systemd the server exits (status 75) and the unit's `Restart=on-failure` starts the new
-   version; the page reloads when the new version answers. The restart waits while a fips upgrade or a
+6. **Restart**: the server exits (status 75) and its service manager starts the new version (systemd's
+   `Restart=on-failure`, daemon(8) on FreeBSD and pfSense, launchd's KeepAlive on macOS); the page reloads when the new version answers. The restart waits while a fips upgrade or a
    node-management change is running, and an update cannot start during one.
 
 Commands run with the running node's directory first on `PATH`, so `npm` is found when node comes from nvm,
@@ -44,8 +44,10 @@ sudo ./deploy/setup-local.sh
 
 ## Other systems
 
-The update works wherever fips-ui runs from a git checkout (on Windows `npm.cmd` is used). Only under systemd
-does it restart itself; elsewhere it builds the new version and asks you to restart fips-ui.
+The update works wherever fips-ui runs from a git checkout (on Windows `npm.cmd` is used). It restarts itself
+under systemd and under the services `deploy/setup-local.sh` installs on FreeBSD, pfSense and macOS (they set
+`FIPS_UI_SUPERVISED=1`: exiting restarts fips-ui). Elsewhere it builds the new version and asks you to restart
+fips-ui ([install.md](install.md)).
 
 ## Variables
 
