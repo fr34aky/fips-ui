@@ -260,9 +260,12 @@ const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
 const upgrade = createUpgradeHandler({
   authorize: (req) => canChange(req), controlSocket: SOCKET_PATH,
-  // After an upgrade, fips.yaml follows the new template (server/config-merge.ts); `admin` is created below.
-  configMerge: createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) }),
-  configRestore: (id) => admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })),
+  // After an upgrade, fips.yaml follows the new template (server/config-merge.ts); `admin` is created below. Only
+  // where the helper can apply configuration (Linux with systemd); elsewhere the step is skipped.
+  ...(PLATFORM.serviceManager === 'systemd' ? {
+    configMerge: createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) }),
+    configRestore: (id: string) => admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })),
+  } : {}),
 });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({

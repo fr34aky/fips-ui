@@ -51,6 +51,9 @@ The node-management pages (configuration editor, firewall) and remote access ove
 Linux with systemd. The hosts-file editor works everywhere: through the helper on Linux with systemd, elsewhere
 directly when the UI's user may write the hosts file (the per-OS path is in the Access page); the upgrade flow targets all of the above but has only been tested on Linux.
 `deploy/setup-local.sh` is systemd-only.
+fips-ui's own update (Upgrade page) needs a git checkout and works on every system, but restarts itself only
+under systemd; elsewhere it builds the new version and asks you to restart fips-ui. The fips.yaml template
+merge after daemon upgrades needs Linux with systemd (the helper applies the file) and is skipped elsewhere.
 
 ## Quick start
 
