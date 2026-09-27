@@ -207,6 +207,9 @@ docs/          feature documentation, screenshots
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, [PR-REVIEW.md](PR-REVIEW.md) for the review
 checklist every PR goes through, and [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
+Every pull request runs smoke tests that install fips-ui on Linux (systemd, Debian, Fedora, Arch, Alpine),
+FreeBSD, macOS and Windows (`.github/workflows/smoke.yml`); `node scripts/smoke-test.mjs` runs the same checks
+against a local installation.
 
 ## License
 
