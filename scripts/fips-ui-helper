@@ -1033,7 +1033,7 @@ pf_render_firewall() {
     echo 'block drop in on $tun all label "fips-ui drop"'
     echo 'pass in on $tun inet6 proto icmp6 icmp6-type echoreq keep state'
     local f
-    for f in "$1"/*.pf; do [[ -f "$f" ]] && { echo "# --- $(basename "$f")"; cat "$f"; echo; }; done
+    for f in "$1"/*.pf; do if [[ -f "$f" ]]; then echo "# --- $(basename "$f")"; cat "$f"; echo; fi; done
   } > "$2"
 }
 
