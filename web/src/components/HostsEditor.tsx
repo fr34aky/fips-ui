@@ -162,7 +162,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
 }
 
 interface SyncConfig { enabled: boolean; master: string; port: number; intervalMin: number }
-interface SyncStatus { running: boolean; lastAttempt?: number; lastSuccess?: number; lastChange?: number; received?: number; skipped?: number; error?: string; unreachableSince?: number; nextAttempt?: number }
+interface SyncStatus { running: boolean; lastAttempt?: number; lastSuccess?: number; lastChange?: number; received?: number; skipped?: number; error?: string; unreachableSince?: number; nextAttempt?: number; chain?: string[] }
 
 /** Follow a master node: its hosts entries are fetched over the mesh and kept in a synced block of this file. */
 function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | null }[] }) {
@@ -202,12 +202,34 @@ function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | n
       )}
       {!config.enabled && status.error && <div className="flex items-center gap-2"><ErrorNote>{status.error}</ErrorNote><button className="btn sm shrink-0" disabled={busy} onClick={() => post('/api/hosts/sync/run', {}, 'Synced names removed')}><RefreshCw size={13} />Retry</button></div>}
       {config.enabled && status.error && <ErrorNote>{status.error}{status.unreachableSince ? <> Offline since {fmtAgo(status.unreachableSince)}; the names synced last stay in effect.</> : null}{status.nextAttempt ? <> Next automatic try {fmtIn(status.nextAttempt)}.</> : null}</ErrorNote>}
+      {config.enabled && status.chain && status.chain.length > 0 && <SyncChain chain={status.chain} />}
       {config.enabled && !status.error && status.lastSuccess && <p className="text-xs text-ink-3">{status.received} name{status.received === 1 ? '' : 's'} from the master{status.skipped ? `, ${status.skipped} invalid left out` : ''}; last change {status.lastChange ? fmtAgo(status.lastChange) : 'none since start'}.</p>}
       <div className="flex items-center gap-2">
         <p className="text-xs text-ink-3 mr-auto">The master's names are fetched over the mesh from its web UI and kept in a marked block at the end of this file; on a duplicate name the master's entry wins. On the master, enable <b>Web UI over the mesh</b> and add {r.data.own ? <span className="mono">{shortKey(r.data.own, 12, 6)}</span> : "this node's npub"} as a <b>viewer</b>. Turning sync off removes the synced names.</p>
         {dirty && <button className="btn ghost" onClick={() => setDraft(config)}><Undo2 size={14} />Discard</button>}
         <button className="btn primary" disabled={!dirty || busy} onClick={() => post('/api/hosts/sync', draft, draft.enabled ? 'Sync settings saved' : 'Sync turned off')}><Save size={14} />Save</button>
       </div>
+    </div>
+  );
+}
+
+/** Where this node's names come from: the top master, the masters in between and the parent (nearest first in `chain`). */
+function SyncChain({ chain }: { chain: string[] }) {
+  const path = [...chain].reverse();
+  return (
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs" aria-label="Sync hierarchy">
+      <span className="text-ink-3 mr-1">Names flow</span>
+      {path.map((n, i) => (
+        <span key={n} className="inline-flex items-center gap-1.5">
+          <span className="rounded-md bg-surface-2 px-2 py-0.5 inline-flex items-center gap-1.5">
+            <NpubInline npub={n} head={8} tail={4} />
+            {i === 0 && <Chip tone="accent">top</Chip>}
+            {i === path.length - 1 && <Chip>parent</Chip>}
+          </span>
+          <ChevronRight size={13} className="text-ink-3" />
+        </span>
+      ))}
+      <span className="rounded-md border border-[var(--border)] px-2 py-0.5">this node</span>
     </div>
   );
 }
@@ -260,36 +282,74 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
   );
 }
 
-interface Follower { npub: string; address: string; firstSeen: number; lastSeen: number; count: number; entries: number; version?: string; intervalMin?: number }
+interface Follower { npub: string; address: string; firstSeen: number; lastSeen: number; count: number; entries: number; version?: string; intervalMin?: number; below?: { npub: string; parent: string }[]; belowMore?: number }
 
-/** On a master: the nodes that sync their hosts names from this one, and when they last did. */
+/** On a master: the nodes that sync their hosts names from this one, when they last did, and the tree below them. */
 function FollowersPanel({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
   const r = usePoll(() => api.get<{ followers: Follower[] }>('/api/hosts/followers'), [], 30000);
+  const [open, setOpen] = useState<Set<string>>(new Set());
   const list = r.data?.followers ?? [];
   if (!list.length) return null;
   const forget = async (npub: string) => {
     try { await api.post('/api/hosts/followers/forget', { npub }); r.refresh(); } catch (x) { toast('err', (x as Error).message); }
   };
+  const total = list.length + list.reduce((n, f) => n + (f.below?.length ?? 0) + (f.belowMore ?? 0), 0);
+  const toggle = (npub: string) => setOpen((o) => { const n = new Set(o); if (n.has(npub)) n.delete(npub); else n.add(npub); return n; });
   return (
     <div className="border-t border-[var(--border)]">
-      <div className="px-4 pt-3 pb-1 text-xs text-ink-3">Nodes syncing their names from this node · {list.length}</div>
-      <div className="overflow-auto max-h-[20rem]"><table className="data"><thead><tr><th>Node</th><th>Last sync</th><th>Names</th><th>Every</th><th>fips-ui</th><th /></tr></thead><tbody>
+      <div className="px-4 pt-3 pb-1 text-xs text-ink-3">Nodes syncing their names from this node · {list.length} direct{total > list.length ? `, ${total} in the whole tree` : ''}</div>
+      <div className="overflow-auto max-h-[24rem]"><table className="data"><thead><tr><th>Node</th><th>Last sync</th><th>Names</th><th>Every</th><th>fips-ui</th><th /></tr></thead><tbody>
         {list.map((f) => {
           // Overdue after three missed intervals (5 minutes when the follower does not report its interval).
           const overdue = Date.now() - f.lastSeen > 3 * (f.intervalMin ?? 5) * 60_000;
+          const below = f.below?.length ?? 0;
+          const isOpen = open.has(f.npub);
           return (
-            <tr key={f.npub}>
-              <td><NpubInline npub={f.npub} /></td>
-              <td>{overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>
-              <td className="tabular">{f.entries}</td>
-              <td className="text-xs text-ink-3">{f.intervalMin ? `${f.intervalMin} min` : '–'}</td>
-              <td className="text-xs text-ink-3">{f.version ?? 'older'}</td>
-              <td className="text-right">{!readOnly && <button className="btn ghost icon sm" title="Forget (it reappears on its next sync)" onClick={() => void forget(f.npub)}><Trash2 size={13} /></button>}</td>
-            </tr>
+            <FollowerRows key={f.npub} f={f} isOpen={isOpen}>
+              <tr>
+                <td>
+                  <span className="inline-flex items-center gap-1.5 min-w-0">
+                    {below > 0 ? <button className="btn ghost icon sm -ml-1" aria-expanded={isOpen} title={isOpen ? 'Hide the nodes below' : 'Show the nodes below'} onClick={() => toggle(f.npub)}>{isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button> : <span className="w-6" />}
+                    <NpubInline npub={f.npub} />
+                    {below > 0 && <Chip title="Nodes syncing from this one, directly or further down, as it reports them">{below + (f.belowMore ?? 0)} below</Chip>}
+                  </span>
+                </td>
+                <td>{overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>
+                <td className="tabular">{f.entries}</td>
+                <td className="text-xs text-ink-3">{f.intervalMin ? `${f.intervalMin} min` : '–'}</td>
+                <td className="text-xs text-ink-3" title={f.below === undefined ? 'Reports no subtree (older fips-ui)' : undefined}>{f.version ?? 'older'}</td>
+                <td className="text-right">{!readOnly && <button className="btn ghost icon sm" title="Forget (it reappears on its next sync)" onClick={() => void forget(f.npub)}><Trash2 size={13} /></button>}</td>
+              </tr>
+            </FollowerRows>
           );
         })}
       </tbody></table></div>
     </div>
+  );
+}
+
+/** A follower's row and, when opened, the nodes below it (as it reported them), indented by depth. */
+function FollowerRows({ f, isOpen, children }: { f: Follower; isOpen: boolean; children: React.ReactNode }) {
+  const rows = useMemo(() => {
+    if (!isOpen || !f.below?.length) return [];
+    const kids = new Map<string, string[]>();
+    for (const n of f.below) kids.set(n.parent, [...(kids.get(n.parent) ?? []), n.npub]);
+    const out: { npub: string; depth: number; parent: string }[] = [];
+    const walk = (p: string, depth: number) => { for (const k of kids.get(p) ?? []) { out.push({ npub: k, depth, parent: p }); walk(k, depth + 1); } };
+    walk(f.npub, 1);
+    return out;
+  }, [f, isOpen]);
+  return (
+    <>
+      {children}
+      {rows.map((n) => (
+        <tr key={n.npub} className="text-ink-2">
+          <td><span className="inline-flex items-center gap-1.5 min-w-0" style={{ paddingLeft: `${n.depth * 1.25}rem` }}><span className="text-ink-3">└</span><NpubInline npub={n.npub} head={8} tail={4} /></span></td>
+          <td colSpan={5} className="text-xs text-ink-3">syncs from <NpubInline npub={n.parent} head={8} tail={4} /> · reported by <NpubInline npub={f.npub} head={8} tail={4} /></td>
+        </tr>
+      ))}
+      {isOpen && !!f.belowMore && <tr><td colSpan={6} className="text-xs text-ink-3" style={{ paddingLeft: '2.5rem' }}>and {f.belowMore} more not reported</td></tr>}
+    </>
   );
 }

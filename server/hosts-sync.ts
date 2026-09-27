@@ -47,6 +47,8 @@ export interface SyncDeps {
   label: (npub: string) => Promise<string | undefined>;
   /** This node's fips-ui version, reported to the master. */
   version?: string;
+  /** The nodes syncing below this one, reported to the master (header x-fips-ui-subtree, server/hosts-followers.ts). */
+  subtree?: () => Promise<string>;
 }
 
 export function validateSyncConfig(input: unknown): SyncConfig {
@@ -167,7 +169,9 @@ export class HostsSync {
     let res: Response;
     // The header tells the master this is a sync (it lists its followers), with this node's version and interval.
     const sync = `version=${this.deps.version ?? ''};interval=${this.config.intervalMin}`;
-    try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync' }, signal: AbortSignal.timeout(15_000) }); }
+    // And which nodes sync from this one in turn, so the master can show the whole tree below it.
+    const subtree = await this.deps.subtree?.().catch(() => undefined);
+    try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync', ...(subtree !== undefined ? { 'x-fips-ui-subtree': subtree } : {}) }, signal: AbortSignal.timeout(15_000) }); }
     catch (e) { throw new SyncError(`cannot reach the master at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
     const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown } | null;
     if (res.status === 403) {

@@ -66,6 +66,25 @@ in it refuses the sync and keeps its names: otherwise names would go round in a 
 anywhere in the circle would keep coming back. Chains longer than 16 nodes are refused the same way. Masters on
 fips-ui versions before this check send no chain, so loops through them are not detected.
 
+## The hierarchy on each node
+
+- **Upward**: a follower's sync card shows where its names come from, from the chain the master reported:
+  `A (top) › B (parent) › this node`. It changes with the next sync when a master moves.
+- **Downward**: the followers list is a tree. Each follower's row shows how many nodes sync below it
+  (`3 below`); the arrow opens them, indented by depth, with the node each one syncs from.
+
+A node learns what is below it from the syncs themselves, without extra requests: every sync request carries an
+`x-fips-ui-subtree` header with the node's own active followers and what they reported below them (parents
+first, about 70 bytes per node, at most 128 nodes and a count of the rest). So C tells B about D, B tells A about
+C and D, and each level knows its whole subtree one sync interval after the level below it synced. A follower
+that has not synced for three of its intervals drops out of its master's report, and with it everything it
+reported, so a removed node disappears from every tree above it within a few intervals.
+
+The tree is informational: each node describes its own subtree, so the rows below a follower are labelled
+"reported by" it, and nothing is granted or changed because of them. Reports are checked (valid npubs, no
+repeats, no reference to the receiving node, depth at most 16); followers on older fips-ui versions send none and
+show no subtree.
+
 ## Conflicts
 
 The daemon uses the last entry for a name. Within one hosts file that is the later line; across a sync it is
