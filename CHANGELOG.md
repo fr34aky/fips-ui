@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hosts-file sync from a master node** (Access → Hosts file): followers fetch
+  the master's names over the mesh every few minutes and keep them in a marked
+  block at the end of their hosts file; local entries stay, and on a duplicate
+  name the master wins. The master only grants followers the viewer role. While
+  the master is offline the last names stay and retries back off to once a day.
+  See `docs/hosts-sync.md`.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added

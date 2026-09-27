@@ -25,14 +25,49 @@ export class HostsError extends Error {}
 /** sha256 of the file's bytes, as the helper computes it ('none' when there is no file). */
 export const hashOf = (bytes: Buffer | null): string => (bytes === null ? 'none' : createHash('sha256').update(bytes).digest('hex'));
 
-export async function readHosts(): Promise<{ path: string; entries: HostEntry[]; raw: string | null; base: string; error?: string }> {
+// Names synced from a master node live in one marked block at the end of the file (after the local entries, so
+// on a duplicate name the master's entry wins: the daemon uses the last one). fips-ui replaces the block on
+// every sync that changes it; everything outside it is the node's own.
+const SYNC_BEGIN = /^# >>> fips-ui sync from (npub1[02-9ac-hj-np-z]{58})\b/;
+const SYNC_END = /^# <<< fips-ui sync\b/;
+
+export interface SyncedBlock { master: string; entries: HostEntry[] }
+export interface HostsFile {
+  path: string; raw: string | null; base: string; error?: string;
+  /** What the daemon resolves: every entry, the last one winning on duplicate names. */
+  entries: HostEntry[];
+  /** The node's own entries (outside the synced block): what the editor changes. */
+  local: HostEntry[];
+  /** The block synced from a master, if any. */
+  synced: SyncedBlock | null;
+}
+
+/** Split the file into its own lines and the synced block (from its begin marker to its end marker or EOF). */
+function splitSync(raw: string): { local: string[]; block: string[] | null; master: string | null } {
+  const lines = raw.split(/\r?\n/);
+  if (lines[lines.length - 1] === '') lines.pop();
+  const start = lines.findIndex((l) => SYNC_BEGIN.test(l.trim()));
+  if (start < 0) return { local: lines, block: null, master: null };
+  let end = lines.findIndex((l, i) => i > start && SYNC_END.test(l.trim()));
+  if (end < 0) end = lines.length - 1;
+  // The blank line written before the block belongs to it.
+  const before = start > 0 && lines[start - 1].trim() === '' ? start - 1 : start;
+  const local = [...lines.slice(0, before), ...lines.slice(end + 1)];
+  return { local, block: lines.slice(start, end + 1), master: SYNC_BEGIN.exec(lines[start].trim())![1] };
+}
+
+export async function readHosts(): Promise<HostsFile> {
   try {
     const bytes = await fs.readFile(HOSTS_PATH);
     const raw = bytes.toString('utf8');
-    return { path: HOSTS_PATH, entries: parseHosts(raw), raw, base: hashOf(bytes) };
+    const s = splitSync(raw);
+    return {
+      path: HOSTS_PATH, raw, base: hashOf(bytes), entries: parseHosts(raw), local: parseHosts(s.local.join('\n')),
+      synced: s.block ? { master: s.master!, entries: parseHosts(s.block.join('\n')) } : null,
+    };
   } catch (e) {
     const missing = (e as NodeJS.ErrnoException).code === 'ENOENT';
-    return { path: HOSTS_PATH, entries: [], raw: null, base: 'none', error: missing ? undefined : (e as Error).message };
+    return { path: HOSTS_PATH, entries: [], local: [], synced: null, raw: null, base: 'none', error: missing ? undefined : (e as Error).message };
   }
 }
 
@@ -84,8 +119,9 @@ export function renderHosts(raw: string | null, entries: { hostname: string; npu
   const want = new Map(entries.map((e) => [e.hostname, e.npub]));
   const written = new Set<string>();
   const out: string[] = [];
-  const lines = raw === null ? ['# FIPS hosts: one "hostname npub" per line, resolved as <hostname>.fips (managed with fips-ui).'] : raw.split(/\r?\n/);
-  if (raw !== null && lines[lines.length - 1] === '') lines.pop();
+  // Only the node's own lines are edited; a synced block is kept as it is, at the end.
+  const s = raw === null ? null : splitSync(raw);
+  const lines = s === null ? ['# FIPS hosts: one "hostname npub" per line, resolved as <hostname>.fips (managed with fips-ui).'] : s.local;
   // With duplicate names only the last line counts (as in the daemon); that is the one updated in place.
   const lastLine = new Map<string, number>();
   lines.forEach((line, i) => { const m = ENTRY_RE.exec(line); if (m && !line.trim().startsWith('#')) lastLine.set(m[2], i); });
@@ -99,7 +135,25 @@ export function renderHosts(raw: string | null, entries: { hostname: string; npu
   });
   const width = Math.max(14, ...entries.map((e) => e.hostname.length + 1));
   for (const e of entries) if (!written.has(e.hostname)) out.push(`${e.hostname.padEnd(width)} ${e.npub}`);
+  if (s?.block) out.push('', ...s.block);
   return out.join(eol) + eol;
+}
+
+/**
+ * The file with its synced block replaced by `entries` from `master` (or removed when `entries` is null). The
+ * node's own lines are unchanged.
+ */
+export function renderSync(raw: string | null, master: string, masterLabel: string | undefined, entries: { hostname: string; npub: string }[] | null): string {
+  const eol = raw?.includes('\r\n') ? '\r\n' : '\n';
+  const local = raw === null ? [] : splitSync(raw).local;
+  while (local.length && local[local.length - 1].trim() === '') local.pop();
+  const out = [...local];
+  if (entries) {
+    const width = Math.max(14, ...entries.map((e) => e.hostname.length + 1));
+    out.push('', `# >>> fips-ui sync from ${master}${masterLabel ? ` (${masterLabel})` : ''}: managed by fips-ui, edits here are replaced on the next sync`,
+      ...entries.map((e) => `${e.hostname.padEnd(width)} ${e.npub}`), '# <<< fips-ui sync');
+  }
+  return out.length ? out.join(eol) + eol : '';
 }
 
 /**
