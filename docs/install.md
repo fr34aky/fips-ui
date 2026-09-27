@@ -109,7 +109,8 @@ Steps, if you accept that:
 Experimental: the code paths exist but have not been tested on a Mac.
 
 ```sh
-brew install node git python        # node 22.18+; PyYAML: python3 -m pip install pyyaml (config editor)
+brew install node git                     # node 22.18+
+sudo /usr/bin/python3 -m pip install pyyaml  # configuration editor (the helper uses the system python)
 
 git clone https://github.com/fr34aky/fips-ui.git && cd fips-ui
 npm run install:all && npm run build

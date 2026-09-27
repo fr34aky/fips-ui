@@ -77,17 +77,17 @@ jobs:
         include:
           - distro: debian
             image: debian:trixie
-            deps: apt-get update -qq && apt-get install -y -qq git bash procps python3-yaml ca-certificates
+            deps: apt-get update -qq && apt-get install -y -qq git bash procps python3-yaml ca-certificates libdbus-1-3
             setup-node: true
           - distro: fedora
             image: fedora:latest
-            deps: dnf install -y -q git bash procps-ng python3-pyyaml nodejs npm
+            deps: dnf install -y -q git bash procps-ng python3-pyyaml nodejs npm dbus-libs
           - distro: arch
             image: archlinux:latest
             deps: pacman -Syu --noconfirm --quiet git bash procps-ng python-yaml nodejs npm
           - distro: alpine
             image: alpine:latest
-            deps: apk add --no-cache git bash procps coreutils py3-yaml nodejs-current npm gcompat
+            deps: apk add --no-cache git bash procps coreutils py3-yaml nodejs-current npm gcompat dbus-libs
     container:
       image: ${{ matrix.image }}
       options: --cap-add NET_ADMIN --device /dev/net/tun
@@ -178,18 +178,20 @@ jobs:
       - name: Install the fips daemon (.pkg)
         run: |
           sudo installer -pkg /tmp/fips-pkg/fips-*-macos-arm64.pkg -target /
+          # The helper runs the system python (/usr/bin is on the service's PATH, Homebrew is not).
+          sudo /usr/bin/python3 -m pip install -q pyyaml
           sleep 5; sudo launchctl list | grep -i fips || true; ls -l /var/run/fips || true
       - name: Build
         run: npm run install:all && npm run build
       - name: setup-local.sh
         run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
       - name: Smoke test
-        run: node scripts/smoke-test.mjs --os macos --helper --supervised | tee /tmp/smoke.out
+        run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised | tee /tmp/smoke.out
       - name: Restart after the process dies
         run: |
           sudo pkill -KILL -u "$USER" -f 'server/index.ts'
           sleep 12
-          node scripts/smoke-test.mjs --os macos --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
+          node scripts/smoke-test.mjs --os macos --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
       - name: Logs
         if: failure()
         run: tail -n 60 /usr/local/var/log/fips-ui.log || true
