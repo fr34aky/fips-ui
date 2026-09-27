@@ -1,10 +1,48 @@
 # Node management
 
-The **Configuration** and **Firewall** pages change the node itself: `/etc/fips/fips.yaml`, the fips0
-nftables firewall and the fips systemd units. All of it needs root, and all of it goes through the same
-privileged helper as upgrades (`scripts/fips-ui-helper`, installed by `deploy/setup-local.sh`). Version 4
-of the helper is required (version 6 for writing the hosts file, see [hosts.md](hosts.md)); older helpers
-keep upgrades working and the pages explain how to update.
+The **Configuration** and **Firewall** pages change the node itself: `fips.yaml`, the fips firewall and the
+fips services. All of it needs root, and all of it goes through the same privileged helper as upgrades
+(`scripts/fips-ui-helper`). Version 4 of the helper is required on Linux with systemd (version 6 for writing
+the hosts file, see [hosts.md](hosts.md)); on the other systems below, version 8.
+
+## Systems
+
+| | Linux (systemd) | FreeBSD | pfSense | macOS |
+|---|---|---|---|---|
+| Configuration editor (`fips.yaml`) | `/etc/fips/fips.yaml` | `/usr/local/etc/fips/fips.yaml` | `/usr/local/etc/fips/fips.yaml` | `/usr/local/etc/fips/fips.yaml` (experimental) |
+| Services (restart, start, stop, at boot) | systemctl | rc.d (`service`, `sysrc`) | its boot script `rc.d/fips.sh` (no "at boot": pfSense starts it) | launchd (experimental) |
+| Hosts file | yes | yes | yes | yes (experimental) |
+| Firewall | nftables (`fips-firewall`) | pf anchor, see below | no: pfSense owns pf | pf anchor (experimental) |
+| Web UI over the mesh (spoofing guard) | nftables | pf | no | pf (experimental) |
+| Install the helper | `sudo ./deploy/setup-local.sh` | `sudo ./deploy/install-upgrade-helper.sh` (needs `bash`, `sudo`, `python3` with PyYAML from pkg) | same as FreeBSD | same |
+
+FreeBSD is tested in a VM (FreeBSD 15.1 with upstream's package); pfSense uses the same code paths with its boot
+script; macOS is untested. Health checks after a configuration change use systemd's restart counter under
+systemd and the daemon's pid elsewhere; the log lines returned with a failed change come from the journal or
+from the daemon's log file.
+
+On FreeBSD the daemon's log (`/var/log/fips.log`) is created readable by root only; the Logs page offers to let
+the fips group read it (helper verb `log-access`), after which it shows the log like the journal on Linux.
+
+## The pf firewall (FreeBSD, macOS)
+
+pf has no fips firewall of its own, so fips-ui provides one that mirrors the Linux baseline: connections
+arriving on the FIPS interface (from the daemon: `tun0` on FreeBSD, `utunN` on macOS) are dropped unless a rule
+passes them; established connections and pings are allowed.
+
+- Rules live in `/usr/local/etc/fips/pf.d/*.pf`; the rules made on the Firewall page are `fips-ui.pf`. The
+  helper renders the baseline and all drop-ins into `/usr/local/etc/fips/fips-ui-firewall.pf` and loads it
+  into the anchor `fips-ui/firewall` (macOS: `com.apple/fips-ui-firewall`).
+- A drop-in may hold only inbound `pass` or `block` rules on `$tun`, so it cannot affect other interfaces;
+  `anchor`, `load`, `table`, redirects and similar are refused, and every change is parsed with `pfctl -n`
+  before it is written.
+- **Enable** (FreeBSD) adds a marked block to `/etc/pf.conf` (the anchor reference `anchor "fips-ui/*"` and
+  `load anchor` for boot), sets `pf_enable=YES` and starts pf if it is not running; the previous pf.conf is
+  kept as `/etc/pf.conf.fips-ui.bak`, and a pf.conf that does not exist is created with `pass all` first, so
+  only the fips-ui anchors restrict anything. **Disable** removes the block again; pf keeps running with your
+  other rules. **Stop** empties the anchor. Check that your own pf.conf keeps SSH open before enabling pf.
+- On macOS the anchors go under Apple's existing `com.apple/*` anchor, so `/etc/pf.conf` is not touched; pf is
+  not enabled at boot by fips-ui there (use Start after a reboot).
 
 ## What the helper does
 
