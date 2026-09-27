@@ -4,7 +4,7 @@ import type { Snapshot } from '../lib/types';
 import { Card, Chip, ConfirmDialog, Empty, ErrorNote, KV, Modal, Segmented, Skeleton, useToast } from '../components/ui';
 import { adminApi, withResult, type DropinResult, type FirewallRule, type RuleSource } from '../lib/admin';
 import { api, usePoll } from '../lib/api';
-import { fmtAgo, fmtBytes, fmtNum, shortKey } from '../lib/format';
+import { fmtAgo, fmtBytes, fmtNum } from '../lib/format';
 import { HelperGate } from '../components/HelperGate';
 import { NpubInline } from '../components/PeerName';
 
