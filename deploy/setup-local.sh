@@ -79,8 +79,10 @@ env_example='# Extra environment for fips-ui (see README). Keep this file mode 0
 #FIPS_UI_READ_ONLY=1
 #FIPS_UI_GITHUB_TOKEN='
 host=127.0.0.1; port=8321
-load_env() { # <file>: pick up FIPS_UI_HOST/PORT for the health check
-  set +u; . "$1"; set -u; host=${FIPS_UI_HOST:-$host}; port=${FIPS_UI_PORT:-$port}
+load_env() { # <file>: pick up FIPS_UI_HOST/PORT for the health check; read, not sourced (a bad line must not abort)
+  local v
+  v=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}FIPS_UI_HOST=["'\'']\{0,1\}\([^"'\'' ]*\).*/\2/p' "$1" | tail -n 1); host=${v:-$host}
+  v=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}FIPS_UI_PORT=["'\'']\{0,1\}\([0-9]*\).*/\2/p' "$1" | tail -n 1); port=${v:-$port}
 }
 
 case "$kind" in
@@ -134,7 +136,8 @@ fips_ui_chdir="$here"
 fips_ui_env="$run_env"
 fips_ui_env_file="$envfile"
 command=/usr/sbin/daemon
-command_args="-r -R 3 -P \${pidfile} -u $user -o /var/log/fips-ui.log -t fips-ui $node $here/server/index.ts"
+# daemon(8) keeps the caller's stdout open; detach it so "service fips_ui restart" over ssh returns.
+command_args="-r -R 3 -P \${pidfile} -u $user -o /var/log/fips-ui.log -t fips-ui $node $here/server/index.ts </dev/null >/dev/null 2>&1"
 run_rc_command "\$1"
 RC
     chmod 0555 /usr/local/etc/rc.d/fips_ui
@@ -154,7 +157,11 @@ start() {
     export $run_env
     cd $here && /usr/sbin/daemon -r -R 3 -P \$pidfile -u $user -o /var/log/fips-ui.log -t fips-ui $node $here/server/index.ts ) </dev/null >/dev/null 2>&1
 }
-stop() { if running; then kill "\$(cat \$pidfile)"; sleep 1; fi; }
+stop() {
+  running || return 0
+  kill "\$(cat \$pidfile)"
+  i=0; while running && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
+}
 case "\$1" in
   start) start ;;
   stop) stop ;;
@@ -198,6 +205,8 @@ macos)
 PLIST
   chown root:wheel "$plist"; chmod 0600 "$plist"
   launchctl bootout system/network.fips-ui 2>/dev/null || true
+  # bootout returns before the job is gone; bootstrap fails with "5: Input/output error" until then.
+  for _ in $(seq 1 20); do launchctl print system/network.fips-ui >/dev/null 2>&1 || break; sleep 0.5; done
   launchctl bootstrap system "$plist"
   ;;
 esac
