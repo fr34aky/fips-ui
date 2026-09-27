@@ -20,7 +20,17 @@ export function Logs() {
   const scroller = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
 
-  useEffect(() => { api.get<{ lines: LogLine[] }>('/api/logs?lines=600').then((r) => { seedLogs(r.lines); setSeeded(true); }).catch(() => setSeeded(true)); }, []);
+  // The daemon's log file may be unreadable for the UI's user (FreeBSD creates it root-only).
+  const [unreadable, setUnreadable] = useState<string | null>(null);
+  const [fixing, setFixing] = useState(false);
+  const load = () => api.get<{ lines: LogLine[]; unreadable?: string }>('/api/logs?lines=600').then((r) => { seedLogs(r.lines); setUnreadable(r.unreadable ?? null); setSeeded(true); }).catch(() => setSeeded(true));
+  useEffect(() => { void load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const grantAccess = async () => {
+    setFixing(true);
+    try { await api.post('/api/admin/log-access', {}); await load(); }
+    catch (e) { alert((e as Error).message); }
+    finally { setFixing(false); }
+  };
 
   const source = paused && frozen ? frozen : lines;
   const filtered = useMemo(() => {
@@ -38,6 +48,12 @@ export function Logs() {
 
   return (
     <div className="grid gap-3 fade-in" style={{ height: 'calc(100dvh - 120px)' }}>
+      {unreadable && (
+        <div className="card px-4 py-3 text-sm flex flex-wrap items-center gap-3" style={{ borderColor: 'rgba(214,158,46,0.5)' }}>
+          <span>The daemon's log <code>{unreadable}</code> is readable by root only, so this page cannot show it. Admins can let the fips group read it (the file's contents and owner stay as they are).</span>
+          <button className="btn sm ml-auto" disabled={fixing} onClick={() => void grantAccess()}>{fixing ? 'Granting…' : 'Let the fips group read it'}</button>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <Segmented value={minLevel} onChange={setMinLevel} options={LEVELS.map((l) => ({ value: l, label: <span className="capitalize">{l}{counts[l] ? <span className="text-ink-3 ml-1">{counts[l]}</span> : null}</span> }))} />
         <div className="relative flex-1 min-w-[180px] max-w-md"><Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3" /><input className="input pl-9" placeholder="Search message or target…" value={q} onChange={(e) => setQ(e.target.value)} /></div>

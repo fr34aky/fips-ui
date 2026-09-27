@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Node management beyond Linux/systemd** (helper v8): the configuration editor,
+  service buttons and hosts file work on FreeBSD (rc.d), pfSense (its boot
+  script) and, experimentally, macOS (launchd), with the same backup, health
+  check and automatic rollback. The helper reports what the system supports and
+  the pages adapt; per-OS paths (`/usr/local/etc/fips`).
+- **pf firewall** on FreeBSD (and experimentally macOS): the Firewall page manages
+  a pf anchor that mirrors the Linux baseline (default deny on the FIPS
+  interface), with rules and drop-ins in `pf.d`, checked with `pfctl -n`;
+  "Enable" adds a marked block to `/etc/pf.conf` and turns pf on at boot.
+- **Web UI over the mesh on FreeBSD**: the spoofing guard as a pf anchor with the
+  same canary check. Tested end to end in a FreeBSD VM peered over the mesh.
+- The Logs page offers to make a root-only daemon log readable for the fips
+  group (FreeBSD).
+
+### Fixed
+
+- The helper installer wrote the sudoers rule to `/etc/sudoers.d` on FreeBSD,
+  where sudo from pkg reads `/usr/local/etc/sudoers.d`.
+- Service status showed fips as inactive on FreeBSD (root-only pid file); it now
+  falls back to the daemon's own answer.
+
 ### Fixed
 
 - **pfSense upgrades**: fips-ui treated pfSense like FreeBSD and would have

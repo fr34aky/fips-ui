@@ -1,14 +1,17 @@
 // Client for the node-management API (server/admin.ts).
 import { api } from './api';
 
-export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean }
+export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
+export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string }
 export interface ConfigBackup { id: string; size: number; mtime: number }
 export interface ApplyResult { ok: boolean; changed?: boolean; restarted?: boolean; backup_id?: string; rolled_back?: boolean; restored_healthy?: boolean; error?: string; journal?: string }
 export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?: string; addr?: string } | { kind: 'prefix'; prefix: string; label?: string };
 export interface FirewallRule { proto: 'tcp' | 'udp'; ports: string; sources: RuleSource[]; comment?: string; tag?: string }
 export interface Dropin { name: string; content: string; size: number; mtime: number; managed: boolean }
 export interface FirewallState {
-  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null } | { error: string };
+  /** nftables (Linux) or pf (FreeBSD, macOS), and where the drop-ins live. */
+  backend?: 'nft' | 'pf'; dropinDir?: string; dropinExt?: string;
+  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null; pfEnabled?: boolean; anchorReferenced?: boolean; anchor?: string; tun?: string; anchorTun?: string; staleInterface?: boolean } | { error: string };
   unit: { active: string; sub: string; unitFileState?: string; since?: number } | null;
   managedRules: FirewallRule[];
   dropins: Dropin[];

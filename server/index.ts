@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
+import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
@@ -259,14 +260,15 @@ const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequest
 const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
+setDaemonProbe(async () => (await query<{ pid?: number }>('show_status', undefined, { timeoutMs: 2000 })).pid);
+const mergeConfig = createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) });
 const upgrade = createUpgradeHandler({
   authorize: (req) => canChange(req), controlSocket: SOCKET_PATH,
   // After an upgrade, fips.yaml follows the new template (server/config-merge.ts); `admin` is created below. Only
   // where the helper can apply configuration (Linux with systemd); elsewhere the step is skipped.
-  ...(PLATFORM.serviceManager === 'systemd' ? {
-    configMerge: createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) }),
-    configRestore: (id: string) => admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })),
-  } : {}),
+  // Only where the helper can apply the configuration; checked at the time of each upgrade.
+  configMerge: async (a) => (await admin.helperInfo()).features.config ? mergeConfig(a) : { status: 'skipped', detail: 'not available on this system (the helper cannot apply the configuration here)' },
+  configRestore: async (id: string) => (await admin.helperInfo()).features.config ? admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })) : { ok: false, error: 'not available on this system' },
 });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
@@ -279,18 +281,16 @@ const admin = createAdminHandler({
  */
 async function hostsWriteMode(): Promise<{ mode: 'helper' | 'direct' | null; hint: string }> {
   if (READ_ONLY) return { mode: null, hint: 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)' };
-  if (PLATFORM.serviceManager === 'systemd' && HOSTS_PATH === '/etc/fips/hosts') {
+  {
     const h = await admin.helperInfo();
-    if (h.available && (h.version ?? 0) >= HOSTS_HELPER_VERSION) return { mode: 'helper', hint: 'saved through the privileged helper' };
+    if (h.available && (h.version ?? 0) >= HOSTS_HELPER_VERSION && h.features.hosts && h.hostsPath === HOSTS_PATH) return { mode: 'helper', hint: 'saved through the privileged helper' };
   }
   const target = fs.existsSync(HOSTS_PATH) ? HOSTS_PATH : path.dirname(HOSTS_PATH);
   try { await fs.promises.access(target, fs.constants.W_OK); return { mode: 'direct', hint: `written directly to ${HOSTS_PATH}` }; }
   catch {
-    return { mode: null, hint: PLATFORM.serviceManager === 'systemd'
-      ? `editing ${HOSTS_PATH} needs the privileged helper v${HOSTS_HELPER_VERSION}: run sudo ./deploy/setup-local.sh`
-      : PLATFORM.os === 'windows'
-        ? `the UI cannot write ${HOSTS_PATH}: run it elevated or give its user write access to that file`
-        : `the UI cannot write ${HOSTS_PATH}: give its user write access to that file (e.g. group-writable) or run it as root` };
+    return { mode: null, hint: PLATFORM.os === 'windows'
+      ? `the UI cannot write ${HOSTS_PATH}: run it elevated or give its user write access to that file`
+      : `editing ${HOSTS_PATH} needs the privileged helper (v8 outside Linux with systemd): sudo ./deploy/setup-local.sh with systemd, sudo ./deploy/install-upgrade-helper.sh elsewhere; or give the UI's user write access to the file` };
   }
 }
 
@@ -345,7 +345,7 @@ if (!SELFTEST) void hostsSync.start();
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   if (READ_ONLY) return null;
   // The helper drives systemd; other service managers use the direct path.
-  if (PLATFORM.serviceManager === 'systemd' && (await admin.helperInfo()).managementCapable) return 'helper';
+  if ((await admin.helperInfo()).features.services) return 'helper';
   return ALLOW_SERVICE_CONTROL ? 'direct' : null;
 }
 
@@ -415,7 +415,7 @@ async function route(req: Req, res: Res) {
     const you = principalOf(req);
     if (you.role !== 'admin') return json(res, 200, { you });
     const h = await admin.helperInfo();
-    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.managementCapable, helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
+    return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.features.firewall !== 'none', guardSupported: h.features.guard !== 'none', helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
   }
   if (p === '/api/hosts' && method !== 'POST') {
     const h = await readHosts();
@@ -450,7 +450,11 @@ async function route(req: Req, res: Res) {
   if (p === '/api/logs') {
     const requested = Number(url.searchParams.get('lines') ?? 300);
     const lines = Number.isFinite(requested) ? Math.min(5000, Math.max(1, Math.floor(requested))) : 300;
-    return json(res, 200, { lines: await recentLogs(lines, url.searchParams.get('since') ?? undefined) });
+    // A log file the UI's user cannot read (FreeBSD's is root-only) is reported, so the page can offer a fix.
+    const file = LOGS?.file;
+    let unreadable: string | undefined;
+    if (file) { try { await fs.promises.access(file, fs.constants.R_OK); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') unreadable = file; } }
+    return json(res, 200, { lines: await recentLogs(lines, url.searchParams.get('since') ?? undefined), ...(unreadable ? { unreadable } : {}) });
   }
   if (p === '/api/resolve') {
     const id = url.searchParams.get('id') ?? '';
@@ -561,8 +565,8 @@ async function route(req: Req, res: Res) {
     if (!(SERVICES as readonly string[]).includes(svc[1])) throw new HttpError(400, 'unknown service');
     const native = unitName(svc[1] as ServiceId);
     if (!native) throw new HttpError(400, `${svc[1]} is not a service on this system`);
-    // The native name honours FIPS_UI_SERVICE_<NAME>, so the helper acts on the unit the Services card shows.
-    if (mode === 'helper') await admin.serviceAction(native, svc[2]);
+    // The helper takes the unit id and maps it to this system's service name itself.
+    if (mode === 'helper') await admin.serviceAction(svc[1], svc[2]);
     else { const r = await serviceAction(svc[1] as ServiceId, svc[2] as ServiceAction); if (!r.ok) throw new HttpError(500, r.error); }
     return json(res, 200, { ok: true, units: await unitStates() });
   }
@@ -675,8 +679,8 @@ function syncMesh(): Promise<MeshSyncResult> {
     // answering as too old for it. A helper check that failed may hide a loaded guard, so that case is retried.
     const noGuardPossible = helper !== null && (helper.available ? (helper.version ?? 0) < GUARD_HELPER_VERSION : !helper.installed);
     if (!cfg.enabled && noGuardPossible) return { ok: true, skipped: 'no guard to remove' };
-    if (!helper?.managementCapable) {
-      mesh.setGuard({ active: false, ports: [], error: 'mesh access needs the privileged helper, which installs the spoofing guard' });
+    if (!helper?.available || helper.features.guard === 'none') {
+      mesh.setGuard({ active: false, ports: [], error: helper?.available ? 'the spoofing guard is not supported on this system yet, so mesh access stays off' : 'mesh access needs the privileged helper, which installs the spoofing guard' });
       meshSync.dirty = true;
       return { ok: false, skipped: 'helper not installed' };
     }

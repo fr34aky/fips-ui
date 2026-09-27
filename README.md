@@ -56,14 +56,15 @@ What works beyond the read-only pages:
 
 | Feature | Where |
 | ------- | ----- |
-| Configuration editor, firewall, service buttons through the helper | Linux with systemd |
-| Web UI over the mesh | Linux with systemd (the helper loads its spoofing guard) |
-| Hosts-file editor | everywhere: through the helper on Linux with systemd, elsewhere directly when the UI may write the file |
-| fips.yaml template merge after daemon upgrades | Linux with systemd (skipped elsewhere) |
+| Configuration editor, service buttons, hosts file through the helper | Linux with systemd, FreeBSD, pfSense; macOS experimental |
+| Firewall | Linux (nftables), FreeBSD (pf); macOS experimental; not pfSense |
+| Web UI over the mesh | Linux (nftables guard), FreeBSD (pf guard); macOS experimental; not pfSense |
+| Hosts-file editor | everywhere: through the helper where it runs, elsewhere directly when the UI may write the file |
+| fips.yaml template merge after daemon upgrades | where the helper applies the configuration (skipped elsewhere) |
 | Daemon upgrade | all of the above (tested on Linux) |
 | fips-ui self-update | everywhere from a git checkout; restarts itself only under systemd |
 
-`deploy/setup-local.sh` is systemd-only.
+`deploy/setup-local.sh` is systemd-only; elsewhere install the helper with `sudo ./deploy/install-upgrade-helper.sh` ([docs/node-management.md](docs/node-management.md#systems)).
 
 ## Quick start
 

@@ -14,7 +14,8 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
   const toast = useToast();
   const status = usePoll(() => adminApi.status(), [], 30000);
   const helper = status.data?.helper;
-  const fw = usePoll(() => (helper?.managementCapable ? adminApi.firewall() : Promise.resolve(null)), [helper?.managementCapable], 10000);
+  const fwOk = !!helper?.managementCapable && (helper.features ? helper.features.firewall !== 'none' : true);
+  const fw = usePoll(() => (fwOk ? adminApi.firewall() : Promise.resolve(null)), [fwOk], 10000);
   const [ruleDialog, setRuleDialog] = useState<{ index: number | null; initial: Partial<FirewallRule> } | null>(null);
   const [dropinEdit, setDropinEdit] = useState<{ name: string; content: string; isNew: boolean } | null>(null);
   const [confirm, setConfirm] = useState<null | { title: string; body: React.ReactNode; label: string; run: () => Promise<void> }>(null);
@@ -40,10 +41,16 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
   const rules = f?.managedRules ?? [];
   const others = (f?.dropins ?? []).filter((d) => !d.managed);
 
+  // nftables on Linux; pf (an anchor fips-ui loads) on FreeBSD and macOS.
+  const pf = f?.backend === 'pf';
+  const dir = f?.dropinDir ?? '/etc/fips/fips.d', ext = f?.dropinExt ?? '.nft';
+  const pfSt = pf && st ? st : null;
   return (
     <div className="grid gap-4 fade-in">
-      <p className="text-ink-2 text-sm max-w-3xl">The fips0 firewall is the default-deny nftables baseline at <code>/etc/fips/fips.nft</code>: nothing a mesh peer initiates gets in unless a drop-in in <code>/etc/fips/fips.d/</code> allows it. Every change is checked with <code>nft -c</code> against the full ruleset before it is written, and reloaded if the firewall is running.</p>
-      <HelperGate helper={helper}>
+      {pf
+        ? <p className="text-ink-2 text-sm max-w-3xl">The fips firewall is a pf anchor loaded by fips-ui: connections arriving on the FIPS interface are dropped unless a drop-in in <code>{dir}/</code> passes them (established connections and pings are allowed). Every change is checked with <code>pfctl -n</code> before it is written, and loaded if the firewall is running.</p>
+        : <p className="text-ink-2 text-sm max-w-3xl">The fips0 firewall is the default-deny nftables baseline at <code>/etc/fips/fips.nft</code>: nothing a mesh peer initiates gets in unless a drop-in in <code>/etc/fips/fips.d/</code> allows it. Every change is checked with <code>nft -c</code> against the full ruleset before it is written, and reloaded if the firewall is running.</p>}
+      <HelperGate helper={helper} need="firewall">
         {fw.error && <ErrorNote>{fw.error}</ErrorNote>}
         {lastError && <div className="card px-4 py-3 text-sm grid gap-2" style={{ borderColor: 'rgba(208,59,59,0.5)' }}><div className="text-crit font-medium">{lastError.error}</div>{lastError.detail && <pre className="text-xs whitespace-pre-wrap bg-surface-2 rounded-lg p-3 max-h-48 overflow-auto">{lastError.detail}</pre>}</div>}
 
@@ -53,10 +60,12 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
               <div className="grid gap-3">
                 <div className="flex items-center gap-3">
                   {st.tableLoaded ? <ShieldCheck size={28} className="text-good" /> : <ShieldAlert size={28} className="text-crit" />}
-                  <div><div className="font-semibold">{st.tableLoaded ? 'Protecting fips0' : 'Not protecting fips0'}</div><div className="text-xs text-ink-3">{st.tableLoaded ? 'table inet fips is loaded' : 'every listener bound to :: is reachable from the mesh'}</div></div>
+                  <div><div className="font-semibold">{(pf ? st.unitActive : st.tableLoaded) ? 'Protecting the FIPS interface' : 'Not protecting the FIPS interface'}</div><div className="text-xs text-ink-3">{pf
+                    ? (!pfSt?.anchorReferenced ? 'pf does not evaluate the fips-ui anchors yet' : !pfSt?.pfEnabled ? 'pf is not enabled' : pfSt?.staleInterface ? `the rules are for ${pfSt.anchorTun}, but fips now uses ${pfSt.tun}: Reload` : st.tableLoaded ? `pf anchor ${pfSt?.anchor ?? ''} is loaded (${pfSt?.tun ?? ''})` : 'the anchor is empty: every listener is reachable from the mesh')
+                    : st.tableLoaded ? 'table inet fips is loaded' : 'every listener bound to :: is reachable from the mesh'}</div></div>
                 </div>
                 <KV items={[
-                  ['Service', <Chip tone={st.unitActive ? 'good' : 'crit'}>{st.unitActive ? 'active' : 'inactive'}</Chip>],
+                  [pf ? 'pf anchor' : 'Service', <Chip tone={st.unitActive ? 'good' : 'crit'}>{st.unitActive ? 'active' : 'inactive'}</Chip>],
                   ['At boot', <Chip tone={st.unitEnabled === 'enabled' ? 'good' : 'warn'}>{st.unitEnabled}</Chip>],
                   ['Rules loaded', st.summary ? fmtNum(st.summary.rules) : '–'],
                   ['Dropped', st.summary ? `${fmtNum(st.summary.dropPackets)} packets · ${fmtBytes(st.summary.dropBytes)}` : '–'],
@@ -64,18 +73,20 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
                 ]} />
                 {!readOnly && (
                   <div className="flex flex-wrap gap-2 pt-1">
-                    {st.unitEnabled !== 'enabled' && <button className="btn primary sm" disabled={busy} onClick={async () => { if (await svc('enable')) if (!st.unitActive) await svc('start'); }}>Enable at boot{st.unitActive ? '' : ' and start'}</button>}
-                    {!st.unitActive && st.unitEnabled === 'enabled' && <button className="btn primary sm" disabled={busy} onClick={() => svc('start')}>Start</button>}
+                    {st.unitEnabled !== 'enabled' && st.unitEnabled !== 'unsupported' && <button className="btn primary sm" disabled={busy} onClick={() => pf
+                      ? setConfirm({ title: 'Enable the fips firewall in pf?', label: 'Enable', body: <>This adds a marked block to <code>/etc/pf.conf</code> (the fips-ui anchors, and loading the firewall anchor at boot), sets <code>pf_enable=YES</code> and starts pf with <code>/etc/pf.conf</code> if it is not running. Check that your own pf.conf rules keep your SSH access open before enabling pf. The previous file is kept as <code>/etc/pf.conf.fips-ui.bak</code>.</>, run: async () => { if (await svc('enable')) if (!st.unitActive) await svc('start'); } })
+                      : void (async () => { if (await svc('enable')) if (!st.unitActive) await svc('start'); })()}>Enable at boot{st.unitActive ? '' : ' and start'}</button>}
+                    {!st.unitActive && (st.unitEnabled === 'enabled' || st.unitEnabled === 'unsupported') && <button className="btn primary sm" disabled={busy} onClick={() => svc('start')}>Start</button>}
                     {st.unitActive && <button className="btn sm" disabled={busy} onClick={() => svc('reload')}>Reload</button>}
-                    {st.unitActive && <button className="btn sm danger" disabled={busy} onClick={() => setConfirm({ title: 'Stop the firewall?', label: 'Stop', body: 'The inet fips table is removed immediately. Every service listening on all interfaces becomes reachable from any mesh node until the firewall is started again.', run: async () => { await svc('stop'); } })}>Stop</button>}
-                    {st.unitEnabled === 'enabled' && <button className="btn sm ghost" disabled={busy} onClick={() => setConfirm({ title: 'Disable at boot?', label: 'Disable', body: 'The firewall keeps running now but will not be loaded after the next reboot.', run: async () => { await svc('disable'); } })}>Disable at boot</button>}
+                    {st.unitActive && <button className="btn sm danger" disabled={busy} onClick={() => setConfirm({ title: 'Stop the firewall?', label: 'Stop', body: pf ? 'The fips-ui firewall anchor is emptied immediately (pf keeps running). Every service listening on all interfaces becomes reachable from any mesh node until the firewall is started again.' : 'The inet fips table is removed immediately. Every service listening on all interfaces becomes reachable from any mesh node until the firewall is started again.', run: async () => { await svc('stop'); } })}>Stop</button>}
+                    {st.unitEnabled === 'enabled' && <button className="btn sm ghost" disabled={busy} onClick={() => setConfirm({ title: 'Disable at boot?', label: 'Disable', body: pf ? 'The fips-ui block is removed from /etc/pf.conf and the firewall anchor emptied; pf itself keeps running with your other rules.' : 'The firewall keeps running now but will not be loaded after the next reboot.', run: async () => { await svc('disable'); } })}>Disable at boot</button>}
                   </div>
                 )}
               </div>
             )}
           </Card>
 
-          <Card title="Allowed inbound (managed by this UI)" hint="Rules stored in /etc/fips/fips.d/fips-ui.nft" actions={!readOnly && <button className="btn sm primary" disabled={busy || !f} onClick={() => setRuleDialog({ index: null, initial: { proto: 'tcp', sources: [{ kind: 'any' }] } })}><Plus size={14} />Add rule</button>} pad={false}>
+          <Card title="Allowed inbound (managed by this UI)" hint={`Rules stored in ${dir}/fips-ui${ext}`} actions={!readOnly && <button className="btn sm primary" disabled={busy || !f} onClick={() => setRuleDialog({ index: null, initial: { proto: 'tcp', sources: [{ kind: 'any' }] } })}><Plus size={14} />Add rule</button>} pad={false}>
             {!f ? <div className="p-4"><Skeleton className="h-24 w-full" /></div> : rules.length === 0 ? <Empty>No rules yet. Use Add rule, or Allow next to a listener below.</Empty> : (
               <div className="overflow-x-auto"><table className="data"><thead><tr><th>Proto</th><th>Ports</th><th>From</th><th>Note</th><th /></tr></thead><tbody>
                 {rules.map((r, i) => (
@@ -109,10 +120,10 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
           )}
         </Card>
 
-        <Card title="Other drop-ins" hint="Files in /etc/fips/fips.d written by other software or by hand" actions={!readOnly && <button className="btn sm" disabled={busy} onClick={() => setDropinEdit({ name: '', content: '', isNew: true })}><Plus size={14} />New drop-in</button>} pad={false}>
+        <Card title="Other drop-ins" hint={`Files in ${dir} written by other software or by hand`} actions={!readOnly && <button className="btn sm" disabled={busy} onClick={() => setDropinEdit({ name: '', content: '', isNew: true })}><Plus size={14} />New drop-in</button>} pad={false}>
           {!f ? <Empty>Loading…</Empty> : others.length === 0 ? <Empty>None.</Empty> : others.map((d) => (
             <div key={d.name} className="border-b border-line last:border-0 px-4 py-3 grid gap-2">
-              <div className="flex items-center gap-2"><FileCode2 size={15} className="text-ink-3" /><span className="font-medium mono">{d.name}.nft</span><span className="text-xs text-ink-3">{fmtBytes(d.size)} · changed {fmtAgo(d.mtime)}</span>
+              <div className="flex items-center gap-2"><FileCode2 size={15} className="text-ink-3" /><span className="font-medium mono">{d.name}{ext}</span><span className="text-xs text-ink-3">{fmtBytes(d.size)} · changed {fmtAgo(d.mtime)}</span>
                 {!readOnly && <div className="ml-auto flex gap-1"><button className="btn sm ghost" onClick={() => setDropinEdit({ name: d.name, content: d.content, isNew: false })}><Pencil size={13} />Edit</button><button className="btn sm ghost" disabled={busy} onClick={() => setConfirm({ title: `Delete ${d.name}.nft?`, label: 'Delete', body: 'The allowances in this file stop applying as soon as the firewall reloads.', run: async () => { await run(() => adminApi.deleteDropin(d.name), `${d.name}.nft deleted`); } })}><Trash2 size={13} /></button></div>}
               </div>
               <pre className="text-xs bg-surface-2 rounded-lg p-3 overflow-auto max-h-48 whitespace-pre">{d.content.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).join('\n') || '(comments only)'}</pre>
@@ -125,10 +136,10 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
         const next = ruleDialog.index === null ? [...rules, rule] : rules.map((r, i) => (i === ruleDialog.index ? rule : r));
         if (await saveRules(next, ruleDialog.index === null ? 'Rule added' : 'Rule updated')) setRuleDialog(null);
       }} />}
-      <Modal open={!!dropinEdit} onClose={() => setDropinEdit(null)} title={dropinEdit?.isNew ? 'New drop-in' : `Edit ${dropinEdit?.name}.nft`} width="max-w-3xl">
-        {dropinEdit && <form className="grid gap-3" onSubmit={async (e) => { e.preventDefault(); if (await run(() => adminApi.saveDropin(dropinEdit.name, dropinEdit.content), `${dropinEdit.name}.nft saved`)) setDropinEdit(null); }}>
+      <Modal open={!!dropinEdit} onClose={() => setDropinEdit(null)} title={dropinEdit?.isNew ? 'New drop-in' : `Edit ${dropinEdit?.name}${ext}`} width="max-w-3xl">
+        {dropinEdit && <form className="grid gap-3" onSubmit={async (e) => { e.preventDefault(); if (await run(() => adminApi.saveDropin(dropinEdit.name, dropinEdit.content), `${dropinEdit.name}${ext} saved`)) setDropinEdit(null); }}>
           {dropinEdit.isNew && <label className="field">Name<input className="input mono" required pattern="[a-z0-9][a-z0-9_\-]{0,40}" value={dropinEdit.name} onChange={(e) => setDropinEdit({ ...dropinEdit, name: e.target.value })} placeholder="services" /></label>}
-          <label className="field">Rules (chain context, one per line)<textarea className="input mono h-64 py-2 resize-y" spellCheck={false} value={dropinEdit.content} onChange={(e) => setDropinEdit({ ...dropinEdit, content: e.target.value })} placeholder={'tcp dport 22 accept\nip6 saddr fd97:467a::/64 tcp dport 8443 accept'} /></label>
+          <label className="field">{pf ? <>Rules (inbound on the FIPS interface: each starts with <code>pass in on $tun</code> or <code>block in on $tun</code>)</> : 'Rules (chain context, one per line)'}<textarea className="input mono h-64 py-2 resize-y" spellCheck={false} value={dropinEdit.content} onChange={(e) => setDropinEdit({ ...dropinEdit, content: e.target.value })} placeholder={pf ? 'pass in on $tun inet6 proto tcp to any port 22\npass in on $tun inet6 proto tcp from fd97:467a::/64 to any port 8443' : 'tcp dport 22 accept\nip6 saddr fd97:467a::/64 tcp dport 8443 accept'} /></label>
           <div className="flex justify-end gap-2"><button type="button" className="btn" onClick={() => setDropinEdit(null)}>Cancel</button><button className="btn primary" disabled={busy}>{busy ? 'Validating…' : 'Validate and save'}</button></div>
         </form>}
       </Modal>

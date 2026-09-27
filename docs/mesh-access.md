@@ -41,6 +41,15 @@ missing or no longer matches, and both are retried every 15 seconds until they s
 Removing an npub or changing its role closes its open connections, including live event streams. An
 operation it had already started, such as a configuration apply, still completes.
 
+## Systems
+
+The guard is an nftables table on Linux and a pf anchor on FreeBSD and macOS (`fips-ui/guard`, with the same
+canary rule and a nested anchor that drops mesh-source TCP to the UI's port unless it arrives on `lo0` or the
+FIPS interface). On pf the guard never enables pf itself: turn the fips firewall on first (Firewall page), so
+pf evaluates the fips-ui anchors. pfSense has no guard, so mesh access stays off there. If pf stops evaluating
+the anchors (pf disabled, pf.conf reloaded without them), the per-connection canary check notices and mesh
+access stops admitting anyone.
+
 ## Roles
 
 | Role | Can |

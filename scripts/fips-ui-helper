@@ -43,7 +43,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=7
+HELPER_VERSION=8
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -108,7 +108,7 @@ svc_exists() {
   case "$SM" in
     systemd) systemctl cat "$1" >/dev/null 2>&1 ;;
     launchd) launchctl print "system/$1" >/dev/null 2>&1 || [[ -f "/Library/LaunchDaemons/$1.plist" ]] ;;
-    rc)      service "$1" status >/dev/null 2>&1 || [[ -x "/usr/local/etc/rc.d/$1" ]] ;;
+    rc)      service "$1" onestatus >/dev/null 2>&1 || [[ -x "/usr/local/etc/rc.d/$1" ]] ;;
     pfsense) [[ -x "/usr/local/etc/rc.d/$1.sh" ]] ;;
     openrc)  rc-service -e "$1" ;;
     sysv)    [[ -x "/etc/init.d/$1" ]] ;;
@@ -119,7 +119,7 @@ svc_active() {
   case "$SM" in
     systemd) systemctl is-active --quiet "$1" ;;
     launchd) launchctl print "system/$1" 2>/dev/null | grep -q 'state = running' ;;
-    rc)      service "$1" status >/dev/null 2>&1 ;;
+    rc)      service "$1" onestatus >/dev/null 2>&1 ;;
     pfsense) "/usr/local/etc/rc.d/$1.sh" status >/dev/null 2>&1 ;;
     openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
     sysv)    "/etc/init.d/$1" status >/dev/null 2>&1 ;;
@@ -137,12 +137,63 @@ rc_script() {
   rm -f "$out"
   return $rc
 }
+svc_start() {
+  case "$SM" in
+    systemd) systemctl start "$1" 9>&- ;;
+    launchd) launchctl kickstart "system/$1" 9>&- ;;
+    rc)      rc_script service "$1" onestart ;;
+    pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" start ;;
+    openrc)  rc-service "$1" start 9>&- ;;
+    *) return 1 ;;
+  esac
+}
+svc_stop() {
+  case "$SM" in
+    systemd) systemctl stop "$1" ;;
+    launchd) launchctl kill TERM "system/$1" ;;
+    rc)      rc_script service "$1" onestop ;;
+    pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" stop ;;
+    openrc)  rc-service "$1" stop ;;
+    *) return 1 ;;
+  esac
+}
+# Start at boot or not. pfSense runs every rc.d/*.sh at boot itself (its own knob lives in fips.conf).
+svc_enable() { # <name> <true|false>
+  case "$SM" in
+    systemd) if $2; then systemctl enable "$1"; else systemctl disable "$1"; fi ;;
+    launchd) if $2; then launchctl enable "system/$1"; else launchctl disable "system/$1"; fi ;;
+    rc)      sysrc -q "${1}_enable=$($2 && echo YES || echo NO)" >/dev/null ;;
+    openrc)  if $2; then rc-update add "$1" default; else rc-update del "$1" default; fi ;;
+    *) return 1 ;;
+  esac
+}
+svc_enabled() {
+  case "$SM" in
+    systemd) systemctl is-enabled "$1" 2>/dev/null || true ;;
+    launchd) launchctl print-disabled system 2>/dev/null | grep -q "\"$1\" => \(true\|disabled\)" && echo disabled || echo enabled ;;
+    rc)      [[ "$(sysrc -n "${1}_enable" 2>/dev/null)" =~ ^[Yy][Ee][Ss]$ ]] && echo enabled || echo disabled ;;
+    pfsense) echo enabled ;;
+    openrc)  rc-update show default 2>/dev/null | grep -qw "$1" && echo enabled || echo disabled ;;
+    *) echo unknown ;;
+  esac
+}
+# The native service name for a fips unit id (fips, fips-dns, fips-gateway, fips-firewall), or nothing.
+svc_native() {
+  case "$SM:$1" in
+    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall) echo "$1.service" ;;
+    rc:fips|rc:fips-dns|rc:fips-gateway) echo "${1//-/_}" ;;
+    pfsense:fips) echo fips ;;
+    launchd:fips) echo "$SERVICE" ;;
+    launchd:fips-gateway) echo "$GATEWAY_SERVICE" ;;
+    openrc:fips|openrc:fips-dns|openrc:fips-gateway) echo "$1" ;;
+  esac
+}
 # 9>&- : a daemon started by the service manager must not inherit the helper lock.
 svc_restart() {
   case "$SM" in
     systemd) systemctl restart "$1" 9>&- ;;
     launchd) launchctl kickstart -k "system/$1" 9>&- ;;
-    rc)      rc_script service "$1" restart ;;
+    rc)      rc_script service "$1" onerestart ;;
     pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" restart ;;
     openrc)  rc-service "$1" restart 9>&- ;;
     sysv)    "/etc/init.d/$1" restart 9>&- ;;
@@ -218,10 +269,23 @@ install_package() {
 }
 
 # ---------------------------------------------------------------- node management (v4)
-FIPS_CONFIG=/etc/fips/fips.yaml
+case "$OS" in
+  FreeBSD|Darwin) FIPS_ETC=/usr/local/etc/fips ;;
+  *)              FIPS_ETC=/etc/fips ;;
+esac
+FIPS_CONFIG=$FIPS_ETC/fips.yaml
+FIPS_HOSTS=$FIPS_ETC/hosts
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
-FIPS_HOSTS=/etc/fips/hosts
+# pf (FreeBSD, macOS): drop-ins in pf.d are rendered, with the baseline, into one anchor file. FreeBSD references
+# the anchors from a marked block in /etc/pf.conf; macOS loads them under Apple's existing "com.apple/*".
+PF_DROPIN_DIR=$FIPS_ETC/pf.d
+PF_FW_FILE=$FIPS_ETC/fips-ui-firewall.pf
+PF_CONF=/etc/pf.conf
+if [[ "$OS" == Darwin ]]; then PF_FW_ANCHOR=com.apple/fips-ui-firewall; PF_GUARD_ANCHOR=com.apple/fips-ui-guard; PF_REF='anchor "com.apple/\*"'
+else PF_FW_ANCHOR=fips-ui/firewall; PF_GUARD_ANCHOR=fips-ui/guard; PF_REF='anchor "fips-ui/firewall"'; fi
+PF_MARK_BEGIN='# >>> fips-ui: anchors of the fips firewall and the web UI guard (managed by fips-ui; keep these lines)'
+PF_MARK_END='# <<< fips-ui'
 # Fixed per OS and deliberately not derived from FIPS_UI_BACKUPS, which sudo forwards from the caller.
 CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DEFAULT")/config-backups"
 LOCK_FILE=/var/run/fips-ui-helper.lock
@@ -240,9 +304,44 @@ fi
 
 # One privileged change at a time, across every caller (UI, upgrade jobs, a second tab, a shell).
 take_lock() {
-  command -v flock >/dev/null 2>&1 || return 0
-  exec 9>"$LOCK_FILE"
-  flock -w 10 9 || die "another privileged operation is in progress"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock -w 10 9 || die "another privileged operation is in progress"
+    return 0
+  fi
+  # No flock (FreeBSD, macOS): a lock directory holding the owner's pid. A lock whose owner is gone is taken
+  # over, so it needs no cleanup on exit (which the verbs' own EXIT traps would replace).
+  # Stale only when its owner is known and gone (or is no longer this helper); a lock without a pid yet is being
+  # taken right now and is waited for, unless it is older than 30 s.
+  local d="$LOCK_FILE.d" i owner age
+  for i in $(seq 1 50); do
+    if mkdir "$d" 2>/dev/null; then echo $$ > "$d/pid.tmp" && mv -f "$d/pid.tmp" "$d/pid"; return 0; fi
+    owner=$(cat "$d/pid" 2>/dev/null || true)
+    if [[ -n "$owner" ]]; then
+      if ! kill -0 "$owner" 2>/dev/null || ! ps -p "$owner" -o command= 2>/dev/null | grep -q fips-ui-helper; then rm -rf "$d"; continue; fi
+    else
+      age=$(( $(date +%s) - $(file_mtime "$d" 2>/dev/null || date +%s) ))
+      (( age > 30 )) && { rm -rf "$d"; continue; }
+    fi
+    sleep 0.2
+  done
+  die "another privileged operation is in progress"
+}
+
+# Portable pieces: GNU coreutils on Linux, BSD tools on FreeBSD and macOS.
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  elif command -v sha256 >/dev/null 2>&1; then sha256 -q
+  else shasum -a 256 | cut -d' ' -f1; fi
+}
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+# "<octal mode> <uid> <gid>" of a file, to write its replacement with the same ones.
+file_perms() { stat -c '%a %u %g' "$1" 2>/dev/null || stat -f '%Lp %u %g' "$1"; }
+# Keep the newest <n> of the files matching a glob (no xargs -r, which BSD/macOS xargs may lack).
+keep_newest() { # <n> <glob...>
+  local n=$1 i=0 f; shift
+  for f in $(ls -1t "$@" 2>/dev/null); do i=$((i + 1)); (( i > n )) && rm -f -- "$f"; done
+  return 0
 }
 
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
@@ -776,8 +875,16 @@ read_stdin_limited() { # <dest> <max-bytes>
   (( n > 0 )) || die "empty input"
 }
 
+# The daemon's last log lines since <epoch>: the journal under systemd, its log file elsewhere.
 journal_tail_json() { # <unit> <since-epoch>
-  local out; out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  local out=""
+  if [[ "$SM" == systemd ]]; then out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  else
+    local f
+    for f in "$(sysrc -n fips_logfile 2>/dev/null || true)" /var/log/fips.log /var/log/fips/fips.log /usr/local/var/log/fips/fips.log; do
+      [[ -n "$f" && -f "$f" ]] && { out=$(tail -n 25 "$f" 2>/dev/null || true); break; }
+    done
+  fi
   json_escape "$out"
 }
 
@@ -793,20 +900,27 @@ wait_fips_healthy() {
   # With the control socket disabled (node.control.enabled: false) only "active without restarts" can be checked.
   local probe=true; [[ "$sock" == "-" ]] && probe=false
   sleep 3
-  restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+  # "Did it restart?": systemd counts restarts; elsewhere the daemon's pid must stay the same.
+  restart_marker() {
+    if [[ "$SM" == systemd ]]; then systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0
+    else "$(fipsctl_bin)" ${args[@]+"${args[@]}"} show status 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null || echo ""; fi
+  }
+  restarts=$(restart_marker)
   while (( $(date +%s) < deadline )); do
-    if systemctl is-active --quiet "$SERVICE" && [[ "$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)" == "$restarts" ]] \
-       && { ! $probe || "$(fipsctl_bin)" "${args[@]}" show status >/dev/null 2>&1; }; then
+    if svc_active "$SERVICE" && [[ "$(restart_marker)" == "$restarts" ]] \
+       && { ! $probe || "$(fipsctl_bin)" ${args[@]+"${args[@]}"} show status >/dev/null 2>&1; }; then
       ok=$((ok + 1)); (( ok >= 8 )) && return 0
     else
-      ok=0; restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+      ok=0; restarts=$(restart_marker)
     fi
     sleep 1
   done
   return 1
 }
 
-require_systemd() { [[ "$SM" == systemd ]] || die "node management verbs need systemd (found $SM)"; }
+require_systemd() { [[ "$SM" == systemd ]] || die "this needs systemd (found $SM)"; }
+# Configuration, hosts file and services: every service manager whose restart and health the helper handles.
+require_managed() { case "$SM" in systemd|rc|pfsense|launchd) ;; *) die "node management is not supported with $SM" ;; esac; }
 valid_id() { [[ "$1" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid backup id"; }
 
 # backup_config [keep-id]: never prunes <keep-id> (the backup about to be restored).
@@ -824,21 +938,26 @@ backup_config() {
 # install_config_and_restart <file> <backup-id> <restart:true|false>
 # Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
 # Replace fips.yaml atomically: a temp file in the same directory, then rename (never a half-written file).
-put_config() { install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"; }
+put_config() {
+  # Always 0600 (it holds secrets); owner and group stay as they were (root:root when there is no file).
+  local m u=0 g=0
+  [[ -f "$FIPS_CONFIG" ]] && read -r m u g < <(file_perms "$FIPS_CONFIG")
+  install -m 0600 -o "$u" -g "$g" "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"
+}
 
 install_config_and_restart() {
   trap '' INT TERM HUP
   put_config "$1"
   if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
   local start; start=$(date +%s)
-  systemctl restart "$SERVICE" || true
+  svc_restart "$SERVICE" || true
   if wait_fips_healthy; then
     printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":true}\n' "$(json_escape "$2")"; return
   fi
   local log; log=$(journal_tail_json "$SERVICE" "$start")
   log "daemon unhealthy with the new config; restoring backup $2"
   put_config "$CONFIG_BACKUPS_DIR/$2.yaml"
-  systemctl restart "$SERVICE" || true
+  svc_restart "$SERVICE" || true
   local back=false; wait_fips_healthy && back=true
   printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"
 }
@@ -877,14 +996,165 @@ firewall_reload_if_active() {
   if systemctl is-active --quiet fips-firewall.service; then systemctl reload-or-restart fips-firewall.service && echo true || echo false; else echo false; fi
 }
 
+# ---------------------------------------------------------------- firewall backends
+# nft: Linux with systemd (fips-firewall.service, table inet fips). pf: FreeBSD and macOS; not pfSense, which
+# owns pf and regenerates its rules.
+fw_backend() {
+  if [[ "$SM" == systemd ]] && command -v nft >/dev/null 2>&1; then echo nft
+  elif [[ "$OS" == FreeBSD && "$SM" != pfsense || "$OS" == Darwin ]] && command -v pfctl >/dev/null 2>&1; then echo pf
+  else echo none; fi
+}
+guard_backend() {
+  if [[ "$OS" == Linux ]] && command -v nft >/dev/null 2>&1; then echo nft
+  elif [[ "$(fw_backend)" == pf ]]; then echo pf
+  else echo none; fi
+}
+require_fw() { [[ "$(fw_backend)" == "$1" ]] || die "the fips firewall is not managed with $1 on this system"; }
+
+pf_ready() { [[ "$OS" == FreeBSD ]] && kldload -n pf 2>/dev/null; return 0; }
+# pfctl with its own exit status; its output goes to stderr without the "No ALTQ support" notices.
+pfctl_run() {
+  local out rc=0
+  out=$(pfctl "$@" 2>&1) || rc=$?
+  out=$(grep -v 'ALTQ' <<<"$out" || true)
+  [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+  return $rc
+}
+pf_enabled() { pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; }
+# The main ruleset evaluates our anchors (FreeBSD: the pf.conf block; macOS: Apple's com.apple/* anchor).
+pf_referenced() { pfctl -s rules 2>/dev/null | grep -q "^$PF_REF"; }
+# The guard only protects if pf evaluates it before every rule that could pass a packet: it must be the first
+# filter rule (FreeBSD: our own reference inserted at the top; macOS: Apple's com.apple/* anchor).
+pf_guard_first() {
+  local first; first=$(pfctl -s rules 2>/dev/null | grep -v '^[[:space:]]' | head -n 1)
+  if [[ "$OS" == Darwin ]]; then [[ "$first" == 'anchor "com.apple/*"'* ]]; else [[ "$first" == "anchor \"$PF_GUARD_ANCHOR\""* ]]; fi
+}
+# "set skip on lo0" makes pf ignore loopback, and with it the guard's canary.
+pf_lo_skipped() { pfctl -s Interfaces -i lo0 -v 2>/dev/null | grep -q '(skip)'; }
+pf_conf_has_block() { [[ -f "$PF_CONF" ]] && grep -qF "$PF_MARK_BEGIN" "$PF_CONF"; }
+# The FIPS interface, from the daemon (tun0 on FreeBSD, utunN on macOS).
+pf_tun() {
+  local sock args=() t
+  sock=$(python3 -I -c "$REDACT_PY" socketpath "$SECRET_KEYS" "$FIPS_CONFIG" 2>/dev/null || true)
+  [[ -n "$sock" && "$sock" == /* ]] && args=(-s "$sock")
+  t=$("$(fipsctl_bin)" ${args[@]+"${args[@]}"} show status 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("tun_name",""))' 2>/dev/null || true)
+  [[ "$t" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || return 1
+  echo "$t"
+}
+# The interface the loaded firewall anchor filters (from its rules), or nothing.
+pf_anchor_tun() { pfctl -a "$PF_FW_ANCHOR" -s rules 2>/dev/null | sed -nE 's/^block drop in on ([A-Za-z0-9_.-]+) .*label "fips-ui drop".*/\1/p' | head -n 1; }
+
+# pf_render_firewall <dropin-dir> <out>: the anchor's rules. Default deny for connections arriving on the FIPS
+# interface, established ones and pings allowed, then the drop-ins (pass rules; pf uses the last match).
+pf_render_firewall() {
+  # Never guess the interface: rules for the wrong one would look loaded but protect nothing.
+  local tun; tun=$(pf_tun) || die "cannot ask the fips daemon for its interface; is fips running?"
+  {
+    echo "# Generated by fips-ui-helper from $PF_DROPIN_DIR; rewritten on every change."
+    echo "tun = \"$tun\""
+    echo 'pass out on $tun all keep state'
+    echo 'block drop in on $tun all label "fips-ui drop"'
+    echo 'pass in on $tun inet6 proto icmp6 icmp6-type echoreq keep state'
+    local f
+    for f in "$1"/*.pf; do if [[ -f "$f" ]]; then echo "# --- $(basename "$f")"; cat "$f"; echo; fi; done
+  } > "$2"
+}
+
+# A pf drop-in may hold only inbound pass/block rules on the FIPS interface ($tun): it cannot touch other
+# interfaces, load files, define anchors or tables, or redirect traffic.
+pf_check_dropin_content() {
+  awk '
+    { if ($0 ~ /\047/) { printf "line %d: single quotes are not allowed in a drop-in (use double quotes)\n", NR; bad = 1; next }
+      q = $0; if (gsub(/"/, "", q) % 2) { printf "line %d: every double quote must be closed on its line\n", NR; bad = 1; next }
+      t = $0; gsub(/"[^"]*"/, "\"\"", t); sub(/#.*/, "", t); gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == "") next
+      if (t !~ /^(pass|block)([ \t]+(drop|return|return-rst))?[ \t]+in([ \t]+log)?([ \t]+quick)?[ \t]+on[ \t]+\$tun([ \t]|$)/) { printf "line %d: every rule must start with \"pass in on $tun\" or \"block in on $tun\"\n", NR; bad = 1; next }
+      if (t ~ /[\\;<>]/) { printf "line %d: \\, ;, < and > are not allowed in a drop-in\n", NR; bad = 1; next }
+      n = split(tolower(t), w, /[ \t{},()]+/)
+      for (i = 1; i <= n; i++) if (w[i] ~ /^(anchor|load|include|table|rdr|nat|binat|scrub|antispoof|set|route-to|reply-to|dup-to|divert-to|divert-reply|divert-packet|nat-to|rdr-to|af-to|rtable)$/) { printf "line %d: \"%s\" is not allowed in a drop-in\n", NR, w[i]; bad = 1; next }
+      d = 0; for (i = 1; i <= length(t); i++) { ch = substr(t, i, 1); if (ch == "{") d++; else if (ch == "}") { d--; if (d < 0) break } }
+      if (d != 0) { printf "line %d: braces must balance within the line\n", NR; bad = 1 }
+    }
+    END { exit bad }' "$1"
+}
+
+# pf_check_ruleset <dir-with-candidate-dropins>: parse the rendered anchor without loading it.
+pf_check_ruleset() {
+  local t; t=$(mktemp); pf_render_firewall "$1" "$t"
+  local out; out=$(pfctl -n -a "$PF_FW_ANCHOR" -f "$t" 2>&1); local rc=$?
+  rm -f "$t"; printf '%s' "$(grep -v 'ALTQ' <<<"$out" | sed "s#^$t#rules#" | head -n 5)"; return $rc
+}
+pf_load_firewall() { pf_ready; pf_render_firewall "$PF_DROPIN_DIR" "$PF_FW_FILE" && chmod 0644 "$PF_FW_FILE" && pfctl_run -a "$PF_FW_ANCHOR" -f "$PF_FW_FILE"; }
+pf_fw_loaded() { [[ -n "$(pfctl -a "$PF_FW_ANCHOR" -s rules 2>/dev/null)" ]]; }
+pf_reload_if_active() { if pf_enabled && pf_fw_loaded; then pf_load_firewall && echo true || echo false; else echo false; fi; }
+
+# The marked pf.conf block (FreeBSD): the anchor reference, and the firewall anchor loaded at boot.
+pf_conf_write() { # <add|remove>
+  local tmp; tmp=$(mktemp)
+  if [[ -f "$PF_CONF" ]]; then awk -v b="$PF_MARK_BEGIN" -v e="$PF_MARK_END" '$0 == b {skip = 1} !skip {print} $0 == e {skip = 0}' "$PF_CONF" > "$tmp"
+  else printf '# /etc/pf.conf created by fips-ui: everything passes except what the fips-ui anchors decide.\npass all\n' > "$tmp"; fi
+  if [[ "$1" == add ]]; then
+    # The guard's reference goes before the first filter rule, so no earlier "quick" rule can pass spoofed traffic;
+    # the firewall's goes last, so its default deny is the last match for the FIPS interface.
+    local t2; t2=$(mktemp)
+    awk -v b="$PF_MARK_BEGIN" -v e="$PF_MARK_END" -v g="$PF_GUARD_ANCHOR" '
+      !done && /^[[:space:]]*(pass|block|match|anchor|antispoof)([[:space:]]|$)/ { print b; printf "anchor \"%s\"\n", g; print e; done = 1 }
+      { print }
+      END { if (!done) { print b; printf "anchor \"%s\"\n", g; print e } }' "$tmp" > "$t2"
+    printf '%s\nanchor "%s"\nload anchor "%s" from "%s"\n%s\n' "$PF_MARK_BEGIN" "$PF_FW_ANCHOR" "$PF_FW_ANCHOR" "$PF_FW_FILE" "$PF_MARK_END" >> "$t2"
+    mv -f "$t2" "$tmp"
+  fi
+  local err; if ! err=$(pfctl_run -n -f "$tmp" 2>&1); then rm -f "$tmp"; die "the new pf.conf does not parse: $(head -n 3 <<<"$err" | tr '\n' ' ')"; fi
+  local m=644 u=0 g=0; [[ -f "$PF_CONF" ]] && read -r m u g < <(file_perms "$PF_CONF")
+  [[ -f "$PF_CONF" ]] && cp -p "$PF_CONF" "$PF_CONF.fips-ui.bak"
+  install -m "$m" -o "$u" -g "$g" "$tmp" "$PF_CONF.fips-ui.new" && mv -f "$PF_CONF.fips-ui.new" "$PF_CONF"; rm -f "$tmp"
+}
+
+# pf firewall actions for the fips-firewall "unit" (Firewall page buttons).
+pf_fw_action() { # <start|stop|restart|reload|enable|disable>
+  pf_ready
+  case "$1" in
+    start|restart|reload)
+      pf_referenced || die "pf does not evaluate the fips-ui anchors yet: use Enable, which adds them to $PF_CONF and turns pf on at boot"
+      if ! pf_enabled; then if [[ "$OS" == Darwin ]]; then pfctl -E >/dev/null 2>&1; else pfctl -e >/dev/null 2>&1; fi; fi
+      pf_load_firewall ;;
+    stop) pfctl -a "$PF_FW_ANCHOR" -F rules >/dev/null 2>&1 ;;
+    enable)
+      [[ "$OS" == FreeBSD ]] || die "enabling at boot is not supported on macOS: pf is started by the system's own configuration; use Start"
+      pf_render_firewall "$PF_DROPIN_DIR" "$PF_FW_FILE" && chmod 0644 "$PF_FW_FILE"
+      pf_conf_write add   # rewrites the marked blocks, so an older layout is brought up to date
+      sysrc -q pf_enable=YES >/dev/null
+      if pf_enabled; then pfctl_run -f "$PF_CONF"; else rc_script service pf start; fi ;;
+    disable)
+      [[ "$OS" == FreeBSD ]] || die "not supported on macOS"
+      if pf_conf_has_block; then pf_conf_write remove; if pf_enabled; then pfctl_run -f "$PF_CONF"; fi; fi
+      pfctl -a "$PF_FW_ANCHOR" -F rules >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+
+# Drop packets/bytes of the baseline's block rule and the number of rules in the firewall anchor, as JSON.
+pf_fw_summary() {
+  pfctl -a "$PF_FW_ANCHOR" -v -s rules 2>/dev/null | awk '
+    /^[a-z]/ { rules++; blk = ($0 ~ /label "fips-ui drop"/) }
+    blk && /Packets:/ { for (i = 1; i <= NF; i++) { if ($i == "Packets:") p = $(i+1); if ($i == "Bytes:") b = $(i+1) } blk = 0 }
+    END { printf "{\"dropPackets\":%d,\"dropBytes\":%d,\"rules\":%d}", p, b, rules }'
+}
+
 # ---------------------------------------------------------------- commands
 cmd=${1:-}
 case "$cmd" in
   check)
     ensure_backups_dir
-    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s}\n' \
+    # What this system supports: configuration, hosts file and services with any managed service manager;
+    # the firewall and the mesh-access guard with nftables (Linux).
+    managed=false; ( require_managed ) >/dev/null 2>&1 && managed=true
+    fw=$(fw_backend); guard=$(guard_backend)
+    if [[ "$fw" == pf ]]; then fw_dir=$PF_DROPIN_DIR; fw_ext=.pf; else fw_dir=$DROPIN_DIR; fw_ext=.nft; fi
+    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s}}\n' \
       "$HELPER_VERSION" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
-      "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")"
+      "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")" \
+      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")"
     ;;
 
   install)
@@ -948,7 +1218,7 @@ case "$cmd" in
     ;;
 
   config-apply)
-    require_systemd; take_lock
+    require_managed; take_lock
     restart=true; base=""; shift
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -981,7 +1251,7 @@ case "$cmd" in
     ;;
 
   config-restore)
-    require_systemd; take_lock
+    require_managed; take_lock
     valid_id "${2:-}"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; cp -p "$f" "$tmp"
     id=$(backup_config "$2")
@@ -989,6 +1259,18 @@ case "$cmd" in
     ;;
 
   firewall-status)
+    if [[ "$(fw_backend)" == pf ]]; then
+      pf_ready
+      en=false; pf_enabled && en=true; ref=false; pf_referenced && ref=true; loaded=false; pf_fw_loaded && loaded=true
+      tun_now=$(pf_tun || true); tun_anchor=$(pf_anchor_tun)
+      # Rules for an interface fips no longer uses protect nothing.
+      stale=false; [[ $loaded == true && -n "$tun_now" && "$tun_anchor" != "$tun_now" ]] && stale=true
+      active=false; $en && $loaded && $ref && ! $stale && active=true
+      if [[ "$OS" == FreeBSD ]]; then boot=disabled; pf_conf_has_block && [[ "$(sysrc -n pf_enable 2>/dev/null)" =~ ^[Yy][Ee][Ss]$ ]] && boot=enabled; else boot=unsupported; fi
+      printf '{"ok":true,"backend":"pf","unit_active":%s,"unit_enabled":%s,"table_loaded":%s,"ruleset":null,"summary":%s,"pf_enabled":%s,"anchor_referenced":%s,"anchor":%s,"tun":%s,"anchor_tun":%s,"stale_interface":%s}\n' \
+        "$active" "$(json_escape "$boot")" "$loaded" "$(pf_fw_summary)" "$en" "$ref" "$(json_escape "$PF_FW_ANCHOR")" "$(json_escape "$tun_now")" "$(json_escape "$tun_anchor")" "$stale"
+      exit 0
+    fi
     require_systemd
     active=false; systemctl is-active --quiet fips-firewall.service && active=true
     enabled=$(systemctl is-enabled fips-firewall.service 2>/dev/null || true)
@@ -998,6 +1280,19 @@ case "$cmd" in
     ;;
 
   dropin-apply)
+    if [[ "$(fw_backend)" == pf ]]; then
+      take_lock; name=${2:-}; valid_dropin "$name"
+      tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+      read_stdin_limited "$tmp/new" "$MAX_DROPIN_BYTES"
+      if ! err=$(pf_check_dropin_content "$tmp/new"); then printf '{"ok":false,"error":"the drop-in contains statements that are not allowed","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
+      pf_ready
+      mkdir "$tmp/d"; cp -p "$PF_DROPIN_DIR"/*.pf "$tmp/d/" 2>/dev/null || true; cp "$tmp/new" "$tmp/d/$name.pf"
+      if ! err=$(pf_check_ruleset "$tmp/d"); then printf '{"ok":false,"error":"pfctl rejected the rules","detail":%s}\n' "$(json_escape "$err")"; exit 0; fi
+      mkdir -p "$PF_DROPIN_DIR"
+      install -m 0644 -o 0 -g 0 "$tmp/new" "$PF_DROPIN_DIR/$name.pf"
+      printf '{"ok":true,"file":%s,"reloaded":%s}\n' "$(json_escape "$PF_DROPIN_DIR/$name.pf")" "$(pf_reload_if_active)"
+      exit 0
+    fi
     require_systemd; take_lock
     name=${2:-}; valid_dropin "$name"
     command -v nft >/dev/null 2>&1 || die "nft not found"
@@ -1013,7 +1308,7 @@ case "$cmd" in
     ;;
 
   hosts-apply)
-    require_systemd; take_lock
+    require_managed; take_lock
     [[ "${2:-}" == --base && "${3:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "usage: hosts-apply --base <sha256|none>"
     base=$3
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
@@ -1024,14 +1319,14 @@ case "$cmd" in
     { [[ -f "$FIPS_HOSTS" ]] && tr -d '\r' < "$FIPS_HOSTS"; } > "$cur_lines" || true
     bad=$(tr -d '\r' < "$tmp" | grep -nvxFf "$cur_lines" | grep -vE '^[0-9]+:[[:space:]]*(#.*)?$|^[0-9]+:[[:space:]]*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[[:space:]]+npub1[02-9ac-hj-np-z]{58}[[:space:]]*(#.*)?$' | head -n 3 || true)
     [[ -z "$bad" ]] || die "invalid hosts line(s): $(printf '%s' "$bad" | tr '\n' ' ')"
-    cur=none; [[ -f "$FIPS_HOSTS" ]] && cur=$(sha256sum < "$FIPS_HOSTS" | cut -d' ' -f1)
+    cur=none; [[ -f "$FIPS_HOSTS" ]] && cur=$(sha256_stdin < "$FIPS_HOSTS")
     [[ "$cur" == "$base" ]] || die "$FIPS_HOSTS changed since it was read; reload and make the change again"
     if [[ -f "$FIPS_HOSTS" ]] && cmp -s "$tmp" "$FIPS_HOSTS"; then printf '{"ok":true,"changed":false}\n'; exit 0; fi
     if [[ -f "$FIPS_HOSTS" ]]; then
       mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
       cp -p "$FIPS_HOSTS" "$CONFIG_BACKUPS_DIR/hosts-$(date +%Y%m%d-%H%M%S)"
       # Keep the newest 20 hosts backups.
-      ls -1t "$CONFIG_BACKUPS_DIR"/hosts-* 2>/dev/null | tail -n +21 | xargs -r rm -f --
+      keep_newest 20 "$CONFIG_BACKUPS_DIR"/hosts-*
     fi
     mkdir -p "$(dirname "$FIPS_HOSTS")"
     install -m 0644 -o 0 -g 0 "$tmp" "$FIPS_HOSTS.fips-ui.new" && mv -f "$FIPS_HOSTS.fips-ui.new" "$FIPS_HOSTS"
@@ -1039,6 +1334,13 @@ case "$cmd" in
     ;;
 
   dropin-delete)
+    if [[ "$(fw_backend)" == pf ]]; then
+      take_lock; name=${2:-}; valid_dropin "$name"
+      [[ -f "$PF_DROPIN_DIR/$name.pf" ]] || die "drop-in $name not found"
+      rm -f -- "$PF_DROPIN_DIR/$name.pf"
+      printf '{"ok":true,"reloaded":%s}\n' "$(pf_reload_if_active)"
+      exit 0
+    fi
     require_systemd; take_lock
     name=${2:-}; valid_dropin "$name"
     [[ -f "$DROPIN_DIR/$name.nft" ]] || die "drop-in $name not found"
@@ -1047,21 +1349,72 @@ case "$cmd" in
     ;;
 
   service)
-    require_systemd; take_lock
+    require_managed; take_lock
     trap '' INT TERM HUP
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
     case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
-    systemctl cat "$unit.service" >/dev/null 2>&1 || die "$unit.service is not installed"
-    if [[ "$action" == reload ]]; then systemctl reload-or-restart "$unit.service"; else systemctl "$action" "$unit.service"; fi
-    a=false; systemctl is-active --quiet "$unit.service" && a=true
-    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
+    # With pf the fips firewall is not a service but the fips-ui anchor: its buttons act on pf.
+    if [[ "$unit" == fips-firewall && "$(fw_backend)" == pf ]]; then
+      pf_fw_action "$action"
+      en=false; pf_enabled && pf_fw_loaded && en=true
+      if [[ "$OS" == FreeBSD ]]; then boot=disabled; pf_conf_has_block && [[ "$(sysrc -n pf_enable 2>/dev/null)" =~ ^[Yy][Ee][Ss]$ ]] && boot=enabled; else boot=unsupported; fi
+      printf '{"ok":true,"unit":"pf anchor %s","active":%s,"enabled":%s}\n' "$PF_FW_ANCHOR" "$en" "$(json_escape "$boot")"
+      exit 0
+    fi
+    # The unit's name under this service manager; a unit this system does not have is refused.
+    native=$(svc_native "$unit")
+    [[ -n "$native" ]] && svc_exists "$native" || die "$unit is not installed as a service here ($SM)"
+    case "$action" in
+      start)   svc_start "$native" ;;
+      stop)    svc_stop "$native" ;;
+      restart) svc_restart "$native" ;;
+      reload)  if [[ "$SM" == systemd ]]; then systemctl reload-or-restart "$native"; else svc_restart "$native"; fi ;;
+      enable|disable) svc_enable "$native" "$([[ "$action" == enable ]] && echo true || echo false)" || die "$action is not supported with $SM" ;;
+    esac
+    a=false; svc_active "$native" && a=true
+    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$native")" "$a" "$(json_escape "$(svc_enabled "$native")")"
     ;;
 
   mesh-guard)
     ports=${2:-}; tun=${3:-fips0}; canary=${4:-}
     [[ "$tun" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "invalid interface name"
     [[ -z "$canary" || ( "$canary" =~ ^[0-9]{1,5}$ && "$canary" -ge 1024 && "$canary" -le 65535 ) ]] || die "invalid canary port"
+    if [[ "$(guard_backend)" == pf ]]; then
+      pf_ready
+      if [[ "$ports" == status ]]; then
+        out=$(pfctl -a "$PF_GUARD_ANCHOR" -s rules 2>/dev/null || true; pfctl -a "$PF_GUARD_ANCHOR/spoof" -s rules 2>/dev/null || true)
+        if pf_enabled && pf_guard_first && ! pf_lo_skipped && grep -q 'label "fips-ui guard"' <<<"$out"; then
+          g=$(grep 'label "fips-ui guard"' <<<"$out")
+          p=$(sed -E 's/.*port (= )?//; s/ label.*//' <<<"$g" | tr -c '0-9\n' ' ' | xargs | tr ' ' ',')
+          tn=$(sed -nE 's/.* on ! ([A-Za-z0-9_.-]+) .*/\1/p' <<<"$g" | head -n 1)
+          c=$(grep 'label "fips-ui canary"' <<<"$out" | sed -nE 's/.*port = ([0-9]+).*/\1/p' | head -n 1)
+          printf '{"ok":true,"active":true,"ports":%s,"tun":%s,"canary":%s}\n' "$(json_escape "$p")" "$(json_escape "$tn")" "$(json_escape "$c")"
+        else printf '{"ok":true,"active":false}\n'; fi
+        exit 0
+      fi
+      take_lock
+      if [[ "$ports" == off ]]; then
+        pfctl -a "$PF_GUARD_ANCHOR/spoof" -F rules >/dev/null 2>&1; pfctl -a "$PF_GUARD_ANCHOR" -F rules >/dev/null 2>&1
+        printf '{"ok":true,"active":false}\n'; exit 0
+      fi
+      [[ "$ports" =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,3}$ ]] || die "ports must be a comma-separated list of up to 4 ports"
+      for p in ${ports//,/ }; do (( p >= 1 && p <= 65535 )) || die "port $p out of range"; done
+      # The guard never turns pf on by itself: that is the admin's decision (Firewall page).
+      pf_enabled || { printf '{"ok":false,"error":"pf is not enabled on this system; turn on the fips firewall (Firewall page) so the spoofing guard can load"}\n'; exit 0; }
+      pf_guard_first || { printf '{"ok":false,"error":"pf does not evaluate the guard before other rules: use Enable on the Firewall page (it puts the guard anchor before the first filter rule of /etc/pf.conf), and keep it first"}\n'; exit 0; }
+      pf_lo_skipped && { printf '{"ok":false,"error":"pf.conf has \\"set skip on lo0\\", which also skips the guard'"'"'s self-check on loopback: remove it (or skip only other interfaces) for mesh access"}\n'; exit 0; }
+      gf=$(mktemp); trap 'rm -f "$gf"' EXIT
+      {
+        [[ -n "$canary" ]] && echo "block return in quick on lo0 inet6 proto tcp from any to ::1 port $canary label \"fips-ui canary\""
+        echo "anchor \"spoof\" in on ! lo0 {"
+        echo "  block drop in quick on ! $tun inet6 proto tcp from fd00::/8 to any port { ${ports//,/, } } label \"fips-ui guard\""
+        echo "}"
+      } > "$gf"
+      if ! err=$(pfctl_run -a "$PF_GUARD_ANCHOR" -f "$gf" 2>&1); then printf '{"ok":false,"error":%s}\n' "$(json_escape "$(head -n 3 <<<"$err")")"; exit 0; fi
+      printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$ports")" "$(json_escape "$tun")"
+      exit 0
+    fi
     command -v nft >/dev/null 2>&1 || die "nft not found"
     if [[ "$ports" == status ]]; then
       if out=$(nft list table inet fips_ui_guard 2>/dev/null) && grep -q "iifname" <<<"$out"; then
@@ -1096,6 +1449,24 @@ table inet fips_ui_guard {
 NFT
     ); then printf '{"ok":false,"error":%s}\n' "$(json_escape "$(printf '%s' "$err" | grep -E 'Error:' | head -n 3)")"; exit 0; fi
     printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$ports")" "$(json_escape "$tun")"
+    ;;
+
+  log-access)
+    # Outside systemd the daemon logs to a file, which FreeBSD's package creates root-only: give the group that
+    # owns the control socket (fips) read access. Nothing else about the file changes.
+    require_managed; [[ "$SM" != systemd ]] || die "under systemd the log is the journal"
+    take_lock
+    logf=""
+    for f in "$(sysrc -n fips_logfile 2>/dev/null || true)" /var/log/fips.log /var/log/fips/fips.log /usr/local/var/log/fips/fips.log; do
+      [[ -n "$f" && -f "$f" ]] && { logf=$f; break; }
+    done
+    [[ -n "$logf" ]] || die "no fips log file found"
+    [[ -f "$logf" && ! -L "$logf" ]] || die "$logf is not a regular file"
+    [[ "$(stat -f %u "$logf" 2>/dev/null || stat -c %u "$logf")" == 0 ]] || die "$logf is not owned by root"
+    grp=$(stat -f %Sg /var/run/fips 2>/dev/null || stat -c %G /var/run/fips 2>/dev/null || echo fips)
+    [[ "$grp" =~ ^[A-Za-z0-9_-]+$ ]] || die "cannot tell the fips group"
+    chgrp "$grp" "$logf" && chmod g+r,o-rwx "$logf"
+    printf '{"ok":true,"file":%s,"group":%s}\n' "$(json_escape "$logf")" "$(json_escape "$grp")"
     ;;
 
   list-backups)
