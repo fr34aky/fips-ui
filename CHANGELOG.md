@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fips-ui's self-update refused a checkout that follows `main` past the release
+  tag (the release workflow commits the changelog after tagging): a checkout
+  that already contains the release is now built and restarted instead.
+
 ## [0.8.0] - 2026-09-27
 
 ### Added
