@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name the master wins. The master only grants followers the viewer role. While
   the master is offline the last names stay and retries back off to once a day.
   See `docs/hosts-sync.md`.
+- **Web UI over the mesh**: a "From hosts file…" dropdown next to the npub field
+  picks a hosts-file name (entries already allowed and this node are left out),
+  and the field suggests hosts names while typing.
 
 ## [0.3.0] - 2026-09-27
 
