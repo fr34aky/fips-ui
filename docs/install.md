@@ -6,12 +6,12 @@ prerequisites come from and which service manager `deploy/setup-local.sh` sets u
 
 | System | `setup-local.sh` installs | Settings file | Log | Status |
 | ------ | ------------------------- | ------------- | --- | ------ |
-| [Linux with systemd](#linux-with-systemd) | systemd unit `fips-ui.service` | `/etc/default/fips-ui` | `journalctl -u fips-ui` | tested |
-| [FreeBSD](#freebsd) | rc.d script `fips_ui` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | tested (FreeBSD 15.1 VM) |
-| [pfSense](#pfsense) | boot script `rc.d/fips-ui.sh` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | untested, see the warning |
-| [macOS](#macos) | LaunchDaemon `network.fips-ui` | the plist itself | `/usr/local/var/log/fips-ui.log` | experimental, untested |
-| [Other Linux](#other-linux-openrc-openwrt) (OpenRC, OpenWrt) | nothing: run it by hand | – | – | read-only pages |
-| [Windows](#windows) | nothing: run it by hand | – | – | experimental, untested |
+| [Linux with systemd](#linux-with-systemd) | systemd unit `fips-ui.service` | `/etc/default/fips-ui` | `journalctl -u fips-ui` | tested, smoke-tested in CI (Ubuntu 24.04) |
+| [FreeBSD](#freebsd) | rc.d script `fips_ui` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | tested (FreeBSD 15.1 VM), smoke-tested in CI |
+| [pfSense](#pfsense) | boot script `rc.d/fips-ui.sh` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | untested (no CI image), see the warning |
+| [macOS](#macos) | LaunchDaemon `network.fips-ui` | the plist itself | `/usr/local/var/log/fips-ui.log` | experimental, smoke-tested in CI |
+| [Other Linux](#other-linux-openrc-openwrt) (OpenRC, OpenWrt) | nothing: run it by hand | – | – | read-only pages, smoke-tested in CI (Debian, Fedora, Arch, Alpine) |
+| [Windows](#windows) | nothing: run it by hand | – | – | experimental, smoke-tested in CI |
 
 What `setup-local.sh` does on every supported system:
 
@@ -106,7 +106,9 @@ Steps, if you accept that:
 
 ## macOS
 
-Experimental: the code paths exist but have not been tested on a Mac.
+Experimental: CI installs it with `setup-local.sh` on macOS 15 next to the fips package and checks the
+helper, the configuration editor, the pf state and the restart; configuration changes, the firewall and Web UI
+over the mesh have not been tried on a Mac.
 
 ```sh
 brew install node git                     # node 22.18+
@@ -148,7 +150,7 @@ daemon from source there. fips-ui itself runs on Alpine's `nodejs-current`.
 
 ## Windows
 
-Experimental: the code paths exist but have not been tested on Windows.
+Experimental: CI only checks that fips-ui builds, starts and answers (without a daemon).
 
 ```powershell
 winget install OpenJS.NodeJS.LTS Git.Git
