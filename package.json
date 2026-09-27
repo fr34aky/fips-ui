@@ -14,7 +14,7 @@
     "build": "npm --prefix web run build",
     "start": "node server/index.ts",
     "install:all": "npm --prefix web install",
-    "test": "node --test test/"
+    "test": "node --test \"test/**/*.test.ts\""
   },
   "license": "MIT"
 }
