@@ -10,7 +10,7 @@ export interface StepInfo { name: string; label: string; state: StepState; start
 export interface JobLogLine { seq: number; t: number; stream: 'out' | 'err' | 'sys'; line: string }
 export interface ConfigMergeResult { status: 'unchanged' | 'current' | 'applied' | 'proposed' | 'failed' | 'skipped'; detail: string; fromRev?: string; toRef?: string; templateDiff?: string; configDiff?: string; deprecations?: string[] }
 export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string; config?: ConfigMergeResult }
-export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper';
+export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper' | 'install';
 export interface JobSummary {
   id: string; kind: JobKind; source: UpgradeSource; ref: string; restart: boolean; dryRun: boolean;
   state: JobState; cancellable: boolean; steps: StepInfo[];
@@ -23,7 +23,7 @@ export interface UpgradeStatus {
   installed: { path: string | null; version?: string; rev?: string; target?: string; raw?: string };
   running: { version?: string; rev?: string; uptime_secs?: number; pid?: number } | null;
   package: { manager: string; name: string; version?: string; note: string } | null;
-  helper: { available: boolean; error?: string; detail?: string };
+  helper: { available: boolean; error?: string; detail?: string; version?: number };
   toolchain: Record<string, { ok: boolean; required: boolean; detail?: string }>;
   toolchainPlan: { manager: string | null; sudo: boolean; packages: string[]; command: string[]; note?: string; missing: string[] };
   helperInstallScript: string | null;
@@ -40,6 +40,8 @@ export const upgradeApi = {
   cancel: () => api.post<{ cancelled: boolean }>('/api/upgrade/jobs/current/cancel'),
   rollback: (id: string) => api.post<JobSummary>('/api/upgrade/rollback', { id }),
   restart: () => api.post<{ output: string }>('/api/upgrade/restart'),
+  /** A machine without fips: install the newest release with a persistent identity and these bootstrap peers (helper v9). */
+  installDaemon: (body: { tag?: string; peers: string[] }) => api.post<JobSummary>('/api/upgrade/install-daemon', body),
   current: (since = 0) => api.get<JobSummary & { log: JobLogLine[] }>(`/api/upgrade/jobs/current?since=${since}`),
 };
 

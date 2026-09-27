@@ -270,6 +270,8 @@ const upgrade = createUpgradeHandler({
   // Only where the helper can apply the configuration; checked at the time of each upgrade.
   configMerge: async (a) => (await admin.helperInfo()).features.config ? mergeConfig(a) : { status: 'skipped', detail: 'not available on this system (the helper cannot apply the configuration here)' },
   configRestore: async (id: string) => (await admin.helperInfo()).features.config ? admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })) : { ok: false, error: 'not available on this system' },
+  // After a fresh fips install: start again to pick up the fips group (once the install job has finished).
+  restartUi: () => { if (!selfUpdate.canRestart) return false; restartWhenIdle('fips was installed; exiting so the service restarts fips-ui in the fips group'); return true; },
 });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
@@ -331,6 +333,11 @@ const restartBlocker = (): string | null => {
   if (admin.changePending()) return 'a node-management change is in progress';
   return null;
 };
+/** Exit with 75 so the service manager starts fips-ui again, once nothing privileged is running. */
+function restartWhenIdle(message: string): void {
+  if (restartBlocker()) { setTimeout(() => restartWhenIdle(message), 2000); return; }
+  console.log(message); server.close(); mesh.close(); hostsSync.close(); process.exit(75);
+}
 
 const hostsFollowers = new HostsFollowers();
 const hostsSync = new HostsSync({
@@ -381,7 +388,7 @@ async function route(req: Req, res: Res) {
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
     // Requests that start an upgrade or rollback are counted before any await, so a node-management change
     // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
-    const starts = method === 'POST' && (p === '/api/upgrade/jobs' || p === '/api/upgrade/rollback');
+    const starts = method === 'POST' && (p === '/api/upgrade/jobs' || p === '/api/upgrade/rollback' || p === '/api/upgrade/install-daemon');
     if (starts) upgradeStarting++;
     try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
   }
@@ -516,11 +523,7 @@ async function route(req: Req, res: Res) {
     const blocked = restartBlocker();
     if (blocked) throw new HttpError(409, `${blocked}; update fips-ui when it has finished`);
     // The restart waits for anything privileged that started meanwhile: exiting would kill it with the service.
-    const exitWhenIdle = () => {
-      if (restartBlocker()) { setTimeout(exitWhenIdle, 2000); return; }
-      console.log(`fips-ui updated to ${tag}; exiting so systemd restarts it`); server.close(); mesh.close(); hostsSync.close(); process.exit(75);
-    };
-    void selfUpdate.install(tag, exitWhenIdle);
+    void selfUpdate.install(tag, () => restartWhenIdle(`fips-ui updated to ${tag}; exiting so the service manager restarts it`));
     return json(res, 202, { job: selfUpdate.job });
   }
   if (p === '/api/hosts/followers/forget') {

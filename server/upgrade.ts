@@ -90,7 +90,7 @@ export const TEMPLATE_PATH = 'packaging/common/fips.yaml'
 
 export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string; config?: ConfigMergeResult }
 
-export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper'
+export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper' | 'install'
 
 export interface JobSummary {
   id: string; kind: JobKind; source: UpgradeSource; ref: string; restart: boolean; dryRun: boolean
@@ -117,6 +117,11 @@ export interface UpgradeOptions {
   backupsDir?: string
   /** URL prefix. Default /api/upgrade */
   prefix?: string
+  /**
+   * After a fresh fips install, when fips-ui cannot open the new control socket: the helper added its user to the
+   * fips group, which a running process only gets by starting again. Asks the server to restart (when supervised).
+   */
+  restartUi?: () => boolean
   /** Gate for mutating endpoints. Return false to answer 403. */
   authorize?: (req: IncomingMessage) => boolean | Promise<boolean>
   /** Extra cargo args for the master build (e.g. ["--features", "profiling"]). */
@@ -392,6 +397,9 @@ class GitHub {
 // ---------------------------------------------------------------------------
 
 type Listener = (ev: { type: 'log'; data: LogLine } | { type: 'state'; data: JobSummary }) => void
+/** A bootstrap peer for a fresh install, as the helper takes it: npub1...@udp|tcp/host:port (same as its PEER_RE). */
+export const PEER_SPEC_RE = /^npub1[02-9ac-hj-np-z]{58}@(udp|tcp)\/([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\]|[0-9.]{7,15}):[0-9]{1,5}$/
+
 class CancelledError extends Error { constructor() { super('cancelled by operator'); this.name = 'CancelledError' } }
 
 class Job {
@@ -539,6 +547,8 @@ class HelperInstaller implements Installer {
   async rollback(job: Job, id: string) { const [c, a] = this.cmd(['rollback', id]); return JSON.parse(lastJsonLine(await job.exec(c, a))) as InstallResult }
   async restart() { const [c, a] = this.cmd(['restart']); const r = await run(c, a, { timeout: 90_000 }); if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `helper exited ${r.code}`); return r.stdout.trim() }
   async listBackups() { return readBackupsDir(this.backupsDir, this.binaries) }
+  /** Helper v9: download, verify, install and start the official release (the helper picks the file itself). */
+  async daemonInstall(job: Job, tag: string, peers: string[]) { const [c, a] = this.cmd(['daemon-install', tag, ...peers]); return JSON.parse(lastJsonLine(await job.exec(c, a))) as { ok: boolean; tag: string; artifact: string; socket: string } }
 }
 
 /** Windows: no sudo; the backend itself must run elevated. Service via the SCM. */
@@ -618,6 +628,7 @@ export class UpgradeManager {
   readonly installer: Installer
   private readonly configMerge?: ConfigMergeHook
   private readonly configRestore?: (backupId: string) => Promise<{ ok: boolean; error?: string }>
+  private readonly restartUi?: () => boolean
   private binDirCache: string | null = null
   private current: Job | null = null
   /** Probe results that only change when an operator acts (helper install, package changes, toolchain installs). */
@@ -639,6 +650,7 @@ export class UpgradeManager {
     this.gh = new GitHub(repo, opts.githubToken ?? process.env.FIPS_UI_GITHUB_TOKEN)
     this.configMerge = opts.configMerge
     this.configRestore = opts.configRestore
+    this.restartUi = opts.restartUi
     this.cargoArgs = opts.cargoArgs ?? (process.env.FIPS_UI_CARGO_ARGS ? process.env.FIPS_UI_CARGO_ARGS.split(/\s+/).filter(Boolean) : [])
     this.installer = P.usesHelper
       ? new HelperInstaller(this.helperPath, this.backupsDir, P.binaries)
@@ -852,6 +864,53 @@ export class UpgradeManager {
     const job = new Job(req.source, req)
     this.publish(job)
     return this.launch(job, () => this.execute(job))
+  }
+
+  /**
+   * A machine without fips: the helper (v9) downloads the newest (or the given) official release, checks it against
+   * the release's checksums, installs and starts it, and adds fips-ui's user to the fips group.
+   */
+  async installDaemon(reqIn: { tag?: unknown; peers?: unknown }): Promise<Job> {
+    if (!(this.installer instanceof HelperInstaller)) throw new Error('installing fips from the UI needs the privileged helper, which this system does not have; install fips by hand (docs/install.md)')
+    const tag = reqIn.tag === undefined || reqIn.tag === '' || reqIn.tag === 'latest' ? '' : reqIn.tag
+    if (typeof tag !== 'string' || (tag && !/^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(tag))) throw new Error('tag must look like v0.5.1 (or be empty for the newest release)')
+    // Bootstrap peers written into the new fips.yaml, in the helper's form (checked again there).
+    const peers = reqIn.peers ?? []
+    if (!Array.isArray(peers) || peers.length > 16 || !peers.every((p) => typeof p === 'string' && PEER_SPEC_RE.test(p))) throw new Error('peers must be at most 16 entries like npub1...@udp/host:port')
+    const installer = this.installer
+    this.claimSlot()
+    try {
+      const h = await installer.check()
+      if (!h.available) throw new Error(`cannot install: ${h.error ?? 'privileged helper unavailable'}`)
+      if ((h.version ?? 0) < 9) throw new Error(`installing fips needs helper v9 or newer (installed: v${h.version ?? '?'}); run sudo ./deploy/setup-local.sh from this fips-ui version first`)
+      this.binDirCache = null
+      if ((await this.installedVersion()).path) throw new Error('fips is already installed; upgrade it instead')
+    } catch (e) { this.publish(null); throw e }
+    const job = new Job('release', { source: 'release', ref: tag || 'latest' }, tag || 'latest', 'install')
+    this.publish(job)
+    return this.launch(job, async () => {
+      job.defineSteps([['install', 'Download, verify, configure and start fips (privileged)'], ['confirm', 'Confirm the daemon answers']])
+      job.info(peers.length ? `fips.yaml: persistent identity, peers ${peers.map((p) => p.split('@')[1]).join(', ')}` : 'fips.yaml: persistent identity, no peers (the node waits for peers to dial it)')
+      const r = await job.runStep('install', () => installer.daemonInstall(job, tag, peers as string[]))
+      job.result.artifact = r.artifact
+      this.binDirCache = null
+      await job.runStep('confirm', async () => {
+        for (let i = 0; i < 20; i++) {
+          const v = await this.runningVersion()
+          if (v?.version) { job.result.runningVersion = v.version; job.info(`fips ${v.version} answers on ${this.controlSocket}`); return }
+          await new Promise((res) => setTimeout(res, 500))
+        }
+        // The socket is there (the helper waited for it); this process just is not in its group yet.
+        let gid: number | null = null
+        try { gid = (await stat(r.socket)).gid } catch { /* checked below */ }
+        const inGroup = gid !== null && (process.getgroups?.() ?? []).includes(gid)
+        if (gid !== null && !inGroup) {
+          if (this.restartUi?.()) { job.result.restarted = true; job.info('fips-ui was added to the fips group; it restarts now to open the control socket, and this page reloads'); return }
+          job.info('fips-ui was added to the fips group; restart fips-ui so it can open the control socket'); return
+        }
+        throw new Error(`the daemon does not answer on ${r.socket}; check its log`)
+      })
+    })
   }
 
   private async execute(job: Job): Promise<void> {
@@ -1148,6 +1207,7 @@ export function createUpgradeHandler(opts: UpgradeOptions = {}): ((req: Incoming
         return true
       }
       if (sub === '/jobs/current/cancel' && method === 'POST') { const j = mgr.job; if (!j) { sendJson(res, 404, { error: 'no job' }); return true } sendJson(res, 200, { cancelled: j.cancel() }); return true }
+      if (sub === '/install-daemon' && method === 'POST') { const body = (await readJsonBody(req)) as { tag?: unknown }; sendJson(res, 202, (await mgr.installDaemon(body)).summary()); return true }
       if (sub === '/rollback' && method === 'POST') { const body = (await readJsonBody(req)) as { id?: unknown }; if (typeof body.id !== 'string' || !body.id) { sendJson(res, 400, { error: 'id (string) required' }); return true } sendJson(res, 202, (await mgr.rollback(body.id as string)).summary()); return true }
       if (sub === '/restart' && method === 'POST') { sendJson(res, 200, { output: await mgr.restartService() }); return true }
       if (sub === '/toolchain/plan' && method === 'GET') { sendJson(res, 200, await mgr.toolchainPlan()); return true }

@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle, ArrowUpCircle, Check, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Download, ExternalLink,
-  GitCommitHorizontal, Hammer, KeyRound, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, SkipForward, Terminal, X, XCircle,
+  GitCommitHorizontal, Hammer, KeyRound, Loader2, Package, Plus, RefreshCw, RotateCcw, ShieldCheck, SkipForward, Terminal, Trash2, X, XCircle,
 } from 'lucide-react';
-import { usePoll } from '../lib/api';
+import { api, usePoll } from '../lib/api';
+import { DAEMON_INSTALL_HELPER, PEER_SPEC_RE, TEST_PEER } from '../lib/fipsInstall';
 import { UiUpdateCard } from '../components/UiUpdateCard';
 import { Copyable, Modal } from '../components/ui';
 import { fmtAgo, fmtBytes, fmtDuration, fmtTime } from '../lib/format';
@@ -50,6 +51,19 @@ export function Upgrade() {
   };
 
   const canInstall = !!st?.helper.available;
+  // No fips on this machine (no binary, nothing answering): offer the fresh install instead of the upgrade sources.
+  const notInstalled = !!st && !st.installed.path && !st.running;
+
+  // A fresh install can end with fips-ui restarting itself (to join the fips group): reload once it is back.
+  const restarting = job?.kind === 'install' && job.state === 'succeeded' && !!job.result?.restarted;
+  useEffect(() => {
+    if (!restarting) return;
+    let down = false;
+    const t = setInterval(() => {
+      api.get<{ uiUptimeSecs: number }>('/api/health').then((h) => { if (down || h.uiUptimeSecs < 20) location.reload(); }).catch(() => { down = true; });
+    }, 1500);
+    return () => clearInterval(t);
+  }, [restarting]);
   const toolchainOk = !!st && Object.values(st.toolchain).filter((t) => t.required).every((t) => t.ok);
   const missingTools = st ? Object.entries(st.toolchain).filter(([, v]) => !v.ok).map(([k]) => k) : [];
 
@@ -106,7 +120,11 @@ export function Upgrade() {
 
       {st?.package && <div className="text-xs text-ink-3 flex items-start gap-2 px-1"><Package size={13} className="mt-0.5 flex-none" /><span>{st.package.note}</span></div>}
 
+      {notInstalled && <InstallDaemonCard st={st} disabled={busy} onInstall={(peers) => launch(() => upgradeApi.installDaemon({ peers }))} />}
+      {restarting && <div className="card p-3 text-sm flex items-center gap-2"><Loader2 size={15} className="animate-spin" /> fips-ui restarts to open the new daemon's control socket; this page reloads when it is back.</div>}
+
       {/* ---- sources ------------------------------------------------------- */}
+      {!notInstalled && <>
       <section className="grid gap-4 lg:grid-cols-2">
         <ReleaseCard st={st} disabled={busy} onInstall={(ref, label) => setConfirm({ source: 'release', ref, label })} />
         {st?.platform.pfsense
@@ -124,6 +142,8 @@ export function Upgrade() {
         {!canInstall && !dryRun && <span className="chip warn"><AlertTriangle size={12} /> installs will fail until the privileged installer is available</span>}
         {st?.restartPending && <button className="btn sm ml-auto" disabled={busy || !canInstall} onClick={() => { setActionErr(null); upgradeApi.restart().then(refresh).catch((e) => setActionErr(e.message)); }}><RotateCcw size={14} /> Restart service now</button>}
       </section>
+
+      </>}
 
       {/* ---- job ----------------------------------------------------------- */}
       {job && <JobPanel job={job} log={log} onCancel={() => upgradeApi.cancel().catch((e) => setActionErr(e.message))} onDismiss={() => { setDismissedId(job.id); setActiveJobId(null); }} />}
@@ -333,7 +353,7 @@ function JobPanel({ job, log, onCancel, onDismiss }: { job: JobSummary; log: { s
   const [follow, setFollow] = useState(true);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => { if (follow && box.current) box.current.scrollTop = box.current.scrollHeight; }, [log.length, follow]);
-  const title = useMemo(() => job.kind === 'rollback' ? `Rollback ${job.ref.replace('rollback:', '')}` : job.kind === 'toolchain' ? 'Installing build tools' : job.kind === 'helper' ? 'Installing privileged helper' : `${job.dryRun ? 'Dry run: ' : ''}${job.source === 'release' ? `Release ${job.ref}` : `Build ${job.ref}`}`, [job]);
+  const title = useMemo(() => job.kind === 'rollback' ? `Rollback ${job.ref.replace('rollback:', '')}` : job.kind === 'toolchain' ? 'Installing build tools' : job.kind === 'helper' ? 'Installing privileged helper' : job.kind === 'install' ? `Installing fips ${job.ref}` : `${job.dryRun ? 'Dry run: ' : ''}${job.source === 'release' ? `Release ${job.ref}` : `Build ${job.ref}`}`, [job]);
   const tone = job.state === 'succeeded' ? 'good' : job.state === 'failed' ? 'crit' : job.state === 'cancelled' ? 'warn' : 'accent';
   // Tick once a second while running so the elapsed time advances without impure reads during render.
   const [now, setNow] = useState(() => job.endedAt ?? job.startedAt);
@@ -408,4 +428,43 @@ function ConfigOutcome({ c }: { c: ConfigMergeResult }) {
 
 function DiffBlock({ text }: { text: string }) {
   return <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-surface-2 p-2 text-[11px] leading-snug">{text.split('\n').map((l, i) => <div key={i} className={l.startsWith('+') && !l.startsWith('+++') ? 'text-good' : l.startsWith('-') && !l.startsWith('---') ? 'text-crit' : l.startsWith('@@') ? 'text-ink-3' : ''}>{l || ' '}</div>)}</pre>;
+}
+
+/** A machine without fips: install the newest release, with a persistent identity and bootstrap peers. */
+function InstallDaemonCard({ st, disabled, onInstall }: { st: UpgradeStatus; disabled: boolean; onInstall: (peers: string[]) => void }) {
+  const [testPeer, setTestPeer] = useState(true);
+  const [peers, setPeers] = useState<string[]>([]);
+  const [npub, setNpub] = useState('');
+  const [transport, setTransport] = useState<'udp' | 'tcp'>('udp');
+  const [addr, setAddr] = useState('');
+  const spec = `${npub.trim()}@${transport}/${addr.trim()}`;
+  const specOk = PEER_SPEC_RE.test(spec);
+  const rel = 'error' in st.release ? null : st.release;
+  const helperOk = st.helper.available && (st.helper.version ?? 0) >= DAEMON_INSTALL_HELPER;
+  const all = [...(testPeer ? [TEST_PEER] : []), ...peers];
+  return (
+    <div className="card p-4 grid gap-3 border-l-4" style={{ borderLeftColor: 'var(--accent)' }}>
+      <div className="card-title flex items-center gap-2"><Download size={14} /> Install fips</div>
+      <p className="text-sm text-ink-2 max-w-3xl">
+        fips is not installed on this machine. This installs {rel ? <b>{rel.tag}</b> : 'the newest release'}{rel?.asset ? <> (<span className="mono text-xs">{rel.asset.name}</span>)</> : null}, verified
+        against the release's checksums, and starts it. Its <span className="mono">fips.yaml</span> keeps a persistent identity (so this node's npub stays the same) and connects to the peers below; everything else follows the release's defaults and can be changed on the Configuration page.
+      </p>
+      <label className="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" checked={testPeer} onChange={(e) => setTestPeer(e.target.checked)} className="accent-[var(--accent)]" /> Connect to the public FIPS test node <span className="mono text-xs">test-us01.fips.network:2121</span></label>
+      {peers.length > 0 && (
+        <ul className="grid gap-1 text-xs">
+          {peers.map((p) => <li key={p} className="flex items-center gap-2"><span className="mono truncate" title={p}>{p.slice(0, 16)}…@{p.split('@')[1]}</span><button className="btn ghost sm" title="Remove" onClick={() => setPeers(peers.filter((x) => x !== p))}><Trash2 size={13} /></button></li>)}
+        </ul>
+      )}
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <input className="input mono text-xs flex-1 min-w-[240px]" placeholder="peer npub1…" value={npub} onChange={(e) => setNpub(e.target.value)} />
+        <select className="input w-auto" value={transport} onChange={(e) => setTransport(e.target.value as 'udp' | 'tcp')}><option value="udp">udp</option><option value="tcp">tcp</option></select>
+        <input className="input mono text-xs w-56" placeholder="host:port" value={addr} onChange={(e) => setAddr(e.target.value)} />
+        <button className="btn sm" disabled={!specOk || peers.includes(spec) || all.length >= 16} onClick={() => { setPeers([...peers, spec]); setNpub(''); setAddr(''); }}><Plus size={14} /> Add peer</button>
+      </div>
+      {(npub || addr) && !specOk && <div className="text-xs text-ink-3">A peer needs its npub and an address like <span className="mono">peer.example.com:2121</span> or <span className="mono">[2001:db8::1]:2121</span>.</div>}
+      {all.length === 0 && <div className="text-xs text-warn flex items-center gap-1.5"><AlertTriangle size={12} /> Without peers the node only reaches peers that connect to it.</div>}
+      {!helperOk && <div className="text-xs text-warn flex items-center gap-1.5"><AlertTriangle size={12} /> {st.helper.available ? `Needs helper v${DAEMON_INSTALL_HELPER} (installed: v${st.helper.version ?? '?'}).` : 'Needs the privileged helper.'} Run <span className="mono">sudo ./deploy/setup-local.sh</span> from this fips-ui checkout, then Refresh.</div>}
+      <div><button className="btn primary" disabled={disabled || !helperOk} onClick={() => onInstall(all)}><Download size={15} /> Install fips{rel ? ` ${rel.tag}` : ''}</button></div>
+    </div>
+  );
 }
