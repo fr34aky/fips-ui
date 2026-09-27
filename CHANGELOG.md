@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sync their names from it (by name and npub), with the last sync (flagged when
   overdue), the number of names, their interval and fips-ui version. Followers
   identify their sync with a header; older followers are recognised too.
+- **Loop protection for hosts sync**: a node answers a sync with its upstream
+  chain (itself, its master, that master's master, …); a follower that finds
+  itself in the chain refuses the sync and keeps its names, so names cannot go
+  round in a circle (A ↔ B or longer cycles). Chains are limited to 16 nodes.
 
 ## [0.5.4] - 2026-09-27
 

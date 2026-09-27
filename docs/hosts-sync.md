@@ -44,3 +44,21 @@ succeeds. Turning sync off removes the synced block.
    shows when the last sync succeeded, or why it failed.
 
 The follower's settings are stored in `~/.config/fips-ui/hosts-sync.json` (`FIPS_UI_HOSTS_SYNC_FILE`).
+
+## Chains of masters
+
+A node that follows a master can itself be the master of other nodes: it serves what its own daemon resolves,
+its own names and the block it syncs from above, so names flow down a tree (A → B → C: C gets A's and B's
+names). A name defined higher up wins further down, since every node puts its synced block last. Changes take
+up to the sum of the intervals to reach the bottom.
+
+Every sync answer carries the serving node's upstream chain (itself first). A follower that finds its own npub
+in it refuses the sync and keeps its names: otherwise names would go round in a circle, and a name deleted
+anywhere in the circle would keep coming back. Chains longer than 16 nodes are refused the same way. Masters on
+fips-ui versions before this check send no chain, so loops through them are not detected.
+
+## Conflicts
+
+The daemon uses the last entry for a name. Within one hosts file that is the later line; across a sync it is
+the master's entry (the synced block comes last). A local entry that a synced one overrides is marked
+"overridden by master" in the editor. One npub under several names is not a conflict: every name resolves.

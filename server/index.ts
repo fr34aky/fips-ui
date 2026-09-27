@@ -423,9 +423,12 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     const syncInfo = pr.kind === 'mesh' && method === 'GET' ? isSyncRequest(req) : null;
     if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo);
+    // A sync is answered with this node's upstream chain, which lets followers detect loops.
+    const own = syncInfo ? (lastSnapshot?.status as { npub?: string } | undefined)?.npub ?? await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 }).then((s) => s.npub, () => undefined) : undefined;
+    const chain = own ? await hostsSync.chainFor(own) : undefined;
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;
-    return json(res, 200, { ...hostsView(h), ...(write !== undefined ? { write } : {}) });
+    return json(res, 200, { ...hostsView(h), ...(chain ? { chain } : {}), ...(write !== undefined ? { write } : {}) });
   }
   if (p === '/api/hosts/followers' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
