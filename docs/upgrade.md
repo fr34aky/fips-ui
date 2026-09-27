@@ -118,3 +118,23 @@ curl -N localhost:8787/api/upgrade/jobs/current/events
 The helper's file logic can be exercised as a normal user against a scratch
 directory: `FIPS_UI_HELPER_TEST=1 FIPS_BIN_DIR=/tmp/x/bin FIPS_SERVICE=none
 FIPS_UI_BACKUPS=/tmp/x/backups scripts/fips-ui-helper install <stagedir>`.
+
+## fips.yaml and the template
+
+The daemon ships a commented configuration template (`packaging/common/fips.yaml` upstream). When it changes
+between the running and the installed version (renamed keys, new sections, updated comments), the upgrade job's
+last step, **Update fips.yaml to the template**, brings `/etc/fips/fips.yaml` in line, the way package managers
+treat changed config files:
+
+1. The template is read at the running and at the installed revision (from the source checkout for builds,
+   from GitHub for releases).
+2. The template's change is merged into the node's file with a 3-way merge (`git merge-file`): your edits
+   stay, the template's are added. The merge runs on the redacted file, so secrets never leave the helper.
+3. A clean merge is applied like a save on the Configuration page: the current file is backed up, the daemon
+   restarted, and the previous file restored if it does not stay up.
+4. A merge with conflicts (a line both you and the template changed), a rolled-back one, or any merge when the
+   option is off, waits on the **Configuration** page: review it in the editor (conflicts are marked), apply or
+   dismiss it.
+
+The job also lists deprecation warnings the new daemon logs about the configuration (keys it still accepts
+under an old name). The step never fails the upgrade itself: the new daemon is already running.

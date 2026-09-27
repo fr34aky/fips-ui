@@ -66,9 +66,27 @@ export interface JobRequest {
   restart?: boolean
   /** Stop after staging; never touch the system. Default false. */
   dryRun?: boolean
+  /** After a successful restart, merge changes of the fips.yaml template into the configuration. Default true. */
+  mergeConfig?: boolean
 }
 
-export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string }
+/** Outcome of merging fips.yaml template changes after an upgrade (see server/config-merge.ts). */
+export interface ConfigMergeResult {
+  status: 'unchanged' | 'current' | 'applied' | 'proposed' | 'failed' | 'skipped'
+  detail: string
+  fromRev?: string; toRef?: string
+  /** The template's own change between the two versions (unified diff). */
+  templateDiff?: string
+  /** Changes made (or proposed) to this node's fips.yaml (unified diff, secrets redacted). */
+  configDiff?: string
+  /** Deprecation warnings the new daemon logged about this configuration. */
+  deprecations?: string[]
+}
+/** Merges template changes into the node's configuration; provided by the server (it needs the helper). */
+export type ConfigMergeHook = (a: { oldTemplate: string; newTemplate: string; fromRev: string; toRef: string; apply: boolean; restartedAt: number; log: (msg: string) => void }) => Promise<ConfigMergeResult>
+export const TEMPLATE_PATH = 'packaging/common/fips.yaml'
+
+export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string; config?: ConfigMergeResult }
 
 export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper'
 
@@ -101,6 +119,8 @@ export interface UpgradeOptions {
   authorize?: (req: IncomingMessage) => boolean | Promise<boolean>
   /** Extra cargo args for the master build (e.g. ["--features", "profiling"]). */
   cargoArgs?: string[]
+  /** Merge fips.yaml template changes after an upgrade (without it the step is skipped). */
+  configMerge?: ConfigMergeHook
 }
 
 const MAX_LOG_LINES = 6000
@@ -335,6 +355,7 @@ class GitHub {
       throw err
     }
   }
+  get name(): string { return this.repo }
   latestRelease() { return this.get<GhRelease>(`/repos/${this.repo}/releases/latest`) }
   releaseByTag(tag: string) { return this.get<GhRelease>(`/repos/${this.repo}/releases/tags/${encodeURIComponent(tag)}`) }
   branchHead(branch = 'master') { return this.get<GhCommit>(`/repos/${this.repo}/commits/${encodeURIComponent(branch)}`) }
@@ -360,6 +381,7 @@ class Job {
   readonly ref: string
   readonly restart: boolean
   readonly dryRun: boolean
+  readonly mergeConfig: boolean
   private log: LogLine[] = []
   private seq = 0
   private listeners = new Set<Listener>()
@@ -377,6 +399,7 @@ class Job {
     this.ref = refOverride ?? (req.ref?.trim() || (source === 'release' ? 'latest' : 'origin/master'))
     this.restart = req.restart !== false
     this.dryRun = req.dryRun === true
+    this.mergeConfig = req.mergeConfig !== false
   }
 
   summary(): JobSummary {
@@ -568,6 +591,7 @@ export class UpgradeManager {
   readonly gh: GitHub
   readonly cargoArgs: string[]
   readonly installer: Installer
+  private readonly configMerge?: ConfigMergeHook
   private binDirCache: string | null = null
   private current: Job | null = null
   /** Probe results that only change when an operator acts (helper install, package changes, toolchain installs). */
@@ -587,6 +611,7 @@ export class UpgradeManager {
     const repo = opts.githubRepo ?? process.env.FIPS_UI_GITHUB_REPO ?? 'jmcorgan/fips'
     this.repoUrl = opts.repoUrl ?? process.env.FIPS_UI_REPO_URL ?? `https://github.com/${repo}.git`
     this.gh = new GitHub(repo, opts.githubToken ?? process.env.FIPS_UI_GITHUB_TOKEN)
+    this.configMerge = opts.configMerge
     this.cargoArgs = opts.cargoArgs ?? (process.env.FIPS_UI_CARGO_ARGS ? process.env.FIPS_UI_CARGO_ARGS.split(/\s+/).filter(Boolean) : [])
     this.installer = P.usesHelper
       ? new HelperInstaller(this.helperPath, this.backupsDir, P.binaries)
@@ -784,7 +809,7 @@ export class UpgradeManager {
   async start(reqIn: JobRequest): Promise<Job> {
     // Flags must be real booleans: a client that sends "true" or 1 has asked for something and must get a 400,
     // never a silent flip to the destructive default.
-    for (const k of ['dryRun', 'restart'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
+    for (const k of ['dryRun', 'restart', 'mergeConfig'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
     const req: JobRequest = { ...reqIn, dryRun: reqIn.dryRun === true, restart: reqIn.restart !== false }
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
@@ -804,14 +829,19 @@ export class UpgradeManager {
     await mkdir(this.workDir, { recursive: true })
     const stageDir = join(this.workDir, 'stage', job.id)
     job.info(`platform ${P.os}/${P.arch} · installer ${this.installer.kind} · work dir ${this.workDir}`)
+    // The version being installed (release tag or built commit) and, for source builds, the checkout: the
+    // fips.yaml template is read at this ref and at the running one.
+    let toRef = ''
+    let srcDir: string | undefined
     if (job.source === 'release') {
-      job.defineSteps([['resolve', 'Resolve release'], ['download', 'Download artifact'], ['verify', 'Verify checksum'], ['extract', P.artifactKind === 'pkg' ? 'Stage package' : 'Extract and stage'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version']])
+      job.defineSteps([['resolve', 'Resolve release'], ['download', 'Download artifact'], ['verify', 'Verify checksum'], ['extract', P.artifactKind === 'pkg' ? 'Stage package' : 'Extract and stage'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version'], ['config', 'Update fips.yaml to the template']])
       const rel = await job.runStep('resolve', async () => {
         const r = job.ref === 'latest' ? await this.gh.latestRelease() : await this.gh.releaseByTag(job.ref.startsWith('v') ? job.ref : `v${job.ref}`)
         const asset = this.pickAsset(r)
         if (!asset) throw new Error(`release ${r.tag_name} publishes no artifact for ${P.os}/${P.arch} (${r.assets.map((a) => a.name).join(', ')})`)
         const sums = r.assets.find((a) => a.name === P.checksumFile) ?? null
         job.info(`release ${r.tag_name} (${r.published_at}) · ${asset.name} · ${(asset.size / 1e6).toFixed(1)} MB${sums ? '' : ` · no ${P.checksumFile} published`}`)
+        toRef = r.tag_name
         return { r, asset, sums }
       })
       const dlDir = join(this.workDir, 'downloads'); await mkdir(dlDir, { recursive: true })
@@ -846,8 +876,9 @@ export class UpgradeManager {
         await rm(x, { recursive: true, force: true })
       })
     } else {
-      job.defineSteps([['sync', 'Sync source from git'], ['build', 'cargo build --release'], ['stage', 'Stage binaries'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version']])
+      job.defineSteps([['sync', 'Sync source from git'], ['build', 'cargo build --release'], ['stage', 'Stage binaries'], ['install', 'Install (privileged)'], ['restart', 'Restart service'], ['confirm', 'Confirm running version'], ['config', 'Update fips.yaml to the template']])
       const src = join(this.workDir, 'src', 'fips')
+      srcDir = src
       const builtSha = await job.runStep('sync', async () => {
         if (!existsSync(join(src, '.git'))) { await mkdir(join(this.workDir, 'src'), { recursive: true }); await job.exec('git', ['clone', '--no-checkout', this.repoUrl, src]) }
         await job.exec('git', ['fetch', '--prune', '--tags', 'origin'], { cwd: src })
@@ -864,6 +895,7 @@ export class UpgradeManager {
         const sha = (await job.exec('git', ['rev-parse', 'HEAD'], { cwd: src, quiet: true })).trim()
         const subject = (await job.exec('git', ['log', '-1', '--format=%s (%ci)'], { cwd: src, quiet: true })).trim()
         job.info(`building ${sha.slice(0, 10)} — ${subject}`)
+        toRef = sha
         return sha
       })
       const targetDir = join(this.workDir, 'target')
@@ -889,7 +921,7 @@ export class UpgradeManager {
     job.emitState()
 
     if (job.dryRun) {
-      for (const s of ['install', 'restart', 'confirm']) job.skipStep(s, 'dry run')
+      for (const s of ['install', 'restart', 'confirm', 'config']) job.skipStep(s, 'dry run')
       job.info(`dry run: staged in ${stageDir}; nothing was installed`)
       return
     }
@@ -898,9 +930,45 @@ export class UpgradeManager {
     const before = await this.runningVersion()
     const r = await job.runStep('install', () => this.installer.install(job, stageDir, job.restart))
     job.result.backupId = r.backup_id; job.result.restarted = !!r.restarted
-    if (!job.restart && !job.result.restarted) { job.skipStep('restart', 'restart disabled by operator'); job.skipStep('confirm', 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
+    if (!job.restart && !job.result.restarted) { for (const s of ['restart', 'confirm', 'config']) job.skipStep(s, 'restart disabled by operator'); job.info('binaries installed; the running daemon keeps the old version until the service restarts'); return }
     await job.runStep('restart', async () => { if (!job.result.restarted) throw new Error(await this.restartFailureMessage('binaries are installed', before)) })
+    const restartedAt = Date.now()
     await job.runStep('confirm', () => this.awaitDaemonBack(job, before, job.result.stagedVersion))
+    await this.updateConfig(job, before?.rev, toRef, srcDir, restartedAt)
+  }
+
+  /**
+   * Bring fips.yaml in line with the new version's template: the template's changes between the running and
+   * the installed version are merged into the configuration (3-way, like a package manager's config files).
+   * Never fails the upgrade: the daemon is already running the new version; the outcome is reported.
+   */
+  private async updateConfig(job: Job, fromRev: string | undefined, toRef: string, srcDir: string | undefined, restartedAt: number): Promise<void> {
+    if (!this.configMerge) { job.skipStep('config', 'not available on this system'); return }
+    if (!fromRev || !toRef) { job.skipStep('config', 'versions unknown'); job.result.config = { status: 'skipped', detail: 'the running or the installed version is unknown' }; return }
+    await job.runStep('config', async () => {
+      const [oldTemplate, newTemplate] = await Promise.all([this.templateAt(fromRev, srcDir), this.templateAt(toRef, srcDir)])
+      if (oldTemplate === null || newTemplate === null) {
+        job.result.config = { status: 'skipped', detail: `the fips.yaml template of ${oldTemplate === null ? fromRev : toRef} could not be read`, fromRev, toRef }
+        job.info(job.result.config.detail)
+        return
+      }
+      job.result.config = await this.configMerge!({ oldTemplate, newTemplate, fromRev, toRef, apply: job.mergeConfig, restartedAt, log: (m) => job.info(m) })
+      job.info(`fips.yaml: ${job.result.config.detail}`)
+      job.emitState()
+    })
+  }
+
+  /** The fips.yaml template at a commit or tag: from the local source checkout if it has it, else from GitHub. */
+  private async templateAt(ref: string, srcDir?: string): Promise<string | null> {
+    if (srcDir && existsSync(join(srcDir, '.git'))) {
+      const r = await run('git', ['show', `${ref}:${TEMPLATE_PATH}`], { cwd: srcDir })
+      if (r.code === 0) return r.stdout
+    }
+    try {
+      const sha = (await this.gh.branchHead(ref)).sha
+      const res = await fetch(`https://raw.githubusercontent.com/${this.gh.name}/${sha}/${TEMPLATE_PATH}`, { signal: AbortSignal.timeout(15_000) })
+      return res.ok ? await res.text() : null
+    } catch { return null }
   }
 
   /**

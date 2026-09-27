@@ -388,9 +388,30 @@ export function createAdminHandler(opts: AdminOptions) {
     return exclusive(() => helperJson(['hosts-apply', '--base', base], content));
   }
 
+  /** fips.yaml with secrets redacted, and the hash of the exact bytes it came from. */
+  async function configShow(): Promise<{ yaml: string; base: string }> {
+    await requireHelper();
+    const r = await runHelper(helperPath, ['config-show']);
+    if (r.code !== 0) throw new Error(helperError(r));
+    const nl = r.stdout.indexOf('\n');
+    const base = /^base [0-9a-f]{64}$/.test(r.stdout.slice(0, nl)) ? r.stdout.slice(5, nl) : '';
+    if (!base) throw new Error('the helper did not report the configuration hash');
+    return { yaml: r.stdout.slice(nl + 1), base };
+  }
+
+  /**
+   * Apply a redacted fips.yaml (secrets restored by the helper), restart and roll back if the daemon does not stay
+   * up. For the upgrade job itself, which the HTTP route would refuse as "busy".
+   */
+  function configApply(yaml: string, base: string): Promise<{ ok: boolean; changed?: boolean; restarted?: boolean; error?: string; backup_id?: string }> {
+    return exclusive(() => helperJson(['config-apply', '--base', base], yaml, HELPER_RESTART_TIMEOUT));
+  }
+
   return Object.assign(handler, {
     helperInfo,
     hostsApply,
+    configShow,
+    configApply,
     meshGuard,
     meshGuardStatus,
     updateManagedRules,

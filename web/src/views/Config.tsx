@@ -1,10 +1,10 @@
 import { useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
-import { AlertTriangle, CheckCircle2, History, Power, RefreshCw, RotateCcw, Save, Undo2, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, GitMerge, History, Power, RefreshCw, RotateCcw, Save, Undo2, XCircle } from 'lucide-react';
 import { Card, Chip, ConfirmDialog, Empty, ErrorNote, Modal, Segmented, Skeleton, useToast } from '../components/ui';
 import { HelperGate } from '../components/HelperGate';
 import { adminApi, withResult, type ApplyResult, type ConfigBackup } from '../lib/admin';
-import { usePoll } from '../lib/api';
+import { api, usePoll } from '../lib/api';
 import { diffStats, lineDiff, withContext, type DiffLine } from '../lib/diff';
 import { fmtAgo, fmtBytes } from '../lib/format';
 
@@ -17,6 +17,10 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   const status = usePoll(() => adminApi.status(), [], 30000);
   const helper = status.data?.helper;
   const cfg = usePoll(() => (helper?.managementCapable ? adminApi.config() : Promise.resolve(null)), [helper?.managementCapable], 0);
+  // A fips.yaml merge from an upgrade that could not be applied by itself (conflicts, rolled back, or not automatic).
+  const prop = usePoll(() => (helper?.managementCapable ? api.get<{ proposal: Proposal | null }>('/api/admin/config/proposal') : Promise.resolve(null)), [helper?.managementCapable], 60000);
+  const [fromProposal, setFromProposal] = useState(false);
+  const dismissProposal = async () => { try { await api.post('/api/admin/config/proposal/dismiss', {}); } catch { /* shown on the next poll */ } prop.refresh(); };
   const [draft, setDraft] = useState<string | null>(null);
   const [view, setView] = useState<'edit' | 'diff'>('edit');
   const [restart, setRestart] = useState(true);
@@ -54,7 +58,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
     try {
       const r = await withResult(adminApi.apply(text, restart, cfg.data?.base ?? ''));
       setResult(r);
-      if (r.ok) { toast('ok', r.changed ? (r.restarted ? 'Configuration applied and the daemon is healthy' : 'Configuration saved; restart the daemon to apply it') : 'No changes to apply'); setDraft(null); cfg.refresh(); }
+      if (r.ok) { toast('ok', r.changed ? (r.restarted ? 'Configuration applied and the daemon is healthy' : 'Configuration saved; restart the daemon to apply it') : 'No changes to apply'); setDraft(null); cfg.refresh(); if (fromProposal) { setFromProposal(false); void dismissProposal(); } }
       else toast('err', r.error ?? 'Apply failed');
     } catch (e) { toast('err', (e as Error).message); }
     finally { setBusy(false); setConfirm(null); }
@@ -82,6 +86,9 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
       <HelperGate helper={helper}>
         {cfg.error && <ErrorNote>{cfg.error}</ErrorNote>}
         {result && <ResultNote r={result} />}
+        {prop.data?.proposal && !readOnly && <ProposalNote p={prop.data.proposal} opened={fromProposal}
+          onOpen={() => { setDraft(prop.data!.proposal!.yaml.replace(/\r\n/g, '\n')); setView('diff'); setFromProposal(true); }}
+          onDismiss={() => { if (fromProposal) { setDraft(null); setFromProposal(false); } void dismissProposal(); }} />}
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
           <Card pad={false} className="overflow-hidden min-h-[420px]">
             <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-line">
@@ -191,6 +198,28 @@ export function DiffView({ lines, labels = ['current', 'edited'] }: { lines: Dif
             <span className={l.kind === 'add' ? 'text-good' : l.kind === 'del' ? 'text-crit' : 'text-ink-3'}>{l.kind === 'add' ? '+' : l.kind === 'del' ? '−' : ' '}</span>
             <span className="whitespace-pre">{l.text || ' '}</span>
           </div>)}
+    </div>
+  );
+}
+
+interface Proposal { at: number; fromRev: string; toRef: string; yaml: string; conflicts: boolean; reason: string; templateDiff?: string; stale?: boolean }
+
+/** An upgrade's fips.yaml template merge waiting for review. */
+function ProposalNote({ p, opened, onOpen, onDismiss }: { p: Proposal; opened: boolean; onOpen: () => void; onDismiss: () => void }) {
+  const short = (r: string) => (/^[0-9a-f]{12,}$/.test(r) ? r.slice(0, 10) : r);
+  return (
+    <div className="card px-4 py-3 grid gap-2 text-sm" style={{ borderColor: 'rgba(214,158,46,0.5)' }}>
+      <div className="flex flex-wrap items-center gap-2">
+        <GitMerge size={16} className="text-warn" />
+        <span>The upgrade from <span className="mono">{short(p.fromRev)}</span> to <span className="mono">{short(p.toRef)}</span> ({fmtAgo(p.at)}) changed the fips.yaml template; the merge into this file is waiting: <b>{p.conflicts ? 'it has conflicts' : p.reason}</b>.</span>
+        <div className="ml-auto flex gap-2">
+          {!opened && <button className="btn sm primary" onClick={onOpen}>Review in the editor</button>}
+          <button className="btn sm ghost" onClick={onDismiss}>Dismiss</button>
+        </div>
+      </div>
+      {p.conflicts && <p className="text-xs text-ink-3">Conflicts are marked with <code>{'<<<<<<< your fips.yaml'}</code>, <code>|||||||</code> (the old template), <code>=======</code> and <code>{'>>>>>>> template'}</code>: keep the lines you want, delete the markers, then Apply.</p>}
+      {p.stale && <p className="text-xs text-warn">fips.yaml changed after this merge was made; the Changes tab shows everything it would change, including undoing those later edits.</p>}
+      {p.templateDiff && <details className="text-xs"><summary className="cursor-pointer text-ink-2">What changed in the template</summary><pre className="mt-1 max-h-60 overflow-auto rounded-lg bg-surface-2 p-2 text-[11px] leading-snug">{p.templateDiff}</pre></details>}
     </div>
   );
 }

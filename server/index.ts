@@ -13,6 +13,7 @@ import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
 import { SelfUpdate } from './self-update.ts';
+import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -257,7 +258,11 @@ const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequest
 const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
-const upgrade = createUpgradeHandler({ authorize: (req) => canChange(req), controlSocket: SOCKET_PATH });
+const upgrade = createUpgradeHandler({
+  authorize: (req) => canChange(req), controlSocket: SOCKET_PATH,
+  // After an upgrade, fips.yaml follows the new template (server/config-merge.ts); `admin` is created below.
+  configMerge: createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) }),
+});
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({
   authorize: (req) => canChange(req),
@@ -371,6 +376,17 @@ async function route(req: Req, res: Res) {
     const starts = method === 'POST' && (p === '/api/upgrade/jobs' || p === '/api/upgrade/rollback');
     if (starts) upgradeStarting++;
     try { if (await upgrade(req, res)) return; } finally { if (starts) upgradeStarting--; }
+  }
+  // A fips.yaml merge an upgrade could not apply by itself, offered on the Configuration page.
+  if (p === '/api/admin/config/proposal' || p === '/api/admin/config/proposal/dismiss') {
+    if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
+    if (method === 'POST' && p.endsWith('/dismiss')) { await clearProposal(); return json(res, 200, { ok: true }); }
+    if (method !== 'GET') return json(res, 405, { error: 'GET only' });
+    const prop = await readProposal();
+    if (!prop) return json(res, 200, { proposal: null });
+    // A proposal made for a file that has changed since cannot be applied as it is.
+    const cur = await admin.configShow().catch(() => null);
+    return json(res, 200, { proposal: { ...prop, stale: !!cur && cur.base !== prop.base } });
   }
   // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
   if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
