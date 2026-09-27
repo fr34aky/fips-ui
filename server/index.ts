@@ -262,6 +262,7 @@ const upgrade = createUpgradeHandler({
   authorize: (req) => canChange(req), controlSocket: SOCKET_PATH,
   // After an upgrade, fips.yaml follows the new template (server/config-merge.ts); `admin` is created below.
   configMerge: createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) }),
+  configRestore: (id) => admin.configRestore(id).catch((e: Error) => ({ ok: false, error: e.message })),
 });
 // Node management (fips.yaml, firewall, units). Refused while an upgrade job holds the daemon.
 const admin = createAdminHandler({

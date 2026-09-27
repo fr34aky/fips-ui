@@ -407,11 +407,17 @@ export function createAdminHandler(opts: AdminOptions) {
     return exclusive(() => helperJson(['config-apply', '--base', base], yaml, HELPER_RESTART_TIMEOUT));
   }
 
+  /** Reinstall a config backup (restart and health check, rolled back if the daemon does not stay up). */
+  function configRestore(id: string): Promise<{ ok: boolean; error?: string }> {
+    return exclusive(() => helperJson(['config-restore', id], undefined, HELPER_RESTART_TIMEOUT));
+  }
+
   return Object.assign(handler, {
     helperInfo,
     hostsApply,
     configShow,
     configApply,
+    configRestore,
     meshGuard,
     meshGuardStatus,
     updateManagedRules,

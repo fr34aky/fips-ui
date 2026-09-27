@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseDocument } from 'yaml';
 import { AlertTriangle, CheckCircle2, GitMerge, History, Power, RefreshCw, RotateCcw, Save, Undo2, XCircle } from 'lucide-react';
 import { Card, Chip, ConfirmDialog, Empty, ErrorNote, Modal, Segmented, Skeleton, useToast } from '../components/ui';
@@ -22,6 +22,8 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   const [fromProposal, setFromProposal] = useState(false);
   const dismissProposal = async () => { try { await api.post('/api/admin/config/proposal/dismiss', {}); } catch { /* shown on the next poll */ } prop.refresh(); };
   const [draft, setDraft] = useState<string | null>(null);
+  // Discarding or reloading the draft leaves the review (the proposal stays waiting, and can be opened again).
+  useEffect(() => { if (draft === null) setFromProposal(false); }, [draft]);
   const [view, setView] = useState<'edit' | 'diff'>('edit');
   const [restart, setRestart] = useState(true);
   const [confirm, setConfirm] = useState<null | 'apply' | 'restart' | { restore: ConfigBackup }>(null);
@@ -58,7 +60,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
     try {
       const r = await withResult(adminApi.apply(text, restart, cfg.data?.base ?? ''));
       setResult(r);
-      if (r.ok) { toast('ok', r.changed ? (r.restarted ? 'Configuration applied and the daemon is healthy' : 'Configuration saved; restart the daemon to apply it') : 'No changes to apply'); setDraft(null); cfg.refresh(); if (fromProposal) { setFromProposal(false); void dismissProposal(); } }
+      if (r.ok) { toast('ok', r.changed ? (r.restarted ? 'Configuration applied and the daemon is healthy' : 'Configuration saved; restart the daemon to apply it') : 'No changes to apply'); if (fromProposal) void dismissProposal(); setDraft(null); cfg.refresh(); }
       else toast('err', r.error ?? 'Apply failed');
     } catch (e) { toast('err', (e as Error).message); }
     finally { setBusy(false); setConfirm(null); }

@@ -81,6 +81,8 @@ export interface ConfigMergeResult {
   configDiff?: string
   /** Deprecation warnings the new daemon logged about this configuration. */
   deprecations?: string[]
+  /** Config backup taken before an applied merge (restored when the binaries are rolled back). */
+  configBackupId?: string
 }
 /** Merges template changes into the node's configuration; provided by the server (it needs the helper). */
 export type ConfigMergeHook = (a: { oldTemplate: string; newTemplate: string; fromRev: string; toRef: string; apply: boolean; restartedAt: number; log: (msg: string) => void }) => Promise<ConfigMergeResult>
@@ -121,6 +123,8 @@ export interface UpgradeOptions {
   cargoArgs?: string[]
   /** Merge fips.yaml template changes after an upgrade (without it the step is skipped). */
   configMerge?: ConfigMergeHook
+  /** Reinstall a fips.yaml backup (restart, health check); used when rolling back an upgrade that merged it. */
+  configRestore?: (backupId: string) => Promise<{ ok: boolean; error?: string }>
 }
 
 const MAX_LOG_LINES = 6000
@@ -592,6 +596,7 @@ export class UpgradeManager {
   readonly cargoArgs: string[]
   readonly installer: Installer
   private readonly configMerge?: ConfigMergeHook
+  private readonly configRestore?: (backupId: string) => Promise<{ ok: boolean; error?: string }>
   private binDirCache: string | null = null
   private current: Job | null = null
   /** Probe results that only change when an operator acts (helper install, package changes, toolchain installs). */
@@ -612,6 +617,7 @@ export class UpgradeManager {
     this.repoUrl = opts.repoUrl ?? process.env.FIPS_UI_REPO_URL ?? `https://github.com/${repo}.git`
     this.gh = new GitHub(repo, opts.githubToken ?? process.env.FIPS_UI_GITHUB_TOKEN)
     this.configMerge = opts.configMerge
+    this.configRestore = opts.configRestore
     this.cargoArgs = opts.cargoArgs ?? (process.env.FIPS_UI_CARGO_ARGS ? process.env.FIPS_UI_CARGO_ARGS.split(/\s+/).filter(Boolean) : [])
     this.installer = P.usesHelper
       ? new HelperInstaller(this.helperPath, this.backupsDir, P.binaries)
@@ -954,8 +960,18 @@ export class UpgradeManager {
       }
       job.result.config = await this.configMerge!({ oldTemplate, newTemplate, fromRev, toRef, apply: job.mergeConfig, restartedAt, log: (m) => job.info(m) })
       job.info(`fips.yaml: ${job.result.config.detail}`)
+      // Rolling back to the binaries backed up by this upgrade also restores the fips.yaml from before it.
+      if (job.result.config.configBackupId && job.result.backupId) await this.setMergedConfig(job.result.backupId, job.result.config.configBackupId)
       job.emitState()
     })
+  }
+
+  private get mergesFile(): string { return join(this.workDir, 'config-merges.json') }
+  private async mergedConfigs(): Promise<Record<string, string>> { try { return JSON.parse(await readFile(this.mergesFile, 'utf8')) as Record<string, string> } catch { return {} } }
+  private async setMergedConfig(binaryBackup: string, configBackup: string | null): Promise<void> {
+    const m = await this.mergedConfigs()
+    if (configBackup) m[binaryBackup] = configBackup; else delete m[binaryBackup]
+    await writeFile(this.mergesFile, JSON.stringify(m)).catch(() => {})
   }
 
   /** The fips.yaml template at a commit or tag: from the local source checkout if it has it, else from GitHub. */
@@ -1026,8 +1042,17 @@ export class UpgradeManager {
     this.publish(job)
     job.cancellable = false
     return this.launch(job, async () => {
-      job.defineSteps([['install', `Restore backup ${id} (privileged)`], ['confirm', 'Confirm running version']])
+      // An upgrade that merged fips.yaml into the new template recorded the file from before it: restore that
+      // first (the newer daemon still accepts the older keys), so the old binaries never read a newer file.
+      const configBackup = this.configRestore ? (await this.mergedConfigs())[id] : undefined
+      job.defineSteps([...(configBackup ? [['config', `Restore fips.yaml from before the upgrade (${configBackup})`] as [string, string]] : []), ['install', `Restore backup ${id} (privileged)`], ['confirm', 'Confirm running version']])
       const h = await this.installer.check(); if (!h.available) throw new Error(`cannot roll back: ${h.error}`)
+      if (configBackup) await job.runStep('config', async () => {
+        const r = await this.configRestore!(configBackup)
+        if (!r.ok) throw new Error(`fips.yaml could not be restored (${r.error ?? 'failed'}); the binaries were not rolled back`)
+        await this.setMergedConfig(id, null)
+        job.info(`fips.yaml restored from backup ${configBackup}`)
+      })
       const before = await this.runningVersion()
       const r = await job.runStep('install', () => this.installer.rollback(job, id))
       const pre = r.pre_rollback_backup ?? r.backup_id

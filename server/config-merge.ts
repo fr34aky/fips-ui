@@ -38,8 +38,11 @@ export async function merge3(ours: string, base: string, theirs: string, labels:
     await writeFile(join(dir, 'ours'), ours); await writeFile(join(dir, 'base'), base); await writeFile(join(dir, 'theirs'), theirs);
     // Exit status: 0 clean, >0 number of conflicts, <0 error.
     const r = await git(['merge-file', '-p', '-L', labels[0], '-L', labels[1], '-L', labels[2], 'ours', 'base', 'theirs'], dir);
-    if (r.code < 0) throw new Error(`git merge-file failed: ${r.out.trim() || 'is git installed?'}`);
-    return { text: r.out, conflicts: r.code > 0 };
+    // Exit status: 0 clean, 1..127 the number of conflicts; anything else (spawn failure, 128 die, 255 error) is an
+    // error, and so is a "conflict" without conflict markers, so an error text can never become the merged file.
+    const conflicts = r.code > 0 && r.code < 128;
+    if ((r.code !== 0 && !conflicts) || (conflicts && !r.out.includes('<<<<<<< '))) throw new Error(`git merge-file failed (${r.code}): ${r.out.trim().split('\n')[0] || 'is git installed?'}`);
+    return { text: r.out, conflicts };
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -77,9 +80,11 @@ export function createConfigMerge(deps: {
           else if (!apply) { res.status = 'proposed'; res.detail = 'merged cleanly; not applied (automatic update was turned off), waiting on the Configuration page'; await keep('not applied automatically'); }
           else {
             log('applying the merged fips.yaml (backup, restart, automatic rollback if the daemon does not stay up)');
-            const r = await deps.apply(m.text, cur.base);
-            if (r.ok) { res.status = 'applied'; res.detail = `updated to the ${to} template${r.backup_id ? ` (previous file: backup ${r.backup_id})` : ''}`; await clearProposal(); }
-            else { res.status = 'failed'; res.detail = `the merged fips.yaml was rolled back: ${r.error ?? 'the daemon did not stay up'}; it waits on the Configuration page`; await keep(`rolled back: ${r.error ?? 'daemon did not stay up'}`); }
+            // The helper refusing the file (a secret's section moved, a hidden comment would show) is not a crash:
+            // the merge is kept for review either way.
+            const r = await deps.apply(m.text, cur.base).catch((e: Error) => ({ ok: false, error: e.message, backup_id: undefined }));
+            if (r.ok) { res.status = 'applied'; res.configBackupId = r.backup_id; res.detail = `updated to the ${to} template${r.backup_id ? ` (previous file: backup ${r.backup_id})` : ''}`; await clearProposal(); }
+            else { res.status = 'failed'; res.detail = `the merged fips.yaml was not applied (${r.error ?? 'the daemon did not stay up'}); it waits on the Configuration page`; await keep(`not applied: ${r.error ?? 'the daemon did not stay up'}`); }
           }
         }
       }
