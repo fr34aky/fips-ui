@@ -422,7 +422,7 @@ async function route(req: Req, res: Res) {
     // A follower node syncing from this one (over the mesh, by its npub): remembered for the master's list.
     const pr = principalOf(req);
     const syncInfo = pr.kind === 'mesh' && method === 'GET' ? isSyncRequest(req) : null;
-    if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo);
+    if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo).catch(() => {});
     // A sync is answered with this node's upstream chain, which lets followers detect loops.
     const own = syncInfo ? (lastSnapshot?.status as { npub?: string } | undefined)?.npub ?? await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 }).then((s) => s.npub, () => undefined) : undefined;
     const chain = own ? await hostsSync.chainFor(own) : undefined;

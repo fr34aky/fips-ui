@@ -146,6 +146,9 @@ export class HostsSync {
       if (content !== cur.raw) { await this.deps.write(content, cur.base); this.status.lastChange = Date.now(); }
       this.status = { ...this.status, lastSuccess: Date.now(), received: entries.valid.length, skipped: entries.skipped, error: undefined, unreachableSince: undefined, nextAttempt: Date.now() + this.config.intervalMin * 60_000 };
     } catch (e) {
+      // Without a fresh answer only the configured master is certain: report just that upstream, so an old chain
+      // cannot make another node refuse a sync as a loop that no longer exists.
+      this.status.chain = [master];
       const offline = e instanceof SyncError && e.kind === 'offline';
       this.status = {
         ...this.status, error: (e as Error).message,

@@ -35,7 +35,13 @@ export class HostsFollowers {
   private saving: Promise<void> = Promise.resolve();
 
   private load(): Promise<void> {
-    this.loaded ??= readFile(FILE, 'utf8').then((t) => { for (const f of JSON.parse(t) as Follower[]) this.map.set(f.npub, f); }, () => {});
+    // A missing, truncated or hand-edited file just starts an empty list.
+    this.loaded ??= readFile(FILE, 'utf8').then((t) => {
+      try {
+        const list = JSON.parse(t) as unknown;
+        if (Array.isArray(list)) for (const f of list as Follower[]) if (f && typeof f.npub === 'string' && typeof f.lastSeen === 'number') this.map.set(f.npub, f);
+      } catch { /* start empty */ }
+    }, () => {});
     return this.loaded;
   }
 
