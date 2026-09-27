@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **fips.yaml follows the template across daemon upgrades** (release and source
+  builds): after the new daemon runs, the changes of the upstream template
+  (`packaging/common/fips.yaml`) between the old and the new version are merged
+  into this node's fips.yaml with a 3-way merge, on the redacted file so secrets
+  stay with the helper. Your own edits stay. A clean merge is applied with a
+  backup, restart and automatic rollback; a merge with conflicts (or a rolled
+  back one) waits on the Configuration page for review. Deprecation warnings the
+  new daemon logs about the configuration are reported in the job. Option on the
+  Upgrade page: "Update fips.yaml to the new template" (on by default).
+
 ## [0.4.0] - 2026-09-27
 
 ### Added

@@ -8,7 +8,8 @@ export type StepState = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
 export interface StepInfo { name: string; label: string; state: StepState; startedAt?: number; endedAt?: number; detail?: string }
 export interface JobLogLine { seq: number; t: number; stream: 'out' | 'err' | 'sys'; line: string }
-export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string }
+export interface ConfigMergeResult { status: 'unchanged' | 'current' | 'applied' | 'proposed' | 'failed' | 'skipped'; detail: string; fromRev?: string; toRef?: string; templateDiff?: string; configDiff?: string; deprecations?: string[] }
+export interface JobResult { stagedVersion?: string; backupId?: string; restarted?: boolean; runningVersion?: string; stageDir?: string; artifact?: string; config?: ConfigMergeResult }
 export type JobKind = 'upgrade' | 'rollback' | 'toolchain' | 'helper';
 export interface JobSummary {
   id: string; kind: JobKind; source: UpgradeSource; ref: string; restart: boolean; dryRun: boolean;
@@ -35,7 +36,7 @@ export interface UpgradeStatus {
 
 export const upgradeApi = {
   status: (force = false) => api.get<UpgradeStatus>(`/api/upgrade/status${force ? '?refresh=1' : ''}`),
-  start: (body: { source: UpgradeSource; ref?: string; restart?: boolean; dryRun?: boolean }) => api.post<JobSummary>('/api/upgrade/jobs', body),
+  start: (body: { source: UpgradeSource; ref?: string; restart?: boolean; dryRun?: boolean; mergeConfig?: boolean }) => api.post<JobSummary>('/api/upgrade/jobs', body),
   cancel: () => api.post<{ cancelled: boolean }>('/api/upgrade/jobs/current/cancel'),
   rollback: (id: string) => api.post<JobSummary>('/api/upgrade/rollback', { id }),
   restart: () => api.post<{ output: string }>('/api/upgrade/restart'),

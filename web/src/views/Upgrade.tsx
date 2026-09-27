@@ -7,7 +7,7 @@ import { usePoll } from '../lib/api';
 import { UiUpdateCard } from '../components/UiUpdateCard';
 import { Copyable, Modal } from '../components/ui';
 import { fmtAgo, fmtBytes, fmtDuration, fmtTime } from '../lib/format';
-import { upgradeApi, useUpgradeJob, type Backup, type JobSummary, type StepInfo, type UpgradeSource, type UpgradeStatus } from '../lib/upgrade';
+import { upgradeApi, useUpgradeJob, type ConfigMergeResult, type Backup, type JobSummary, type StepInfo, type UpgradeSource, type UpgradeStatus } from '../lib/upgrade';
 
 // ---------------------------------------------------------------------------
 // Page
@@ -40,6 +40,7 @@ export function Upgrade() {
   const [confirm, setConfirm] = useState<null | { source: UpgradeSource; ref?: string; label: string }>(null);
   const [restart, setRestart] = useState(true);
   const [dryRun, setDryRun] = useState(false);
+  const [mergeConfig, setMergeConfig] = useState(true);
   const [actionErr, setActionErr] = useState<string | null>(null);
 
   const launch = async (fn: () => Promise<JobSummary | null>) => {
@@ -117,6 +118,7 @@ export function Upgrade() {
         <div className="card-title mr-2">Options</div>
         <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={restart} onChange={(e) => setRestart(e.target.checked)} className="accent-[var(--accent)]" /> Restart service after install</label>
         <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} className="accent-[var(--accent)]" /> Dry run <span className="text-ink-3">(download / build and stage only, install nothing)</span></label>
+        <label className="flex items-center gap-2 cursor-pointer" title="After the new daemon runs, the changes of the fips.yaml template between the old and the new version are merged into your fips.yaml (your own edits stay). A clean merge is applied with a backup, restart and automatic rollback; a merge with conflicts waits on the Configuration page."><input type="checkbox" checked={mergeConfig} onChange={(e) => setMergeConfig(e.target.checked)} className="accent-[var(--accent)]" /> Update fips.yaml to the new template</label>
         {!canInstall && !dryRun && <span className="chip warn"><AlertTriangle size={12} /> installs will fail until the privileged installer is available</span>}
         {st?.restartPending && <button className="btn sm ml-auto" disabled={busy || !canInstall} onClick={() => { setActionErr(null); upgradeApi.restart().then(refresh).catch((e) => setActionErr(e.message)); }}><RotateCcw size={14} /> Restart service now</button>}
       </section>
@@ -149,7 +151,7 @@ export function Upgrade() {
               <button className="btn primary" onClick={() => {
                 const c = confirm; setConfirm(null);
                 if (c.ref?.startsWith('rollback:')) void launch(() => upgradeApi.rollback(c.ref!.slice('rollback:'.length)));
-                else void launch(() => upgradeApi.start({ source: c.source, ref: c.ref, restart, dryRun }));
+                else void launch(() => upgradeApi.start({ source: c.source, ref: c.ref, restart, dryRun, mergeConfig }));
               }}><Check size={15} /> {dryRun && !confirm.ref?.startsWith('rollback:') ? 'Start dry run' : 'Proceed'}</button>
             </div>
           </div>
@@ -368,6 +370,7 @@ function JobPanel({ job, log, onCancel, onDismiss }: { job: JobSummary; log: { s
               {job.result.backupId && <div>backup: <span className="mono">{job.result.backupId}</span></div>}
             </li>
           )}
+          {job.result?.config && <li className="mt-2 px-2"><ConfigOutcome c={job.result.config} /></li>}
           {job.error && job.state !== 'cancelled' && <li className="mt-1 px-2 text-xs text-crit break-words">{job.error}</li>}
         </ol>
         <div className="relative min-w-0">
@@ -384,4 +387,23 @@ function JobPanel({ job, log, onCancel, onDismiss }: { job: JobSummary; log: { s
       </div>
     </section>
   );
+}
+
+/** What happened to fips.yaml after the upgrade: template diff, the change to this node's file, deprecations. */
+function ConfigOutcome({ c }: { c: ConfigMergeResult }) {
+  const tone = c.status === 'applied' ? 'good' : c.status === 'proposed' ? 'warn' : c.status === 'failed' ? 'crit' : '';
+  const label = { unchanged: 'template unchanged', current: 'already up to date', applied: 'updated', proposed: 'review needed', failed: 'not updated', skipped: 'skipped' }[c.status];
+  return (
+    <div className="grid gap-1 text-xs">
+      <div className="flex flex-wrap items-center gap-1.5"><span className="text-ink-2">fips.yaml:</span><span className={`chip ${tone}`}><span className="chip-dot" />{label}</span>{(c.status === 'proposed' || c.status === 'failed') && <a className="text-ink-3 hover:text-ink" href="#/config">review on the Configuration page →</a>}</div>
+      <div className="text-ink-3 break-words">{c.detail}</div>
+      {!!c.deprecations?.length && <div className="text-warn break-words">Deprecated settings reported by the new daemon: {c.deprecations.join(' · ')}</div>}
+      {c.configDiff && <details><summary className="cursor-pointer text-ink-2">Change to your fips.yaml</summary><DiffBlock text={c.configDiff} /></details>}
+      {c.templateDiff && <details><summary className="cursor-pointer text-ink-2">Template change</summary><DiffBlock text={c.templateDiff} /></details>}
+    </div>
+  );
+}
+
+function DiffBlock({ text }: { text: string }) {
+  return <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-surface-2 p-2 text-[11px] leading-snug">{text.split('\n').map((l, i) => <div key={i} className={l.startsWith('+') && !l.startsWith('+++') ? 'text-good' : l.startsWith('-') && !l.startsWith('---') ? 'text-crit' : l.startsWith('@@') ? 'text-ink-3' : ''}>{l || ' '}</div>)}</pre>;
 }
