@@ -29,6 +29,15 @@ names next to npubs.
   invalid entries are left out and counted. At most 2000 entries are taken.
 - The master shares every entry of its hosts file (what `/api/hosts` shows its viewers).
 
+## Followers on the master
+
+The master's hosts card lists the nodes that sync from it: name and npub, when each last synced (amber once
+three of its intervals have passed without a sync), how many names it received, its interval and its fips-ui
+version. Followers mark their sync request with an `x-fips-ui-sync` header carrying version and interval;
+followers on versions before that are recognised by their plain `node` client and shown as "older". A person
+browsing the dashboard over the mesh is not counted. The list is kept in `~/.config/fips-ui/hosts-followers.json`
+(`FIPS_UI_HOSTS_FOLLOWERS_FILE`); forgetting an entry removes it until that node's next sync.
+
 ## If the master is offline
 
 The names synced last stay in effect. Automatic retries back off to once a day while the master cannot be

@@ -3,7 +3,8 @@
 The **Configuration** and **Firewall** pages change the node itself: `/etc/fips/fips.yaml`, the fips0
 nftables firewall and the fips systemd units. All of it needs root, and all of it goes through the same
 privileged helper as upgrades (`scripts/fips-ui-helper`, installed by `deploy/setup-local.sh`). Version 4
-of the helper is required; older helpers keep upgrades working and the pages explain how to update.
+of the helper is required (version 6 for writing the hosts file, see [hosts.md](hosts.md)); older helpers
+keep upgrades working and the pages explain how to update.
 
 ## What the helper does
 

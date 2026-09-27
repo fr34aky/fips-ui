@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- README brought up to date (features, requirements, what works on which system,
+  settings, security, API, project layout) with an overview of the docs; new
+  `docs/hosts.md` (hosts-file editor, names next to npubs, web UI access per
+  name) and `docs/self-update.md`; followers section in `docs/hosts-sync.md`.
+
 ## [0.6.0] - 2026-09-27
 
 ### Added
