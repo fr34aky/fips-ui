@@ -5,6 +5,7 @@ import { api, usePoll } from '../lib/api';
 import { shortKey } from '../lib/format';
 import type { Principal } from '../lib/types';
 import { NameText } from './PeerName';
+import { useHosts } from '../lib/names';
 
 type Role = 'viewer' | 'admin';
 interface Entry { npub: string; label?: string; role: Role }
@@ -20,6 +21,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const [busy, setBusy] = useState(false);
   const [add, setAdd] = useState({ id: '', label: '', role: 'viewer' as Role });
   const [lastFw, setLastFw] = useState<SaveResponse['firewall'] | null>(null);
+  const hosts = useHosts().data?.entries ?? [];
   const data = r.data;
   useEffect(() => { if (data?.config && !draft) setDraft(data.config); }, [data?.config, draft]);
 
@@ -31,6 +33,8 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const saved = data.config;
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
   const st = data.status!;
+  // Hosts-file names not yet on the list (and not this node itself), for the picker.
+  const pickable = hosts.filter((h) => h.npub !== st.npub && !draft.allowed.some((e) => e.npub === h.npub));
   const selfRemoved = you.kind === 'mesh' && !draft.allowed.some((e) => e.npub === you.npub && e.role === 'admin');
 
   const addEntry = async (e: React.FormEvent) => {
@@ -86,7 +90,14 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
           )}
           {!readOnly && (
             <form className="flex flex-wrap gap-2" onSubmit={addEntry}>
-              <input className="input mono flex-1 min-w-[220px]" placeholder="npub1… or hosts-file name" value={add.id} onChange={(e) => setAdd({ ...add, id: e.target.value })} />
+              {pickable.length > 0 && (
+                <select className="input w-56" aria-label="Pick from the hosts file" value="" onChange={(e) => { const h = pickable.find((x) => x.hostname === e.target.value); if (h) setAdd({ ...add, id: h.hostname, label: add.label || h.hostname }); }}>
+                  <option value="">From hosts file…</option>
+                  {pickable.map((h) => <option key={h.hostname} value={h.hostname}>{h.hostname} · {shortKey(h.npub, 10, 4)}</option>)}
+                </select>
+              )}
+              <input className="input mono flex-1 min-w-[220px]" placeholder="npub1… or hosts-file name" list="access-hosts" value={add.id} onChange={(e) => setAdd({ ...add, id: e.target.value })} />
+              <datalist id="access-hosts">{pickable.map((h) => <option key={h.hostname} value={h.hostname}>{shortKey(h.npub, 12, 6)}</option>)}</datalist>
               <input className="input w-36" placeholder="label" value={add.label} onChange={(e) => setAdd({ ...add, label: e.target.value })} maxLength={40} />
               <select className="input w-28" value={add.role} onChange={(e) => setAdd({ ...add, role: e.target.value as Role })}><option value="viewer">viewer</option><option value="admin">admin</option></select>
               <button className="btn"><Plus size={14} />Add</button>
