@@ -12,6 +12,7 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
+import { HostsFollowers, isSyncRequest } from './hosts-followers.ts';
 import { SelfUpdate } from './self-update.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
@@ -330,7 +331,9 @@ const restartBlocker = (): string | null => {
   return null;
 };
 
+const hostsFollowers = new HostsFollowers();
 const hostsSync = new HostsSync({
+  version: UI_VERSION,
   ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
   meshAddress,
   write: writeHostsFile,
@@ -416,9 +419,20 @@ async function route(req: Req, res: Res) {
   }
   if (p === '/api/hosts' && method !== 'POST') {
     const h = await readHosts();
+    // A follower node syncing from this one (over the mesh, by its npub): remembered for the master's list.
+    const pr = principalOf(req);
+    const syncInfo = pr.kind === 'mesh' && method === 'GET' ? isSyncRequest(req) : null;
+    if (pr.kind === 'mesh' && syncInfo && !h.error) void hostsFollowers.record(pr.npub, pr.address, h.entries.length, syncInfo).catch(() => {});
+    // A sync is answered with this node's upstream chain, which lets followers detect loops.
+    const own = syncInfo ? (lastSnapshot?.status as { npub?: string } | undefined)?.npub ?? await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 }).then((s) => s.npub, () => undefined) : undefined;
+    const chain = own ? await hostsSync.chainFor(own) : undefined;
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;
-    return json(res, 200, { ...hostsView(h), ...(write !== undefined ? { write } : {}) });
+    return json(res, 200, { ...hostsView(h), ...(chain ? { chain } : {}), ...(write !== undefined ? { write } : {}) });
+  }
+  if (p === '/api/hosts/followers' && method === 'GET') {
+    if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
+    return json(res, 200, { followers: await hostsFollowers.list() });
   }
   if (p === '/api/ui-update' && method === 'GET') {
     const admin_ = canChange(req);
@@ -503,6 +517,11 @@ async function route(req: Req, res: Res) {
     };
     void selfUpdate.install(tag, exitWhenIdle);
     return json(res, 202, { job: selfUpdate.job });
+  }
+  if (p === '/api/hosts/followers/forget') {
+    const { npub } = body as { npub?: unknown };
+    if (typeof npub !== 'string' || !NPUB_RE.test(npub)) throw new HttpError(400, 'npub required');
+    return json(res, 200, { ok: await hostsFollowers.forget(npub) });
   }
   if (p === '/api/hosts/sync/run') {
     // Syncs now, or with sync turned off retries removing names a failed removal left behind.

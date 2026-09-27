@@ -24,7 +24,12 @@ export interface SyncStatus {
   unreachableSince?: number;
   /** When the next automatic sync is due. */
   nextAttempt?: number;
+  /** The master and the nodes it syncs from in turn, nearest first (as the master reported it). */
+  chain?: string[];
 }
+
+/** Longest chain of masters accepted (a deeper one is treated like a loop). */
+export const MAX_CHAIN = 16;
 export class SyncError extends Error {
   /** 'offline': the master could not be reached or refused this node; retried once a day unless synced by hand. */
   kind: 'offline' | 'other';
@@ -40,6 +45,8 @@ export interface SyncDeps {
   write: (content: string, base: string) => Promise<void>;
   /** A name for the master to put in the block header, if known. */
   label: (npub: string) => Promise<string | undefined>;
+  /** This node's fips-ui version, reported to the master. */
+  version?: string;
 }
 
 export function validateSyncConfig(input: unknown): SyncConfig {
@@ -75,6 +82,11 @@ export class HostsSync {
   constructor(deps: SyncDeps) { this.deps = deps; }
 
   get file(): string { return FILE; }
+
+  /** The chain this node reports to its own followers: itself, then its master and that master's chain. */
+  async chainFor(own: string): Promise<string[]> {
+    return this.config.enabled && this.status.chain ? [own, ...this.status.chain] : [own];
+  }
 
   async start(): Promise<void> {
     try { this.config = validateSyncConfig(JSON.parse(await readFile(FILE, 'utf8'))); }
@@ -134,6 +146,9 @@ export class HostsSync {
       if (content !== cur.raw) { await this.deps.write(content, cur.base); this.status.lastChange = Date.now(); }
       this.status = { ...this.status, lastSuccess: Date.now(), received: entries.valid.length, skipped: entries.skipped, error: undefined, unreachableSince: undefined, nextAttempt: Date.now() + this.config.intervalMin * 60_000 };
     } catch (e) {
+      // Without a fresh answer only the configured master is certain: report just that upstream, so an old chain
+      // cannot make another node refuse a sync as a loop that no longer exists.
+      this.status.chain = [master];
       const offline = e instanceof SyncError && e.kind === 'offline';
       this.status = {
         ...this.status, error: (e as Error).message,
@@ -150,9 +165,11 @@ export class HostsSync {
     const addr = await this.deps.meshAddress(master).catch((e: Error) => { throw new SyncError(`cannot derive the master's address: ${e.message}`); });
     const url = `http://[${addr}]:${port}/api/hosts`;
     let res: Response;
-    try { res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }); }
+    // The header tells the master this is a sync (it lists its followers), with this node's version and interval.
+    const sync = `version=${this.deps.version ?? ''};interval=${this.config.intervalMin}`;
+    try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync' }, signal: AbortSignal.timeout(15_000) }); }
     catch (e) { throw new SyncError(`cannot reach the master at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
-    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string } | null;
+    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown } | null;
     if (res.status === 403) {
       const own = await this.deps.ownNpub().catch(() => undefined);
       throw new SyncError(`the master refused this node${body?.error ? ` (${body.error})` : ''}: on the master, add ${own ?? "this node's npub"} as a viewer under Access → Web UI over the mesh, then use Sync now`, 'offline');
@@ -172,6 +189,16 @@ export class HostsSync {
       byName.delete(hostname); byName.set(hostname, npub);
     }
     skipped += Math.max(0, body.entries.length - MAX_ENTRIES);
+    // The master's upstream chain (itself first). Finding this node in it means the names would go round in a
+    // loop (a deleted name would keep coming back): refuse. Masters before this check send no chain.
+    const chain = Array.isArray(body.chain) ? body.chain.filter((x): x is string => typeof x === 'string' && NPUB_RE.test(x)) : [master];
+    const own = await this.deps.ownNpub().catch(() => undefined);
+    if (own && chain.includes(own)) {
+      const i = chain.indexOf(own);
+      throw new SyncError(`sync loop: ${i <= 1 ? 'the master' : `a node ${i} hops up (above the master)`} syncs its names from this node, so names would go round in a circle. Stop one of the syncs; this node keeps its current names`);
+    }
+    if (chain.length > MAX_CHAIN) throw new SyncError(`the chain of masters is longer than ${MAX_CHAIN} nodes; this node keeps its current names`);
+    this.status.chain = chain;
     return { valid: [...byName].map(([hostname, npub]) => ({ hostname, npub })), skipped };
   }
 
