@@ -316,6 +316,11 @@ export function createAdminHandler(opts: AdminOptions) {
         const result = await helperJson<Record<string, unknown>>(['config-apply', ...(body.restart === false ? ['--no-restart'] : []), '--base', body.base], yaml, HELPER_RESTART_TIMEOUT);
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
+      if (sub === '/log-access') {
+        // Let the fips group read the daemon's log file (FreeBSD creates it root-only), so the Logs page works.
+        const result = await helperJson<Record<string, unknown>>(['log-access']);
+        sendJson(res, result.ok ? 200 : 422, result); return true;
+      }
       if (sub === '/config/restore') {
         const id = body.id;
         if (typeof id !== 'string' || !/^[0-9]{8}-[0-9]{6}(-[0-9]+)?$/.test(id)) throw new BodyError(400, 'id (backup id string) required');

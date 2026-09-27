@@ -1215,6 +1215,22 @@ NFT
     printf '{"ok":true,"active":true,"ports":%s,"tun":%s}\n' "$(json_escape "$ports")" "$(json_escape "$tun")"
     ;;
 
+  log-access)
+    # Outside systemd the daemon logs to a file, which FreeBSD's package creates root-only: give the group that
+    # owns the control socket (fips) read access. Nothing else about the file changes.
+    require_managed; [[ "$SM" != systemd ]] || die "under systemd the log is the journal"
+    take_lock
+    logf=""
+    for f in "$(sysrc -n fips_logfile 2>/dev/null || true)" /var/log/fips.log /var/log/fips/fips.log /usr/local/var/log/fips/fips.log; do
+      [[ -n "$f" && -f "$f" ]] && { logf=$f; break; }
+    done
+    [[ -n "$logf" ]] || die "no fips log file found"
+    grp=$(stat -f %Sg /var/run/fips 2>/dev/null || stat -c %G /var/run/fips 2>/dev/null || echo fips)
+    [[ "$grp" =~ ^[A-Za-z0-9_-]+$ ]] || die "cannot tell the fips group"
+    chgrp "$grp" "$logf" && chmod g+r,o-rwx "$logf"
+    printf '{"ok":true,"file":%s,"group":%s}\n' "$(json_escape "$logf")" "$(json_escape "$grp")"
+    ;;
+
   list-backups)
     ensure_backups_dir
     printf '['

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
+import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
@@ -259,6 +260,7 @@ const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequest
 const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
+setDaemonProbe(async () => (await query<{ pid?: number }>('show_status', undefined, { timeoutMs: 2000 })).pid);
 const mergeConfig = createConfigMerge({ show: () => admin.configShow(), apply: (yaml, base) => admin.configApply(yaml, base), logs: (n) => recentLogs(n) });
 const upgrade = createUpgradeHandler({
   authorize: (req) => canChange(req), controlSocket: SOCKET_PATH,
@@ -448,7 +450,11 @@ async function route(req: Req, res: Res) {
   if (p === '/api/logs') {
     const requested = Number(url.searchParams.get('lines') ?? 300);
     const lines = Number.isFinite(requested) ? Math.min(5000, Math.max(1, Math.floor(requested))) : 300;
-    return json(res, 200, { lines: await recentLogs(lines, url.searchParams.get('since') ?? undefined) });
+    // A log file the UI's user cannot read (FreeBSD's is root-only) is reported, so the page can offer a fix.
+    const file = LOGS?.file;
+    let unreadable: string | undefined;
+    if (file) { try { await fs.promises.access(file, fs.constants.R_OK); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') unreadable = file; } }
+    return json(res, 200, { lines: await recentLogs(lines, url.searchParams.get('since') ?? undefined), ...(unreadable ? { unreadable } : {}) });
   }
   if (p === '/api/resolve') {
     const id = url.searchParams.get('id') ?? '';

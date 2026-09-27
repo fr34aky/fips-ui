@@ -180,11 +180,25 @@ async function probe(id: ServiceId, name: string): Promise<UnitState> {
   }
 }
 
+/**
+ * The daemon's own answer (control socket: pid) for when the service manager cannot tell, e.g. a root-only pid
+ * file on FreeBSD. Set by the server.
+ */
+let daemonPid: () => Promise<number | undefined> = async () => undefined;
+export function setDaemonProbe(fn: () => Promise<number | undefined>): void { daemonPid = fn; }
+
 export async function unitStates(): Promise<UnitState[]> {
   if (PLATFORM.serviceManager === 'systemd') return systemdStates();
   if (PLATFORM.serviceManager === 'none') return [];
   const ids = SERVICES.filter((id) => nativeName(id));
   const states = await Promise.all(ids.map((id) => probe(id, nativeName(id)!).catch(() => null)));
+  // A fips service reported as not running while the daemon answers on its control socket is running: the
+  // status check itself failed (typically "Permission denied" reading the pid file).
+  const fips = states.find((s) => s?.id === 'fips');
+  if (fips && fips.active !== 'active') {
+    const pid = await daemonPid().catch(() => undefined);
+    if (pid) Object.assign(fips, { active: 'active', sub: 'running', mainPid: pid });
+  }
   return states.filter((s): s is UnitState => !!s && s.loaded);
 }
 
@@ -246,6 +260,8 @@ const PRIORITY_TO_LEVEL: Record<string, LogLevel> = { '0': 'error', '1': 'error'
 
 export interface LogSource {
   name: string;
+  /** For a plain log file: its path (the UI's user may lack read access to it). */
+  file?: string;
   /** argv producing recent lines, and the parser for one output line. */
   recent(lines: number, since?: string): [string, string[]] | null;
   /** argv producing a live stream. */
@@ -256,6 +272,7 @@ export interface LogSource {
 const LOG_FILE = process.env.FIPS_UI_LOG_FILE;
 const fileSource = (file: string): LogSource => ({
   name: `file ${file}`,
+  file,
   recent: (n) => PLATFORM.os === 'windows'
     ? ['powershell.exe', ['-NoProfile', '-Command', `Get-Content -Tail ${n} -LiteralPath '${file.replace(/'/g, "''")}'`]]
     : ['tail', ['-n', String(n), file]],
