@@ -26,11 +26,16 @@ export function compareVersions(a: string, b: string): number {
 
 // A service often runs node by absolute path (nvm, mise, a tarball) with a PATH that does not contain it; npm lives
 // next to that node and starts with "#!/usr/bin/env node", so both must be found through PATH.
-const CHILD_ENV: NodeJS.ProcessEnv = { ...process.env, PATH: [path.dirname(process.execPath), process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'].join(path.delimiter), GIT_TERMINAL_PROMPT: '0' };
+// On Windows the variable is usually spelled "Path": prepend to whichever spelling exists, so there is only one.
+const PATH_KEY = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+const CHILD_ENV: NodeJS.ProcessEnv = { ...process.env, [PATH_KEY]: [path.dirname(process.execPath), process.env[PATH_KEY] ?? '/usr/local/bin:/usr/bin:/bin'].join(path.delimiter), GIT_TERMINAL_PROMPT: '0' };
+const WINDOWS = process.platform === 'win32';
 
 function run(cmd: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: CHILD_ENV }, (err, stdout, stderr) => {
+    // Windows: npm is npm.cmd, a batch file, which only starts through the shell (the arguments are fixed here).
+    const winNpm = WINDOWS && cmd === 'npm';
+    execFile(winNpm ? 'npm.cmd' : cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: CHILD_ENV, shell: winNpm }, (err, stdout, stderr) => {
       const out = `${stdout}${stderr}`.trim();
       if (!err) return resolve({ code: 0, out });
       const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string };
