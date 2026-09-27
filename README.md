@@ -23,7 +23,7 @@ reachability probes, and (optionally) upgrade the node.
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
 | **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
-| **Upgrade** | Install the latest GitHub release (checksum-verified) or build any ref from source with cargo, with backups and rollback. Root steps go through a tiny helper you install once from a shell. See [docs/upgrade.md](docs/upgrade.md). |
+| **Upgrade** | Install the latest GitHub release (checksum-verified) or build any ref from source with cargo, with backups and rollback. Root steps go through a tiny helper you install once from a shell. See [docs/upgrade.md](docs/upgrade.md). Also updates **fips-ui itself** to its newest release (a git checkout is fast-forwarded, rebuilt and the service restarted); a new release shows next to the version in the sidebar. |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
 

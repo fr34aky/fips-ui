@@ -4,6 +4,7 @@ import {
   GitCommitHorizontal, Hammer, KeyRound, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, SkipForward, Terminal, X, XCircle,
 } from 'lucide-react';
 import { usePoll } from '../lib/api';
+import { UiUpdateCard } from '../components/UiUpdateCard';
 import { Copyable, Modal } from '../components/ui';
 import { fmtAgo, fmtBytes, fmtDuration, fmtTime } from '../lib/format';
 import { upgradeApi, useUpgradeJob, type Backup, type JobSummary, type StepInfo, type UpgradeSource, type UpgradeStatus } from '../lib/upgrade';
@@ -53,6 +54,7 @@ export function Upgrade() {
 
   return (
     <div className="grid gap-4 fade-in">
+      <UiUpdateCard readOnly={false} />
       <header className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-ink-2 text-sm max-w-2xl">Install a published release or build the development version from <code>master</code>. Binaries are backed up before every install and can be rolled back from this page.</p>
         <div className="flex items-center gap-2">

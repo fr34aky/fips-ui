@@ -12,6 +12,7 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
+import { SelfUpdate } from './self-update.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -303,6 +304,10 @@ function hostsView(h: HostsFile) {
   return { path: h.path, entries: h.entries, local: h.local, synced: h.synced, base: h.base, error: h.error };
 }
 
+const selfUpdate = new SelfUpdate(ROOT, UI_VERSION);
+// Look for a new fips-ui release shortly after start and every 6 hours.
+setTimeout(() => { void selfUpdate.check(); setInterval(() => void selfUpdate.check(), 6 * 60 * 60_000).unref(); }, 10_000).unref();
+
 const hostsSync = new HostsSync({
   ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
   meshAddress,
@@ -382,6 +387,14 @@ async function route(req: Req, res: Res) {
     const write = canChange(req) ? await hostsWriteMode() : undefined;
     return json(res, 200, { ...hostsView(h), ...(write !== undefined ? { write } : {}) });
   }
+  if (p === '/api/ui-update' && method === 'GET') {
+    const admin_ = canChange(req);
+    await selfUpdate.check(admin_ && url.searchParams.get('refresh') === '1');
+    const base = { current: selfUpdate.current, latest: selfUpdate.latest, newer: selfUpdate.newer, checkedAt: selfUpdate.checkedAt, error: selfUpdate.checkError };
+    if (!admin_) return json(res, 200, base);
+    const h = await admin.helperInfo().catch(() => null);
+    return json(res, 200, { ...base, job: selfUpdate.job, install: await selfUpdate.installMode(), canRestart: selfUpdate.canRestart, helper: { installed: h?.version ?? null, shipped: selfUpdate.repoHelperVersion() } });
+  }
   if (p === '/api/hosts/sync' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
     return json(res, 200, { config: hostsSync.config, status: hostsSync.status, file: hostsSync.file, own: lastSnapshot?.status && (lastSnapshot.status as { npub?: string }).npub });
@@ -442,6 +455,14 @@ async function route(req: Req, res: Res) {
       const status = await hostsSync.save({ ...b, master });
       return json(res, 200, { config: hostsSync.config, status });
     } catch (e) { throw e instanceof HttpError ? e : new HttpError(e instanceof SyncError ? 400 : 500, (e as Error).message); }
+  }
+  if (p === '/api/ui-update/install') {
+    const { tag } = body as { tag?: unknown };
+    await selfUpdate.check();
+    if (!selfUpdate.latest || !selfUpdate.newer || tag !== selfUpdate.latest.tag) throw new HttpError(400, `only the newest release (${selfUpdate.latest?.tag ?? 'unknown'}) can be installed, and only when it is newer than ${selfUpdate.current}`);
+    if (selfUpdate.job?.state === 'running') throw new HttpError(409, 'an update is already running');
+    void selfUpdate.install(tag, () => { console.log(`fips-ui updated to ${tag}; exiting so systemd restarts it`); server.close(); mesh.close(); hostsSync.close(); process.exit(75); });
+    return json(res, 202, { job: selfUpdate.job });
   }
   if (p === '/api/hosts/sync/run') {
     // Syncs now, or with sync turned off retries removing names a failed removal left behind.

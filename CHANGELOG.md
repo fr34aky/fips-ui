@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **fips-ui updates itself**: the server looks up the newest fips-ui release on
+  GitHub every 6 hours; a newer one shows as "vX available" next to the version
+  in the sidebar. On the Upgrade page admins see the release notes and **Update**:
+  the git checkout is fast-forwarded to the release tag (refused when it has
+  local changes or commits not in the release), dependencies are reinstalled if
+  they changed, the UI is rebuilt (rolled back if that fails) and the service
+  restarts by itself under systemd. A newer privileged helper is reported, since
+  only `sudo ./deploy/setup-local.sh` can install it.
+
 - **Hosts-file sync from a master node** (Access → Hosts file): followers fetch
   the master's names over the mesh every few minutes and keep them in a marked
   block at the end of their hosts file; local entries stay, and on a duplicate

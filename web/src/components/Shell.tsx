@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff } from 'lucide-react';
 import type { ConnState } from '../lib/api';
 import type { Principal } from '../lib/types';
+import { useUiUpdate } from '../lib/uiUpdate';
 
 export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'upgrade' | 'config' | 'firewall';
 
@@ -72,7 +73,7 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
             <button className="btn ghost icon sm" onClick={toggleTheme} aria-label="Toggle theme" title="Toggle theme">{theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}</button>
           </div>
           {principal?.kind === 'mesh' && <div className="mt-2 flex items-center gap-1.5" title={principal.npub}><span className={`chip ${principal.role === 'admin' ? 'accent' : ''}`}><span className="chip-dot" />via mesh · {principal.label || `${principal.npub.slice(0, 12)}…`} · {principal.role}</span></div>}
-          {uiVersion && <div className="mt-2"><a href="https://github.com/fr34aky/fips-ui/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" className="hover:text-ink" title="Changelog">fips-ui v{uiVersion}</a></div>}
+          {uiVersion && <div className="mt-2 flex flex-wrap items-center gap-1.5"><a href="https://github.com/fr34aky/fips-ui/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" className="hover:text-ink" title="Changelog">fips-ui v{uiVersion}</a><UiUpdateBadge admin={principal?.role !== 'viewer'} /></div>}
         </div>
       </aside>
       {open && <div className="fixed inset-0 z-30 lg:hidden" style={{ background: 'rgba(3,8,18,0.5)' }} onClick={() => setOpen(false)} />}
@@ -94,4 +95,11 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
       </div>
     </div>
   );
+}
+
+/** "v0.4.0 available" next to the version: admins go to the Upgrade page, others to the release notes. */
+function UiUpdateBadge({ admin }: { admin: boolean }) {
+  const u = useUiUpdate();
+  if (!u?.newer || !u.latest) return null;
+  return <a className="chip accent" href={admin ? '#/upgrade' : u.latest.url} target={admin ? undefined : '_blank'} rel="noreferrer" title={admin ? 'Update fips-ui from the Upgrade page' : 'Release notes'}>v{u.latest.version} available</a>;
 }
