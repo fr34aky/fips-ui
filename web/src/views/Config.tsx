@@ -81,7 +81,7 @@ export default function Config({ readOnly }: { readOnly: boolean }) {
   return (
     <div className="grid gap-4 fade-in">
       <div className="flex flex-wrap items-center gap-3">
-        <p className="text-ink-2 text-sm max-w-3xl">Edit <code>/etc/fips/fips.yaml</code>. Secret values stay on the node: they are shown as <code>{REDACTED}</code> placeholders, and restored on save as long as each stays under its key and entry. Applying backs up the current file, restarts the daemon and <b>rolls back automatically</b> if it does not stay up. See the <a className="underline hover:text-ink" href="https://github.com/jmcorgan/fips/blob/master/docs/reference/configuration.md" target="_blank" rel="noreferrer">configuration reference</a>.</p>
+        <p className="text-ink-2 text-sm max-w-3xl">Edit <code>{helper?.configPath ?? cfg.data?.path ?? "/etc/fips/fips.yaml"}</code>. Secret values stay on the node: they are shown as <code>{REDACTED}</code> placeholders, and restored on save as long as each stays under its key and entry. Applying backs up the current file, restarts the daemon and <b>rolls back automatically</b> if it does not stay up. See the <a className="underline hover:text-ink" href="https://github.com/jmcorgan/fips/blob/master/docs/reference/configuration.md" target="_blank" rel="noreferrer">configuration reference</a>.</p>
         {!readOnly && helper?.managementCapable && <button className="btn ml-auto" disabled={busy} onClick={() => setConfirm('restart')}><Power size={15} />Restart node</button>}
       </div>
 

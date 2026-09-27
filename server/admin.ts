@@ -174,7 +174,16 @@ export interface AdminOptions {
   busy: () => string | null;
 }
 
-export type HelperInfo = { installed: boolean; available: boolean; version: number | null; error?: string; managementCapable: boolean };
+/** What the installed helper can do on this system (reported by helper v8+, derived for older ones). */
+export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
+const NO_FEATURES: HelperFeatures = { config: false, hosts: false, services: false, firewall: 'none', guard: 'none' };
+export type HelperInfo = {
+  installed: boolean; available: boolean; version: number | null; error?: string;
+  /** Configuration editor and node management: helper v4+ with a service manager it handles. */
+  managementCapable: boolean;
+  features: HelperFeatures;
+  serviceManager?: string; configPath?: string; hostsPath?: string;
+};
 
 export function createAdminHandler(opts: AdminOptions) {
   const helperPath = opts.helperPath ?? process.env.FIPS_UI_HELPER ?? '/usr/local/libexec/fips-ui-helper';
@@ -191,13 +200,27 @@ export function createAdminHandler(opts: AdminOptions) {
 
   async function checkHelper(): Promise<HelperInfo> {
     let value: HelperInfo;
-    if (!existsSync(helperPath)) value = { installed: false, available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false };
+    if (!existsSync(helperPath)) value = { installed: false, available: false, version: null, error: `helper not installed at ${helperPath}`, managementCapable: false, features: NO_FEATURES };
     else {
       const r = await runHelper(helperPath, ['check'], undefined, 15_000);
-      if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false };
+      if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false, features: NO_FEATURES };
       else {
-        try { const j = lastJson<{ ok: boolean; version: number }>(r.stdout); value = { installed: true, available: j.ok, version: j.version, managementCapable: j.ok && j.version >= MIN_HELPER_VERSION, error: j.version < MIN_HELPER_VERSION ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh` : undefined }; }
-        catch { value = { installed: true, available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false }; }
+        try {
+          const j = lastJson<{ ok: boolean; version: number; service_manager?: string; config_path?: string; hosts_path?: string; features?: Partial<HelperFeatures> }>(r.stdout);
+          const systemd = j.service_manager === 'systemd';
+          // Helpers before v8 do not report features: they did everything with systemd, nothing without it.
+          const f: HelperFeatures = j.features
+            ? { ...NO_FEATURES, ...j.features }
+            : { config: systemd, hosts: systemd && j.version >= 6, services: systemd, firewall: systemd ? 'nft' : 'none', guard: systemd && j.version >= 5 ? 'nft' : 'none' };
+          const tooOld = j.version < MIN_HELPER_VERSION;
+          value = {
+            installed: true, available: j.ok, version: j.version, features: f,
+            managementCapable: j.ok && !tooOld && f.config,
+            serviceManager: j.service_manager, configPath: j.config_path ?? '/etc/fips/fips.yaml', hostsPath: j.hosts_path ?? '/etc/fips/hosts',
+            error: tooOld ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh`
+              : !f.config ? `node management is not supported with ${j.service_manager ?? 'this service manager'}` : undefined,
+          };
+        } catch { value = { installed: true, available: false, version: null, error: 'helper returned invalid JSON', managementCapable: false, features: NO_FEATURES }; }
       }
     }
     helperCache = { at: Date.now(), value };
@@ -260,7 +283,7 @@ export function createAdminHandler(opts: AdminOptions) {
           if (yaml.code !== 0) throw new Error(helperError(yaml));
           const nl = yaml.stdout.indexOf('\n');
           const base = /^base [0-9a-f]{64}$/.test(yaml.stdout.slice(0, nl)) ? yaml.stdout.slice(5, nl) : '';
-          sendJson(res, 200, { yaml: base ? yaml.stdout.slice(nl + 1) : yaml.stdout, base, backups, path: '/etc/fips/fips.yaml' }); return true;
+          sendJson(res, 200, { yaml: base ? yaml.stdout.slice(nl + 1) : yaml.stdout, base, backups, path: (await helperInfo()).configPath ?? '/etc/fips/fips.yaml' }); return true;
         }
         if (sub === '/config/backup') {
           await requireHelper();

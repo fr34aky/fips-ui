@@ -43,7 +43,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=7
+HELPER_VERSION=8
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -137,6 +137,57 @@ rc_script() {
   rm -f "$out"
   return $rc
 }
+svc_start() {
+  case "$SM" in
+    systemd) systemctl start "$1" 9>&- ;;
+    launchd) launchctl kickstart "system/$1" 9>&- ;;
+    rc)      rc_script service "$1" onestart ;;
+    pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" start ;;
+    openrc)  rc-service "$1" start 9>&- ;;
+    *) return 1 ;;
+  esac
+}
+svc_stop() {
+  case "$SM" in
+    systemd) systemctl stop "$1" ;;
+    launchd) launchctl kill TERM "system/$1" ;;
+    rc)      rc_script service "$1" onestop ;;
+    pfsense) rc_script "/usr/local/etc/rc.d/$1.sh" stop ;;
+    openrc)  rc-service "$1" stop ;;
+    *) return 1 ;;
+  esac
+}
+# Start at boot or not. pfSense runs every rc.d/*.sh at boot itself (its own knob lives in fips.conf).
+svc_enable() { # <name> <true|false>
+  case "$SM" in
+    systemd) if $2; then systemctl enable "$1"; else systemctl disable "$1"; fi ;;
+    launchd) if $2; then launchctl enable "system/$1"; else launchctl disable "system/$1"; fi ;;
+    rc)      sysrc -q "${1}_enable=$($2 && echo YES || echo NO)" >/dev/null ;;
+    openrc)  if $2; then rc-update add "$1" default; else rc-update del "$1" default; fi ;;
+    *) return 1 ;;
+  esac
+}
+svc_enabled() {
+  case "$SM" in
+    systemd) systemctl is-enabled "$1" 2>/dev/null || true ;;
+    launchd) launchctl print-disabled system 2>/dev/null | grep -q "\"$1\" => \(true\|disabled\)" && echo disabled || echo enabled ;;
+    rc)      [[ "$(sysrc -n "${1}_enable" 2>/dev/null)" =~ ^[Yy][Ee][Ss]$ ]] && echo enabled || echo disabled ;;
+    pfsense) echo enabled ;;
+    openrc)  rc-update show default 2>/dev/null | grep -qw "$1" && echo enabled || echo disabled ;;
+    *) echo unknown ;;
+  esac
+}
+# The native service name for a fips unit id (fips, fips-dns, fips-gateway, fips-firewall), or nothing.
+svc_native() {
+  case "$SM:$1" in
+    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall) echo "$1.service" ;;
+    rc:fips|rc:fips-dns|rc:fips-gateway) echo "${1//-/_}" ;;
+    pfsense:fips) echo fips ;;
+    launchd:fips) echo "$SERVICE" ;;
+    launchd:fips-gateway) echo "$GATEWAY_SERVICE" ;;
+    openrc:fips|openrc:fips-dns|openrc:fips-gateway) echo "$1" ;;
+  esac
+}
 # 9>&- : a daemon started by the service manager must not inherit the helper lock.
 svc_restart() {
   case "$SM" in
@@ -218,10 +269,14 @@ install_package() {
 }
 
 # ---------------------------------------------------------------- node management (v4)
-FIPS_CONFIG=/etc/fips/fips.yaml
+case "$OS" in
+  FreeBSD|Darwin) FIPS_ETC=/usr/local/etc/fips ;;
+  *)              FIPS_ETC=/etc/fips ;;
+esac
+FIPS_CONFIG=$FIPS_ETC/fips.yaml
+FIPS_HOSTS=$FIPS_ETC/hosts
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
-FIPS_HOSTS=/etc/fips/hosts
 # Fixed per OS and deliberately not derived from FIPS_UI_BACKUPS, which sudo forwards from the caller.
 CONFIG_BACKUPS_DIR="$(dirname "$BACKUPS_DEFAULT")/config-backups"
 LOCK_FILE=/var/run/fips-ui-helper.lock
@@ -240,9 +295,37 @@ fi
 
 # One privileged change at a time, across every caller (UI, upgrade jobs, a second tab, a shell).
 take_lock() {
-  command -v flock >/dev/null 2>&1 || return 0
-  exec 9>"$LOCK_FILE"
-  flock -w 10 9 || die "another privileged operation is in progress"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock -w 10 9 || die "another privileged operation is in progress"
+    return 0
+  fi
+  # No flock (FreeBSD, macOS): a lock directory holding the owner's pid. A lock whose owner is gone is taken
+  # over, so it needs no cleanup on exit (which the verbs' own EXIT traps would replace).
+  local d="$LOCK_FILE.d" i
+  for i in $(seq 1 50); do
+    if mkdir "$d" 2>/dev/null; then echo $$ > "$d/pid"; return 0; fi
+    local owner; owner=$(cat "$d/pid" 2>/dev/null || true)
+    if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$d"; continue; fi
+    sleep 0.2
+  done
+  die "another privileged operation is in progress"
+}
+
+# Portable pieces: GNU coreutils on Linux, BSD tools on FreeBSD and macOS.
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  elif command -v sha256 >/dev/null 2>&1; then sha256 -q
+  else shasum -a 256 | cut -d' ' -f1; fi
+}
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+# "<octal mode> <uid> <gid>" of a file, to write its replacement with the same ones.
+file_perms() { stat -c '%a %u %g' "$1" 2>/dev/null || stat -f '%Lp %u %g' "$1"; }
+# Keep the newest <n> of the files matching a glob (no xargs -r, which BSD/macOS xargs may lack).
+keep_newest() { # <n> <glob...>
+  local n=$1 i=0 f; shift
+  for f in $(ls -1t "$@" 2>/dev/null); do i=$((i + 1)); (( i > n )) && rm -f -- "$f"; done
+  return 0
 }
 
 # Secret redaction, decided from the parsed YAML tree (PyYAML's safe composer), never from line text. Each
@@ -776,8 +859,16 @@ read_stdin_limited() { # <dest> <max-bytes>
   (( n > 0 )) || die "empty input"
 }
 
+# The daemon's last log lines since <epoch>: the journal under systemd, its log file elsewhere.
 journal_tail_json() { # <unit> <since-epoch>
-  local out; out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  local out=""
+  if [[ "$SM" == systemd ]]; then out=$(journalctl -u "$1" --since "@$2" -n 25 --no-pager -o cat 2>/dev/null || true)
+  else
+    local f
+    for f in "$(sysrc -n fips_logfile 2>/dev/null || true)" /var/log/fips.log /var/log/fips/fips.log /usr/local/var/log/fips/fips.log; do
+      [[ -n "$f" && -f "$f" ]] && { out=$(tail -n 25 "$f" 2>/dev/null || true); break; }
+    done
+  fi
   json_escape "$out"
 }
 
@@ -793,20 +884,27 @@ wait_fips_healthy() {
   # With the control socket disabled (node.control.enabled: false) only "active without restarts" can be checked.
   local probe=true; [[ "$sock" == "-" ]] && probe=false
   sleep 3
-  restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+  # "Did it restart?": systemd counts restarts; elsewhere the daemon's pid must stay the same.
+  restart_marker() {
+    if [[ "$SM" == systemd ]]; then systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0
+    else "$(fipsctl_bin)" "${args[@]}" show status 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null || echo ""; fi
+  }
+  restarts=$(restart_marker)
   while (( $(date +%s) < deadline )); do
-    if systemctl is-active --quiet "$SERVICE" && [[ "$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)" == "$restarts" ]] \
+    if svc_active "$SERVICE" && [[ "$(restart_marker)" == "$restarts" ]] \
        && { ! $probe || "$(fipsctl_bin)" "${args[@]}" show status >/dev/null 2>&1; }; then
       ok=$((ok + 1)); (( ok >= 8 )) && return 0
     else
-      ok=0; restarts=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null || echo 0)
+      ok=0; restarts=$(restart_marker)
     fi
     sleep 1
   done
   return 1
 }
 
-require_systemd() { [[ "$SM" == systemd ]] || die "node management verbs need systemd (found $SM)"; }
+require_systemd() { [[ "$SM" == systemd ]] || die "this needs systemd (found $SM)"; }
+# Configuration, hosts file and services: every service manager whose restart and health the helper handles.
+require_managed() { case "$SM" in systemd|rc|pfsense|launchd) ;; *) die "node management is not supported with $SM" ;; esac; }
 valid_id() { [[ "$1" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid backup id"; }
 
 # backup_config [keep-id]: never prunes <keep-id> (the backup about to be restored).
@@ -824,21 +922,26 @@ backup_config() {
 # install_config_and_restart <file> <backup-id> <restart:true|false>
 # Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
 # Replace fips.yaml atomically: a temp file in the same directory, then rename (never a half-written file).
-put_config() { install -m 0600 -o 0 -g 0 "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"; }
+put_config() {
+  # Same mode and owner as the file it replaces (root:root 0600 when there is none).
+  local m=600 u=0 g=0
+  [[ -f "$FIPS_CONFIG" ]] && read -r m u g < <(file_perms "$FIPS_CONFIG")
+  install -m "$m" -o "$u" -g "$g" "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"
+}
 
 install_config_and_restart() {
   trap '' INT TERM HUP
   put_config "$1"
   if [[ "$3" != true ]]; then printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":false}\n' "$(json_escape "$2")"; return; fi
   local start; start=$(date +%s)
-  systemctl restart "$SERVICE" || true
+  svc_restart "$SERVICE" || true
   if wait_fips_healthy; then
     printf '{"ok":true,"changed":true,"backup_id":%s,"restarted":true}\n' "$(json_escape "$2")"; return
   fi
   local log; log=$(journal_tail_json "$SERVICE" "$start")
   log "daemon unhealthy with the new config; restoring backup $2"
   put_config "$CONFIG_BACKUPS_DIR/$2.yaml"
-  systemctl restart "$SERVICE" || true
+  svc_restart "$SERVICE" || true
   local back=false; wait_fips_healthy && back=true
   printf '{"ok":false,"changed":false,"rolled_back":true,"backup_id":%s,"restored_healthy":%s,"error":"the daemon did not stay up with the new configuration","journal":%s}\n' "$(json_escape "$2")" "$back" "$log"
 }
@@ -882,9 +985,15 @@ cmd=${1:-}
 case "$cmd" in
   check)
     ensure_backups_dir
-    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s}\n' \
+    # What this system supports: configuration, hosts file and services with any managed service manager;
+    # the firewall and the mesh-access guard with nftables (Linux).
+    managed=false; ( require_managed ) >/dev/null 2>&1 && managed=true
+    fw=none; [[ "$SM" == systemd ]] && command -v nft >/dev/null 2>&1 && fw=nft
+    guard=none; command -v nft >/dev/null 2>&1 && guard=nft
+    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s}}\n' \
       "$HELPER_VERSION" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
-      "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")"
+      "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")" \
+      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")"
     ;;
 
   install)
@@ -948,7 +1057,7 @@ case "$cmd" in
     ;;
 
   config-apply)
-    require_systemd; take_lock
+    require_managed; take_lock
     restart=true; base=""; shift
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -981,7 +1090,7 @@ case "$cmd" in
     ;;
 
   config-restore)
-    require_systemd; take_lock
+    require_managed; take_lock
     valid_id "${2:-}"; f="$CONFIG_BACKUPS_DIR/$2.yaml"; [[ -f "$f" ]] || die "config backup $2 not found"
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; cp -p "$f" "$tmp"
     id=$(backup_config "$2")
@@ -1013,7 +1122,7 @@ case "$cmd" in
     ;;
 
   hosts-apply)
-    require_systemd; take_lock
+    require_managed; take_lock
     [[ "${2:-}" == --base && "${3:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "usage: hosts-apply --base <sha256|none>"
     base=$3
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
@@ -1024,14 +1133,14 @@ case "$cmd" in
     { [[ -f "$FIPS_HOSTS" ]] && tr -d '\r' < "$FIPS_HOSTS"; } > "$cur_lines" || true
     bad=$(tr -d '\r' < "$tmp" | grep -nvxFf "$cur_lines" | grep -vE '^[0-9]+:[[:space:]]*(#.*)?$|^[0-9]+:[[:space:]]*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[[:space:]]+npub1[02-9ac-hj-np-z]{58}[[:space:]]*(#.*)?$' | head -n 3 || true)
     [[ -z "$bad" ]] || die "invalid hosts line(s): $(printf '%s' "$bad" | tr '\n' ' ')"
-    cur=none; [[ -f "$FIPS_HOSTS" ]] && cur=$(sha256sum < "$FIPS_HOSTS" | cut -d' ' -f1)
+    cur=none; [[ -f "$FIPS_HOSTS" ]] && cur=$(sha256_stdin < "$FIPS_HOSTS")
     [[ "$cur" == "$base" ]] || die "$FIPS_HOSTS changed since it was read; reload and make the change again"
     if [[ -f "$FIPS_HOSTS" ]] && cmp -s "$tmp" "$FIPS_HOSTS"; then printf '{"ok":true,"changed":false}\n'; exit 0; fi
     if [[ -f "$FIPS_HOSTS" ]]; then
       mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
       cp -p "$FIPS_HOSTS" "$CONFIG_BACKUPS_DIR/hosts-$(date +%Y%m%d-%H%M%S)"
       # Keep the newest 20 hosts backups.
-      ls -1t "$CONFIG_BACKUPS_DIR"/hosts-* 2>/dev/null | tail -n +21 | xargs -r rm -f --
+      keep_newest 20 "$CONFIG_BACKUPS_DIR"/hosts-*
     fi
     mkdir -p "$(dirname "$FIPS_HOSTS")"
     install -m 0644 -o 0 -g 0 "$tmp" "$FIPS_HOSTS.fips-ui.new" && mv -f "$FIPS_HOSTS.fips-ui.new" "$FIPS_HOSTS"
@@ -1047,15 +1156,23 @@ case "$cmd" in
     ;;
 
   service)
-    require_systemd; take_lock
+    require_managed; take_lock
     trap '' INT TERM HUP
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
     case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
-    systemctl cat "$unit.service" >/dev/null 2>&1 || die "$unit.service is not installed"
-    if [[ "$action" == reload ]]; then systemctl reload-or-restart "$unit.service"; else systemctl "$action" "$unit.service"; fi
-    a=false; systemctl is-active --quiet "$unit.service" && a=true
-    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$unit.service")" "$a" "$(json_escape "$(systemctl is-enabled "$unit.service" 2>/dev/null || true)")"
+    # The unit's name under this service manager; a unit this system does not have is refused.
+    native=$(svc_native "$unit")
+    [[ -n "$native" ]] && svc_exists "$native" || die "$unit is not installed as a service here ($SM)"
+    case "$action" in
+      start)   svc_start "$native" ;;
+      stop)    svc_stop "$native" ;;
+      restart) svc_restart "$native" ;;
+      reload)  if [[ "$SM" == systemd ]]; then systemctl reload-or-restart "$native"; else svc_restart "$native"; fi ;;
+      enable|disable) svc_enable "$native" "$([[ "$action" == enable ]] && echo true || echo false)" || die "$action is not supported with $SM" ;;
+    esac
+    a=false; svc_active "$native" && a=true
+    printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$native")" "$a" "$(json_escape "$(svc_enabled "$native")")"
     ;;
 
   mesh-guard)

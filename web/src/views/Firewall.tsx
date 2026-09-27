@@ -14,7 +14,8 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
   const toast = useToast();
   const status = usePoll(() => adminApi.status(), [], 30000);
   const helper = status.data?.helper;
-  const fw = usePoll(() => (helper?.managementCapable ? adminApi.firewall() : Promise.resolve(null)), [helper?.managementCapable], 10000);
+  const fwOk = !!helper?.managementCapable && (helper.features ? helper.features.firewall !== 'none' : true);
+  const fw = usePoll(() => (fwOk ? adminApi.firewall() : Promise.resolve(null)), [fwOk], 10000);
   const [ruleDialog, setRuleDialog] = useState<{ index: number | null; initial: Partial<FirewallRule> } | null>(null);
   const [dropinEdit, setDropinEdit] = useState<{ name: string; content: string; isNew: boolean } | null>(null);
   const [confirm, setConfirm] = useState<null | { title: string; body: React.ReactNode; label: string; run: () => Promise<void> }>(null);
@@ -43,7 +44,7 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
   return (
     <div className="grid gap-4 fade-in">
       <p className="text-ink-2 text-sm max-w-3xl">The fips0 firewall is the default-deny nftables baseline at <code>/etc/fips/fips.nft</code>: nothing a mesh peer initiates gets in unless a drop-in in <code>/etc/fips/fips.d/</code> allows it. Every change is checked with <code>nft -c</code> against the full ruleset before it is written, and reloaded if the firewall is running.</p>
-      <HelperGate helper={helper}>
+      <HelperGate helper={helper} need="firewall">
         {fw.error && <ErrorNote>{fw.error}</ErrorNote>}
         {lastError && <div className="card px-4 py-3 text-sm grid gap-2" style={{ borderColor: 'rgba(208,59,59,0.5)' }}><div className="text-crit font-medium">{lastError.error}</div>{lastError.detail && <pre className="text-xs whitespace-pre-wrap bg-surface-2 rounded-lg p-3 max-h-48 overflow-auto">{lastError.detail}</pre>}</div>}
 

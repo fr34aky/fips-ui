@@ -1,7 +1,8 @@
 // Client for the node-management API (server/admin.ts).
 import { api } from './api';
 
-export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean }
+export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
+export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string }
 export interface ConfigBackup { id: string; size: number; mtime: number }
 export interface ApplyResult { ok: boolean; changed?: boolean; restarted?: boolean; backup_id?: string; rolled_back?: boolean; restored_healthy?: boolean; error?: string; journal?: string }
 export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?: string; addr?: string } | { kind: 'prefix'; prefix: string; label?: string };
