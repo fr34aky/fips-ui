@@ -3,12 +3,15 @@
 // involved: the checkout belongs to the UI's user. A newer privileged helper still has to be installed by an
 // admin (sudo ./deploy/setup-local.sh); the UI only reports that it is needed.
 import { execFile, spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const REPO = process.env.FIPS_UI_REPO ?? 'fr34aky/fips-ui';
 const CHECK_MS = 6 * 60 * 60_000;
 const TAG_RE = /^v\d+\.\d+\.\d+$/;
+// The service runs with NODE_ENV=production, in which npm ci leaves out devDependencies, and the build tools
+// (TypeScript, Vite) are devDependencies: include them explicitly.
+const NPM_CI = ['ci', '--prefix', 'web', '--include=dev', '--no-audit', '--no-fund'];
 
 export interface Release { tag: string; version: string; url: string; publishedAt: string; notes: string }
 export interface InstallMode { mode: 'git' | 'manual'; reason?: string; branch?: string }
@@ -84,6 +87,8 @@ export class SelfUpdate {
     catch { return null; }
   }
 
+  private hasBuildTools(): boolean { return existsSync(path.join(this.root, 'web', 'node_modules', '.bin', 'tsc')) && existsSync(path.join(this.root, 'web', 'node_modules', '.bin', 'vite')); }
+
   /** Start the checkout's server in self-test mode (FIPS_UI_SELFTEST=1) and wait for it to report that it runs. */
   private selftest(): Promise<{ ok: boolean; out: string }> {
     return new Promise((resolve) => {
@@ -136,7 +141,8 @@ export class SelfUpdate {
       moved = true;
       const changed = await run('git', ['diff', '--name-only', before, 'HEAD'], this.root, 10_000);
       depsChanged = /(^|\n)(web\/)?package(-lock)?\.json(\n|$)/.test(changed.out);
-      if (depsChanged) await step('npm ci (web)', 'npm', ['ci', '--prefix', 'web', '--no-audit', '--no-fund'], 600_000);
+      // Also when the build tools are missing (a previous install without them): the build needs them.
+      if (depsChanged || !this.hasBuildTools()) await step('npm ci (web)', 'npm', NPM_CI, 600_000);
       await step('npm run build', 'npm', ['run', 'build'], 600_000);
       // The web build does not compile the server: start the new server once, without side effects, before the
       // service is restarted on it.
@@ -157,7 +163,7 @@ export class SelfUpdate {
         // Put the previous version back (the tree was clean and only fast-forwarded) and rebuild it.
         job.log.push(`rolling back to ${before.slice(0, 10)}`);
         await run('git', ['reset', '--hard', before], this.root, 60_000);
-        if (depsChanged) await run('npm', ['ci', '--prefix', 'web', '--no-audit', '--no-fund'], this.root, 600_000);
+        if (depsChanged || !this.hasBuildTools()) await run('npm', NPM_CI, this.root, 600_000);
         const rb = await run('npm', ['run', 'build'], this.root, 600_000);
         job.log.push(rb.code === 0 ? 'previous version rebuilt' : `rebuilding the previous version failed; in ${this.root} run: npm ci --prefix web && npm run build`);
       }
