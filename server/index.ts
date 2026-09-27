@@ -13,7 +13,7 @@ import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
-import { HostsFollowers, isSyncRequest, parseSubtree } from './hosts-followers.ts';
+import { HostsFollowers, isSyncRequest, parseSubtree, syncRole } from './hosts-followers.ts';
 import { SelfUpdate } from './self-update.ts';
 import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
@@ -438,7 +438,7 @@ async function route(req: Req, res: Res) {
     const chain = own ? await hostsSync.chainFor(own) : undefined;
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;
-    return json(res, 200, { ...hostsView(h), ...(chain ? { chain } : {}), ...(write !== undefined ? { write } : {}) });
+    return json(res, 200, { ...hostsView(h), ...(chain ? { chain, chainComplete: hostsSync.chainComplete() } : {}), ...(write !== undefined ? { write } : {}) });
   }
   if (p === '/api/hosts/followers' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
@@ -454,7 +454,8 @@ async function route(req: Req, res: Res) {
   }
   if (p === '/api/hosts/sync' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
-    return json(res, 200, { config: hostsSync.config, status: hostsSync.status, file: hostsSync.file, own: lastSnapshot?.status && (lastSnapshot.status as { npub?: string }).npub });
+    const role = syncRole(hostsSync.config.enabled, await hostsFollowers.activeCount());
+    return json(res, 200, { config: hostsSync.config, status: hostsSync.status, file: hostsSync.file, own: lastSnapshot?.status && (lastSnapshot.status as { npub?: string }).npub, role });
   }
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {

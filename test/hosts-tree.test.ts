@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HostsFollowers, MAX_SUBTREE, parseSubtree } from '../server/hosts-followers.ts';
+import { HostsFollowers, MAX_SUBTREE, parseSubtree, syncRole } from '../server/hosts-followers.ts';
 
 const CHARS = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 // Distinct per seed: the seed's base-32 digits, padded with a fixed pattern.
@@ -65,4 +65,16 @@ test('large trees are capped and counted', async () => {
   const parsed = parseSubtree(header, B, A)!;
   assert.equal(parsed.below.length, MAX_SUBTREE);
   assert.equal(parsed.more, 20);
+});
+
+test('roles follow from syncing and having active followers', async () => {
+  assert.equal(syncRole(false, 2), 'master');
+  assert.equal(syncRole(true, 1), 'distribution');
+  assert.equal(syncRole(true, 0), 'follower');
+  assert.equal(syncRole(false, 0), 'none');
+  // Only followers that still sync count.
+  const b = store('b5');
+  await b.record(C, 'fd00::1', 1, { intervalMin: 5 });
+  (b as unknown as { map: Map<string, { lastSeen: number }> }).map.get(C)!.lastSeen = Date.now() - 60 * 60_000;
+  assert.equal(await b.activeCount(), 0);
 });

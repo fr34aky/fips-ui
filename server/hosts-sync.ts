@@ -26,8 +26,9 @@ export interface SyncStatus {
   nextAttempt?: number;
   /** The master and the nodes it syncs from in turn, nearest first (as the master reported it). */
   chain?: string[];
-  /** Whether `chain` is the master's own report; otherwise it is just the configured master (after a failed sync, or
-   *  from a master too old to send one), and what is above it is unknown. */
+  /** Whether `chain` is complete up to the master node: every node in it reported its own upstream (it travels up
+   *  as `chainComplete` in the sync answers). Otherwise the top of `chain` is only the highest node known (after a
+   *  failed sync somewhere, or through a node too old to report), and what is above it is unknown. */
   chainConfirmed?: boolean;
 }
 
@@ -58,7 +59,7 @@ export function validateSyncConfig(input: unknown): SyncConfig {
   const x = input as Partial<SyncConfig>;
   if (typeof x?.enabled !== 'boolean') throw new SyncError('enabled must be a boolean');
   const master = String(x.master ?? '').trim();
-  if (x.enabled && !NPUB_RE.test(master)) throw new SyncError('master must be an npub');
+  if (x.enabled && !NPUB_RE.test(master)) throw new SyncError('the node to sync from must be given by npub');
   const port = Number(x.port ?? 8321);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new SyncError('port must be an integer between 1 and 65535');
   const intervalMin = Number(x.intervalMin ?? 5);
@@ -87,6 +88,9 @@ export class HostsSync {
   constructor(deps: SyncDeps) { this.deps = deps; }
 
   get file(): string { return FILE; }
+
+  /** Whether the chain this node reports is known up to the master node (true on the master node itself). */
+  chainComplete(): boolean { return !this.config.enabled || this.status.chainConfirmed === true; }
 
   /** The chain this node reports to its own followers: itself, then its master and that master's chain. */
   async chainFor(own: string): Promise<string[]> {
@@ -168,7 +172,7 @@ export class HostsSync {
   }
 
   private async fetchMaster(master: string, port: number): Promise<{ valid: { hostname: string; npub: string }[]; skipped: number }> {
-    const addr = await this.deps.meshAddress(master).catch((e: Error) => { throw new SyncError(`cannot derive the master's address: ${e.message}`); });
+    const addr = await this.deps.meshAddress(master).catch((e: Error) => { throw new SyncError(`cannot derive the upstream node's address: ${e.message}`); });
     const url = `http://[${addr}]:${port}/api/hosts`;
     let res: Response;
     // The header tells the master this is a sync (it lists its followers), with this node's version and interval.
@@ -176,17 +180,17 @@ export class HostsSync {
     // And which nodes sync from this one in turn, so the master can show the whole tree below it.
     const subtree = await this.deps.subtree?.().catch(() => undefined);
     try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync', ...(subtree !== undefined ? { 'x-fips-ui-subtree': subtree } : {}) }, signal: AbortSignal.timeout(15_000) }); }
-    catch (e) { throw new SyncError(`cannot reach the master at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
-    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown } | null;
+    catch (e) { throw new SyncError(`cannot reach the upstream node at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
+    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown; chainComplete?: unknown } | null;
     if (res.status === 403) {
       const own = await this.deps.ownNpub().catch(() => undefined);
-      throw new SyncError(`the master refused this node${body?.error ? ` (${body.error})` : ''}: on the master, add ${own ?? "this node's npub"} as a viewer under Access → Web UI over the mesh, then use Sync now`, 'offline');
+      throw new SyncError(`the upstream node refused this node${body?.error ? ` (${body.error})` : ''}: on it, add ${own ?? "this node's npub"} as a viewer under Access → Web UI over the mesh, then use Sync now`, 'offline');
     }
     // 503: the master's mesh listener is up but not ready (guard reloading, identity unknown): a normal retry.
-    if (!res.ok || !Array.isArray(body?.entries)) throw new SyncError(`the master answered ${res.status}${body?.error ? `: ${body.error}` : ''}`);
+    if (!res.ok || !Array.isArray(body?.entries)) throw new SyncError(`the upstream node answered ${res.status}${body?.error ? `: ${body.error}` : ''}`);
     // A master that cannot read its own hosts file answers with no entries and an error: never take that as
     // "no names" (it would remove every synced name on every follower).
-    if (body.error) throw new SyncError(`the master cannot read its hosts file (${body.error}); keeping the names synced last`);
+    if (body.error) throw new SyncError(`the upstream node cannot read its hosts file (${body.error}); keeping the names synced last`);
     // Only well-formed entries are taken (the same rules as the editor); the last one wins on a duplicate name.
     const byName = new Map<string, string>();
     let skipped = 0;
@@ -203,11 +207,11 @@ export class HostsSync {
     const own = await this.deps.ownNpub().catch(() => undefined);
     if (own && chain.includes(own)) {
       const i = chain.indexOf(own);
-      throw new SyncError(`sync loop: ${i <= 1 ? 'the master' : `a node ${i} hops up (above the master)`} syncs its names from this node, so names would go round in a circle. Stop one of the syncs; this node keeps its current names`);
+      throw new SyncError(`sync loop: ${i <= 1 ? 'the upstream node' : `a node ${i} hops up (above the upstream node)`} syncs its names from this node, so names would go round in a circle. Stop one of the syncs; this node keeps its current names`);
     }
-    if (chain.length > MAX_CHAIN) throw new SyncError(`the chain of masters is longer than ${MAX_CHAIN} nodes; this node keeps its current names`);
+    if (chain.length > MAX_CHAIN) throw new SyncError(`the chain of upstream nodes is longer than ${MAX_CHAIN} nodes; this node keeps its current names`);
     this.status.chain = chain;
-    this.status.chainConfirmed = Array.isArray(body.chain);
+    this.status.chainConfirmed = Array.isArray(body.chain) && body.chainComplete === true;
     return { valid: [...byName].map(([hostname, npub]) => ({ hostname, npub })), skipped };
   }
 

@@ -48,8 +48,8 @@ peer ACL, firewall rules, the mesh-access list), it also shows the npub's hosts-
 for one npub the first in the file is shown. The daemon labels peers without a name by a shortened npub
 ("npub1ab...cdef"); fips-ui does not treat that as a name.
 
-## Syncing from a master
+## Syncing from another node
 
-Trusted nodes can copy the names of one master node into their own hosts file, in a tree of masters if
-needed: see [hosts-sync.md](hosts-sync.md). With names synced, the editor shows them read-only and folds the
+Trusted nodes can copy the names of another node into their own hosts file, in a tree below one master node
+with distribution nodes in between if needed: see [hosts-sync.md](hosts-sync.md). With names synced, the editor shows them read-only and folds the
 node's own entries into a "Local entries" line.
