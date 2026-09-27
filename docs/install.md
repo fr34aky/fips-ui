@@ -10,7 +10,7 @@ prerequisites come from and which service manager `deploy/setup-local.sh` sets u
 | [FreeBSD](#freebsd) | rc.d script `fips_ui` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | tested (FreeBSD 15.1 VM), smoke-tested in CI |
 | [pfSense](#pfsense) | boot script `rc.d/fips-ui.sh` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | untested (no CI image), see the warning |
 | [macOS](#macos) | LaunchDaemon `network.fips-ui` | the plist itself | `/usr/local/var/log/fips-ui.log` | experimental, smoke-tested in CI |
-| [Other Linux](#other-linux-openrc-openwrt) (OpenRC, OpenWrt) | nothing: run it by hand | – | – | read-only pages, smoke-tested in CI (Debian, Fedora, Arch, Alpine) |
+| [Other Linux](#other-linux-openrc-openwrt) (OpenRC, OpenWrt) | nothing: run it by hand | – | – | read-only pages; CI runs it by hand on Debian, Fedora, Arch and Alpine, not under OpenRC or OpenWrt |
 | [Windows](#windows) | nothing: run it by hand | – | – | experimental, smoke-tested in CI |
 
 What `setup-local.sh` does on every supported system:
@@ -112,8 +112,9 @@ over the mesh have not been tried on a Mac.
 
 ```sh
 brew install node git                     # node 22.18+
-# Configuration editor: PyYAML for the python3 the helper finds first on /usr/local/bin:/usr/bin
-sudo PIP_BREAK_SYSTEM_PACKAGES=1 $(PATH=/usr/local/bin:/usr/bin command -v python3) -m pip install pyyaml
+# Configuration editor: PyYAML for the python3 the helper finds on the service's PATH (node's directory first,
+# so Homebrew's python when node comes from Homebrew)
+sudo PIP_BREAK_SYSTEM_PACKAGES=1 $(PATH="$(dirname "$(command -v node)"):/usr/local/bin:/usr/bin" command -v python3) -m pip install pyyaml
 
 git clone https://github.com/fr34aky/fips-ui.git && cd fips-ui
 npm run install:all && npm run build

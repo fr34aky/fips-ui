@@ -57,12 +57,13 @@ jobs:
       - name: setup-local.sh
         run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
       - name: Smoke test
-        run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised | tee /tmp/smoke.out
+        run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised
       - name: Restart after the process dies
         run: |
+          killed=$(date +%s); sleep 1
           sudo systemctl kill -s KILL fips-ui.service
           sleep 5
-          node scripts/smoke-test.mjs --os linux --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
+          node scripts/smoke-test.mjs --os linux --daemon --helper --supervised --killed-at "$killed"
       - name: Logs
         if: failure()
         run: sudo journalctl -u fips-ui -u fips -n 80 --no-pager
@@ -162,10 +163,11 @@ jobs:
             chmod -R a+rX "$GITHUB_WORKSPACE"
             p=$GITHUB_WORKSPACE; while [ "$p" != / ]; do chmod a+x "$p"; p=$(dirname "$p"); done
             ./deploy/setup-local.sh smoke /usr/local/bin/node
-            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised | tee /tmp/smoke.out
+            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised
+            killed=$(date +%s); sleep 1
             pkill -KILL -u smoke node
             sleep 6
-            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)" \
+            node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised --killed-at "$killed" \
               || { tail -n 40 /var/log/fips-ui.log; exit 1; }
 
   macos:
@@ -191,12 +193,13 @@ jobs:
       - name: setup-local.sh
         run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
       - name: Smoke test
-        run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised | tee /tmp/smoke.out
+        run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised
       - name: Restart after the process dies
         run: |
+          killed=$(date +%s); sleep 1
           sudo pkill -KILL -u "$USER" -f 'server/index.ts'
           sleep 12
-          node scripts/smoke-test.mjs --os macos --daemon --helper --supervised --after-restart "$(sed -n 's/^uptime=//p' /tmp/smoke.out)"
+          node scripts/smoke-test.mjs --os macos --daemon --helper --supervised --killed-at "$killed"
       - name: Logs
         if: failure()
         run: tail -n 60 /usr/local/var/log/fips-ui.log || true

@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Smoke test against a running fips-ui (used by .github/workflows/smoke.yml, runnable by hand):
 //   node scripts/smoke-test.mjs [--url http://127.0.0.1:8321] [--os linux] [--daemon] [--helper] [--supervised]
-//                               [--after-restart <uiUptimeSecs seen before>]
+//                               [--killed-at <unix seconds>] [--token <FIPS_UI_TOKEN>]
 // --daemon      the fips daemon runs: health must report it
 // --helper      the privileged helper is installed: node management must be available with the shipped version
 // --supervised  fips-ui runs under a service that restarts it (the self-update can restart it)
+// --killed-at   its process was killed at this time: the answering server must have started after it
+// --token       FIPS_UI_TOKEN of the installation (default: the FIPS_UI_TOKEN environment variable)
 // Exits non-zero on the first failed check.
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -15,6 +17,7 @@ const args = process.argv.slice(2);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const flag = (name) => args.includes(name);
 const base = opt('--url') ?? 'http://127.0.0.1:8321';
+const token = opt('--token') ?? process.env.FIPS_UI_TOKEN;
 
 const expectVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 const shippedHelper = Number(/^HELPER_VERSION=(\d+)/m.exec(readFileSync(join(root, 'scripts/fips-ui-helper'), 'utf8'))?.[1]);
@@ -25,7 +28,7 @@ function check(name, ok, detail) {
   if (!ok) failed++;
 }
 async function get(path) {
-  const r = await fetch(base + path, { signal: AbortSignal.timeout(10_000) });
+  const r = await fetch(base + path, { signal: AbortSignal.timeout(10_000), headers: token ? { authorization: `Bearer ${token}` } : {} });
   const text = await r.text();
   let body = text; try { body = JSON.parse(text); } catch { /* html */ }
   return { status: r.status, body };
@@ -42,7 +45,10 @@ const h = health.body;
 check('server answers /api/health', true);
 check('uiVersion is the checkout\'s', h.uiVersion === expectVersion, `${h.uiVersion} (package.json ${expectVersion})`);
 if (opt('--os')) check('platform os', h.platform?.os === opt('--os'), h.platform);
-if (opt('--after-restart') !== undefined) check('restarted after its process exited', h.uiUptimeSecs < Number(opt('--after-restart')) || h.uiUptimeSecs < 30, `uptime ${h.uiUptimeSecs}s`);
+if (opt('--killed-at') !== undefined) {
+  const startedAt = Math.floor(Date.now() / 1000) - h.uiUptimeSecs;
+  check('restarted after its process was killed', startedAt >= Number(opt('--killed-at')) - 1, `started ${startedAt}, killed ${opt('--killed-at')}`);
+}
 if (flag('--daemon')) check('daemon reachable', h.ok === true && typeof h.version === 'string', h.error ?? `fips ${h.version}`);
 else console.log(`info daemon: ${h.ok ? `fips ${h.version}` : h.error}`);
 
@@ -77,5 +83,4 @@ check('/api/ui-update answers', upd.status === 200, upd.status);
 if (flag('--supervised')) check('self-update can restart fips-ui', upd.body?.canRestart === true, upd.body?.canRestart);
 
 console.log(failed ? `\n${failed} check(s) failed` : '\nall checks passed');
-console.log(`uptime=${h.uiUptimeSecs}`);
 process.exit(failed ? 1 : 0);
