@@ -12,6 +12,14 @@ In both cases the current binaries are backed up first (last 10 kept) and can be
 restored from the **Backups** table. After the restart the page waits for the
 control socket to answer and confirms the running version matches what was staged.
 
+## A machine without fips
+
+When no fips is installed, the page shows an **Install fips** card instead of the release and development
+sources: it installs the newest release through the helper (v9, verb `daemon-install`) with a persistent
+identity and the bootstrap peers you choose, starts it, and restarts fips-ui into the `fips` group. See
+[install.md](install.md#installing-the-fips-daemon). `POST /api/upgrade/install-daemon {"tag"?: "vX.Y.Z",
+"peers": ["npub1...@udp/host:port"]}` does the same (admin).
+
 ## OS support
 
 Cargo is portable, so the build path works on every OS Rust supports. The

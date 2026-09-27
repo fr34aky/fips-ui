@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Installing fips from scratch**: on a machine without the fips daemon,
-  `deploy/setup-local.sh` offers to install the newest fips release first
-  (`--install-fips` without asking): the .deb on Debian/Ubuntu, the tarball's
-  installer on other Linux with systemd, the FreeBSD, pfSense or macOS package,
-  checksum-verified, then started. `deploy/install-fips.sh` does that step on
-  its own.
+- **Installing fips from scratch** (helper v9, verb `daemon-install`): on a
+  machine without the fips daemon, `deploy/setup-local.sh` offers to install the
+  newest fips release, and the Upgrade page shows an **Install fips** card. The
+  helper downloads the official release itself (the .deb on Debian/Ubuntu, the
+  tarball's installer on other Linux with systemd, the FreeBSD, pfSense or macOS
+  package), checks it against the release's checksums, and before the first
+  start sets a persistent identity and the chosen bootstrap peers (optionally
+  the public test node) in `fips.yaml`. fips-ui then restarts into the `fips`
+  group. `deploy/install-fips.sh` does the step on its own.
+- Smoke tests for fresh installs, through `setup-local.sh` and through the
+  Upgrade page, on Linux (.deb and tarball), FreeBSD and macOS.
 
 ### Changed
 

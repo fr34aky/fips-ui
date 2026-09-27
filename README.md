@@ -26,7 +26,7 @@ to npubs throughout, and fips-ui can update itself to its newest release.
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
 | **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. Offers template merges from daemon upgrades that need review. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
-| **Upgrade** | Install the latest fips release (checksum-verified) or build any ref from source with cargo, with backups and rollback; afterwards `fips.yaml` is merged with the new version's template ([docs/upgrade.md](docs/upgrade.md)). Root steps go through a tiny helper you install once from a shell. Also updates **fips-ui itself** to its newest release, shown next to the version in the sidebar ([docs/self-update.md](docs/self-update.md)). |
+| **Upgrade** | Install the latest fips release (checksum-verified) or build any ref from source with cargo, with backups and rollback; afterwards `fips.yaml` is merged with the new version's template ([docs/upgrade.md](docs/upgrade.md)). Root steps go through a tiny helper you install once from a shell. On a machine without fips it **installs fips** itself, with a persistent identity and bootstrap peers ([docs/install.md](docs/install.md#installing-the-fips-daemon)). Also updates **fips-ui itself** to its newest release, shown next to the version in the sidebar ([docs/self-update.md](docs/self-update.md)). |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
 
@@ -114,8 +114,8 @@ Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are 
 
 On the machine where the checkout lives, one command installs the upgrade helper, a service running the UI
 from the checkout as your user (systemd, FreeBSD rc.d, pfSense boot script or macOS LaunchDaemon), and starts
-it. On a machine without fips it offers to install the newest fips release first (`--install-fips` skips the
-question). Per-system details are in [docs/install.md](docs/install.md):
+it. On a machine without fips it offers to install the newest fips release first, with a persistent identity
+and bootstrap peers (`--install-fips --fips-test-peer` for scripts), or leaves that to the Upgrade page. Per-system details are in [docs/install.md](docs/install.md):
 
 ```sh
 sudo ./deploy/setup-local.sh
