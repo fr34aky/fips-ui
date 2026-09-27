@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Web UI over the mesh**: a "From hosts file…" dropdown next to the npub field
   picks a hosts-file name (entries already allowed and this node are left out),
   and the field suggests hosts names while typing.
+- **Hosts file table**: a "Web UI" column shows each name's web UI access (not
+  allowed, viewer, admin) and admins change it right there; granting admin asks
+  for confirmation. The Access card and the table share one copy of the list.
 
 ## [0.3.0] - 2026-09-27
 

@@ -1,29 +1,30 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Globe, Plus, Save, Trash2, Undo2 } from 'lucide-react';
 import { Card, Chip, Copyable, Empty, ErrorNote, useToast } from './ui';
-import { api, usePoll } from '../lib/api';
+import { api } from '../lib/api';
+import { saveAccess, saveMessage, useAccess, type AccessConfig as Config, type AccessSaveResult as SaveResponse, type Role } from '../lib/access';
 import { shortKey } from '../lib/format';
-import type { Principal } from '../lib/types';
 import { NameText } from './PeerName';
 import { useHosts } from '../lib/names';
 
-type Role = 'viewer' | 'admin';
-interface Entry { npub: string; label?: string; role: Role }
-interface Config { enabled: boolean; port: number; allowed: Entry[] }
-interface Status { listening: boolean; address: string | null; npub: string | null; port: number; guard?: { active: boolean; ports: number[]; error?: string }; error?: string }
-interface AccessResponse { config?: Config; status?: Status; file?: string; you: Principal; firewallManaged?: boolean; helperVersion?: number | null; guardHelperVersion?: number }
-interface SaveResponse { config: Config; status: Status; firewall: { ok: boolean; skipped?: string; guard?: string; rule?: string } }
 
 export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
-  const r = usePoll(() => api.get<AccessResponse>('/api/access'), [], 10000);
+  const r = useAccess();
   const [draft, setDraft] = useState<Config | null>(null);
   const [busy, setBusy] = useState(false);
   const [add, setAdd] = useState({ id: '', label: '', role: 'viewer' as Role });
   const [lastFw, setLastFw] = useState<SaveResponse['firewall'] | null>(null);
   const hosts = useHosts().data?.entries ?? [];
   const data = r.data;
-  useEffect(() => { if (data?.config && !draft) setDraft(data.config); }, [data?.config, draft]);
+  // Follow the saved list (it can also change from the hosts table) while there are no unsaved edits here.
+  const lastSaved = useRef<string | null>(null);
+  useEffect(() => {
+    if (!data?.config) return;
+    const saved = JSON.stringify(data.config);
+    if (!draft || JSON.stringify(draft) === lastSaved.current) setDraft(data.config);
+    lastSaved.current = saved;
+  }, [data?.config]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!data) return <Card title="Web UI over the mesh">{r.error ? <ErrorNote>{r.error}</ErrorNote> : <Empty>Loading…</Empty>}</Card>;
   const you = data.you;
@@ -51,9 +52,9 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const save = async () => {
     setBusy(true); setLastFw(null);
     try {
-      const res = await api.post<SaveResponse>('/api/access', draft);
-      setDraft(res.config); setLastFw(res.firewall); r.refresh();
-      toast(res.firewall.ok ? 'ok' : 'info', res.firewall.ok ? 'Access saved; guard and firewall rule updated' : `Access saved; ${res.firewall.skipped ?? res.firewall.guard ?? res.firewall.rule ?? 'not fully applied yet'}`);
+      const res: SaveResponse = await saveAccess(draft);
+      setDraft(res.config); setLastFw(res.firewall);
+      const m = saveMessage(res); toast(m.tone, m.text);
     } catch (x) { toast('err', (x as Error).message); }
     finally { setBusy(false); }
   };
