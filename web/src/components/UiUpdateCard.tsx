@@ -60,7 +60,7 @@ export function UiUpdateCard({ readOnly }: { readOnly: boolean }) {
         {info.newer && !readOnly && info.install && (info.install.mode === 'git'
           ? <div className="flex flex-wrap items-center gap-3">
               <button className="btn primary" disabled={running || restarting} onClick={() => setConfirm(true)}><ArrowUpCircle size={15} />Update to v{latest!.version}</button>
-              <span className="text-xs text-ink-3">{info.canRestart ? 'The service restarts by itself afterwards; this page reloads when it is back.' : 'Not running under systemd: restart fips-ui yourself after the build.'}</span>
+              <span className="text-xs text-ink-3">{info.canRestart ? 'The service restarts by itself afterwards; this page reloads when it is back.' : 'Not running under a service that restarts it: restart fips-ui yourself after the build.'}</span>
             </div>
           : <p className="text-xs text-ink-3">This installation cannot update itself: {info.install.reason}.</p>)}
         {helperBehind && <ErrorNote>This version ships privileged helper v{info.helper!.shipped} (installed: {info.helper!.installed ? `v${info.helper!.installed}` : 'none'}). Some pages need it: run <code>sudo ./deploy/setup-local.sh</code> in {'the fips-ui directory'}.</ErrorNote>}

@@ -31,7 +31,7 @@ How the file is written:
 
 | System | How |
 | ------ | --- |
-| Linux with systemd | Through the privileged helper (`hosts-apply`, helper v6): every line is checked, the previous file is kept as a backup (newest 20), the new one installed root:root 0644 atomically. Install or update the helper with `sudo ./deploy/setup-local.sh`. |
+| Where the helper runs (Linux with systemd, FreeBSD, pfSense; macOS experimental) | Through the privileged helper (`hosts-apply`, helper v6): every line is checked, the previous file is kept as a backup (newest 20), the new one installed atomically, owned by root and mode 0644. Install or update the helper with `sudo ./deploy/setup-local.sh` ([install.md](install.md)). |
 | Everything else | Directly, when the UI's user may write the file (for example a group-writable file, or an elevated Windows service); the file keeps its owner, group and mode. Otherwise the page says what permission is missing. |
 
 ## Web UI access per name

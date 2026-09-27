@@ -35,7 +35,7 @@ Dark and light themes, responsive down to phone width, no external fonts or CDNs
 - Node.js 22.18+, 23.6+ or 24+ (the backend is TypeScript run directly by Node's unflagged type stripping; no build step for the server)
 - A running `fips` daemon; the UI user must be in the **`fips`** group to reach `/run/fips/control.sock`
 - `journalctl` access to the fips unit for the Logs page (membership in `systemd-journal`, or `adm` on Debian, or being the same user that runs the daemon)
-- For node management (Linux with systemd): the privileged helper (`sudo ./deploy/setup-local.sh`), `python3` with PyYAML for the configuration editor (Arch `python-yaml`, Debian/Ubuntu `python3-yaml`, Fedora `python3-pyyaml`), `nft` for the firewall
+- For node management: the privileged helper (`sudo ./deploy/setup-local.sh`, [docs/install.md](docs/install.md)), `bash`, `python3` with PyYAML for the configuration editor (Arch `python-yaml`, Debian/Ubuntu `python3-yaml`, Fedora `python3-pyyaml`), `nft` (Linux) or pf (FreeBSD, macOS) for the firewall
 - `git` for fips-ui's self-update and for merging `fips.yaml` with the template after daemon upgrades
 
 ## Operating systems
@@ -62,9 +62,9 @@ What works beyond the read-only pages:
 | Hosts-file editor | everywhere: through the helper where it runs, elsewhere directly when the UI may write the file |
 | fips.yaml template merge after daemon upgrades | where the helper applies the configuration (skipped elsewhere) |
 | Daemon upgrade | all of the above (tested on Linux) |
-| fips-ui self-update | everywhere from a git checkout; restarts itself only under systemd |
+| fips-ui self-update | everywhere from a git checkout; restarts itself under the services `setup-local.sh` installs |
 
-`deploy/setup-local.sh` is systemd-only; elsewhere install the helper with `sudo ./deploy/install-upgrade-helper.sh` ([docs/node-management.md](docs/node-management.md#systems)).
+`deploy/setup-local.sh` installs the helper and a service on Linux with systemd, FreeBSD, pfSense and macOS; installation per system, including OpenRC, OpenWrt and Windows, is in [docs/install.md](docs/install.md).
 
 ## Quick start
 
@@ -112,14 +112,15 @@ Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are 
 
 ## Running as a service
 
-On the machine where the checkout lives, one command installs the upgrade helper, a systemd unit
-running the UI from the checkout as your user, and starts it:
+On the machine where the checkout lives, one command installs the upgrade helper, a service running the UI
+from the checkout as your user (systemd, FreeBSD rc.d, pfSense boot script or macOS LaunchDaemon), and starts
+it; per-system details are in [docs/install.md](docs/install.md):
 
 ```sh
 sudo ./deploy/setup-local.sh
 ```
 
-For a dedicated service account instead:
+For a dedicated service account instead (Linux with systemd):
 
 ```sh
 sudo useradd -r -s /usr/sbin/nologin -G fips,systemd-journal fips-ui
@@ -186,7 +187,7 @@ server/        zero-dependency Node backend
   self-update.ts fips-ui's own updates        journal.ts, http.ts     log follower, HTTP helpers
 web/           Vite + React + Tailwind frontend (src/views/* one file per page, src/components/* shared, src/lib/* API and stores)
 scripts/       fips-ui-helper (the privileged helper), dev.mjs
-deploy/        setup-local.sh, systemd unit, helper installer, sudoers snippet
+deploy/        setup-local.sh (systemd, FreeBSD, pfSense, macOS), systemd unit, helper installer, sudoers snippet
 docs/          feature documentation, screenshots
 ```
 
@@ -194,6 +195,7 @@ docs/          feature documentation, screenshots
 
 | Document | Covers |
 | -------- | ------ |
+| [docs/install.md](docs/install.md) | Installing and running fips-ui as a service on Linux, FreeBSD, pfSense, macOS and Windows |
 | [docs/mesh-access.md](docs/mesh-access.md) | Web UI over the mesh: why no login is needed, roles, the spoofing guard |
 | [docs/hosts.md](docs/hosts.md) | The hosts-file editor, names next to npubs, web UI access per name |
 | [docs/hosts-sync.md](docs/hosts-sync.md) | Syncing names from a master, followers, chains of masters, loops, conflicts |

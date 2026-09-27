@@ -1,5 +1,5 @@
 // fips-ui updating itself: find the newest release on GitHub and, when the UI runs from a git checkout of that
-// repository, fast-forward it to the release tag, rebuild and let systemd restart the service. No privileges are
+// repository, fast-forward it to the release tag, rebuild and let the service manager restart it. No privileges are
 // involved: the checkout belongs to the UI's user. A newer privileged helper still has to be installed by an
 // admin (sudo ./deploy/setup-local.sh); the UI only reports that it is needed.
 import { execFile, spawn } from 'node:child_process';
@@ -125,7 +125,8 @@ export class SelfUpdate {
 
   /** Under systemd (Restart=on-failure) exiting with an error code restarts the service on the new code. */
   // INVOCATION_ID alone is also set in shells of a systemd session; a service's own process has systemd as parent.
-  get canRestart(): boolean { return !!process.env.INVOCATION_ID && process.ppid === 1; }
+  // FIPS_UI_SUPERVISED: set by the rc.d, pfSense and launchd services of deploy/setup-local.sh, which restart it too.
+  get canRestart(): boolean { return process.env.FIPS_UI_SUPERVISED === '1' || (!!process.env.INVOCATION_ID && process.ppid === 1); }
 
   /** Fast-forward to the release, install dependencies if they changed, build; roll back if anything fails. */
   async install(tag: string, onRestart: () => void): Promise<UpdateJob> {

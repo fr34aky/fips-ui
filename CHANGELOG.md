@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`deploy/setup-local.sh` on FreeBSD, pfSense and macOS**: besides a systemd
+  unit it now installs an rc.d service (FreeBSD, run by daemon(8)), a boot
+  script (pfSense) or a LaunchDaemon (macOS, experimental), with the helper, the
+  `fips` group and a health check, as on Linux.
+- **Installation guide per system** (`docs/install.md`): Linux, FreeBSD, pfSense,
+  macOS, OpenRC/OpenWrt and Windows.
+
+### Changed
+
+- fips-ui restarts itself after a self-update under any supervisor that sets
+  `FIPS_UI_SUPERVISED=1` (the services `setup-local.sh` installs), not only
+  under systemd.
+
+### Fixed
+
+- `setup-local.sh` ignores greetings a login shell prints (FreeBSD's fortune
+  tips) when it looks for node.
+
 ## [0.7.0] - 2026-09-27
 
 ### Added
