@@ -110,7 +110,8 @@ Experimental: the code paths exist but have not been tested on a Mac.
 
 ```sh
 brew install node git                     # node 22.18+
-sudo /usr/bin/python3 -m pip install pyyaml  # configuration editor (the helper uses the system python)
+# Configuration editor: PyYAML for the python3 the helper finds first on /usr/local/bin:/usr/bin
+sudo PIP_BREAK_SYSTEM_PACKAGES=1 $(PATH=/usr/local/bin:/usr/bin command -v python3) -m pip install pyyaml
 
 git clone https://github.com/fr34aky/fips-ui.git && cd fips-ui
 npm run install:all && npm run build
@@ -141,6 +142,9 @@ NODE_ENV=production node server/index.ts
 ```
 
 fips-ui can still update itself from the Upgrade page; restart it afterwards by hand.
+
+On Alpine and other musl systems the fips release binaries do not run (they are built for glibc); build the
+daemon from source there. fips-ui itself runs on Alpine's `nodejs-current`.
 
 ## Windows
 

@@ -87,7 +87,9 @@ jobs:
             deps: pacman -Syu --noconfirm --quiet git bash procps-ng python-yaml nodejs npm
           - distro: alpine
             image: alpine:latest
-            deps: apk add --no-cache git bash procps coreutils py3-yaml nodejs-current npm gcompat dbus-libs
+            deps: apk add --no-cache git bash procps coreutils py3-yaml nodejs-current npm
+            # fips ships no musl build for Alpine (the Linux tarball is glibc): the UI runs without a daemon.
+            no-daemon: true
     container:
       image: ${{ matrix.image }}
       options: --cap-add NET_ADMIN --device /dev/net/tun
@@ -103,6 +105,7 @@ jobs:
       - name: Node version
         run: node -v
       - name: Start the fips daemon (release tarball)
+        if: ${{ !matrix.no-daemon }}
         shell: bash
         run: |
           tar xzf /tmp/fips-pkg/fips-*-linux-x86_64.tar.gz -C /tmp
@@ -129,7 +132,7 @@ jobs:
         shell: bash
         run: |
           (NODE_ENV=production node server/index.ts >/tmp/fips-ui.log 2>&1 &)
-          node scripts/smoke-test.mjs --os linux --daemon
+          node scripts/smoke-test.mjs --os linux ${{ matrix.no-daemon && ' ' || '--daemon' }}
       - name: Logs
         if: failure()
         run: cat /tmp/fips-ui.log /tmp/fips.log || true
@@ -178,8 +181,10 @@ jobs:
       - name: Install the fips daemon (.pkg)
         run: |
           sudo installer -pkg /tmp/fips-pkg/fips-*-macos-arm64.pkg -target /
-          # The helper runs the system python (/usr/bin is on the service's PATH, Homebrew is not).
-          sudo /usr/bin/python3 -m pip install -q pyyaml
+          # PyYAML for the python3 the helper finds on the service's PATH (Homebrew's /opt/homebrew is not on it).
+          py=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v python3); echo "helper python: $py"
+          sudo PIP_BREAK_SYSTEM_PACKAGES=1 "$py" -m pip install -q pyyaml
+          sudo "$py" -I -c 'import yaml; print("PyYAML", yaml.__version__)'
           sleep 5; sudo launchctl list | grep -i fips || true; ls -l /var/run/fips || true
       - name: Build
         run: npm run install:all && npm run build
