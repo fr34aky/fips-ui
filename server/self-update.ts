@@ -1,5 +1,5 @@
 // fips-ui updating itself: find the newest release on GitHub and, when the UI runs from a git checkout of that
-// repository, fast-forward it to the release tag, rebuild and let systemd restart the service. No privileges are
+// repository, fast-forward it to the release tag, rebuild and let the service manager restart it. No privileges are
 // involved: the checkout belongs to the UI's user. A newer privileged helper still has to be installed by an
 // admin (sudo ./deploy/setup-local.sh); the UI only reports that it is needed.
 import { execFile, spawn } from 'node:child_process';
