@@ -74,7 +74,7 @@ export function Upgrade() {
         <div className="card p-4 grid gap-2 content-start">
           <div className="card-title">System</div>
           <dl className="kv">
-            <dt>Platform</dt><dd>{st ? `${st.platform.os} / ${st.platform.arch}` : '–'}</dd>
+            <dt>Platform</dt><dd>{st ? (st.platform.pfsense ? `pfSense (${st.platform.pfsense.abi})` : `${st.platform.os} / ${st.platform.arch}`) : '–'}</dd>
             <dt>Install path</dt><dd className="mono text-xs">{st?.platform.binDir ?? '–'}</dd>
             <dt>Installer</dt><dd>{st ? (st.helper.available ? <span className="chip good"><ShieldCheck size={12} />{st.platform.installer === 'helper' ? 'privileged helper' : 'elevated'}</span> : <span className="chip crit"><AlertTriangle size={12} />unavailable</span>) : '–'}</dd>
             {st?.package && <><dt>Package</dt><dd>{st.package.manager}: <span className="mono text-xs">{st.package.name}{st.package.version ? ` ${st.package.version}` : ''}</span></dd></>}
@@ -109,8 +109,10 @@ export function Upgrade() {
       {/* ---- sources ------------------------------------------------------- */}
       <section className="grid gap-4 lg:grid-cols-2">
         <ReleaseCard st={st} disabled={busy} onInstall={(ref, label) => setConfirm({ source: 'release', ref, label })} />
-        <MasterCard st={st} disabled={busy} toolchainOk={toolchainOk} missing={missingTools}
-          onInstall={(ref, label) => setConfirm({ source: 'master', ref, label })} />
+        {st?.platform.pfsense
+          ? <div className="card p-4 text-sm text-ink-2"><div className="card-title mb-2">Development build (master)</div>Not available on pfSense: there is no Rust toolchain there, and pfSense needs its own package ({st.platform.pfsense.tag ? <code>fips-…-pfsense-{st.platform.pfsense.tag}-{st.platform.arch}.pkg</code> : <>none is known for {st.platform.pfsense.abi}</>}). Install a release instead.</div>
+          : <MasterCard st={st} disabled={busy} toolchainOk={toolchainOk} missing={missingTools}
+              onInstall={(ref, label) => setConfirm({ source: 'master', ref, label })} />}
       </section>
 
       {/* ---- options ------------------------------------------------------- */}
@@ -201,7 +203,7 @@ function ReleaseCard({ st, disabled, onInstall }: { st: UpgradeStatus | null; di
         <>
           <div>
             <div className="text-2xl font-semibold tracking-tight flex items-center gap-2">{rel.tag}{rel.prerelease && <span className="chip warn">pre-release</span>}</div>
-            <div className="text-xs text-ink-2 mt-1">Published {fmtAgo(Date.parse(rel.publishedAt))} · {rel.asset ? <>{rel.asset.name} · {fmtBytes(rel.asset.size)}</> : <span className="text-serious">no artifact for {st.platform.os}/{st.platform.arch}</span>} · {rel.checksums ? 'checksum published' : 'no checksum file'} · <a href={rel.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-ink">release page <ExternalLink size={11} /></a></div>
+            <div className="text-xs text-ink-2 mt-1">Published {fmtAgo(Date.parse(rel.publishedAt))} · {rel.asset ? <>{rel.asset.name} · {fmtBytes(rel.asset.size)}</> : <span className="text-serious">{st.platform.pfsense ? `no pfSense package for ${st.platform.pfsense.abi} in this release` : `no artifact for ${st.platform.os}/${st.platform.arch}`}</span>} · {rel.checksums ? 'checksum published' : 'no checksum file'} · <a href={rel.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-ink">release page <ExternalLink size={11} /></a></div>
           </div>
           {rel.notes && (
             <div>
