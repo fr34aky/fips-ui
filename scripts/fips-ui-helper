@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fips-ui-helper — the only privileged part of the FIPS UI upgrade flow.
-# Linux (systemd / OpenRC), macOS (launchd) and FreeBSD (rc.d).
+# Linux (systemd / OpenRC), macOS (launchd), FreeBSD (rc.d) and pfSense (its rc.d/*.sh boot scripts).
 #
 # Installed root-owned at /usr/local/libexec/fips-ui-helper and reachable by
 # the UI user through a single NOPASSWD sudoers rule (deploy/sudoers.d/fips-ui).
@@ -43,7 +43,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=6
+HELPER_VERSION=7
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -93,6 +93,8 @@ fi
 # ---------------------------------------------------------------- service mgr
 detect_service_manager() {
   if [[ "$OS" == Darwin ]]; then echo launchd
+  # pfSense is FreeBSD underneath, but runs /usr/local/etc/rc.d/*.sh scripts itself instead of rc.conf services.
+  elif [[ "$OS" == FreeBSD ]] && grep -qi pfsense /etc/platform 2>/dev/null; then echo pfsense
   elif [[ "$OS" == FreeBSD ]]; then echo rc
   elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then echo systemd
   elif command -v rc-service >/dev/null 2>&1; then echo openrc
@@ -107,6 +109,7 @@ svc_exists() {
     systemd) systemctl cat "$1" >/dev/null 2>&1 ;;
     launchd) launchctl print "system/$1" >/dev/null 2>&1 || [[ -f "/Library/LaunchDaemons/$1.plist" ]] ;;
     rc)      service "$1" status >/dev/null 2>&1 || [[ -x "/usr/local/etc/rc.d/$1" ]] ;;
+    pfsense) [[ -x "/usr/local/etc/rc.d/$1.sh" ]] ;;
     openrc)  rc-service -e "$1" ;;
     sysv)    [[ -x "/etc/init.d/$1" ]] ;;
     *) return 1 ;;
@@ -117,6 +120,7 @@ svc_active() {
     systemd) systemctl is-active --quiet "$1" ;;
     launchd) launchctl print "system/$1" 2>/dev/null | grep -q 'state = running' ;;
     rc)      service "$1" status >/dev/null 2>&1 ;;
+    pfsense) "/usr/local/etc/rc.d/$1.sh" status >/dev/null 2>&1 ;;
     openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
     sysv)    "/etc/init.d/$1" status >/dev/null 2>&1 ;;
     *) return 1 ;;
@@ -128,6 +132,7 @@ svc_restart() {
     systemd) systemctl restart "$1" 9>&- ;;
     launchd) launchctl kickstart -k "system/$1" 9>&- ;;
     rc)      service "$1" restart 9>&- ;;
+    pfsense) "/usr/local/etc/rc.d/$1.sh" restart 9>&- ;;
     openrc)  rc-service "$1" restart 9>&- ;;
     sysv)    "/etc/init.d/$1" restart 9>&- ;;
     *) return 1 ;;

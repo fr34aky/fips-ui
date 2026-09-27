@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pfSense upgrades**: fips-ui treated pfSense like FreeBSD and would have
+  installed the FreeBSD package, which does not work there (it never starts at
+  boot). pfSense is now detected, and only the pfSense package for its ABI is
+  installed (`ce2.8`, `ce2.9-plus26` or `plus26`); a release without one is
+  refused. Source builds are not offered on pfSense. Helper v7 restarts fips
+  through pfSense's boot script (`rc.d/fips.sh`).
+
 ### Documentation
 
 - README brought up to date (features, requirements, what works on which system,

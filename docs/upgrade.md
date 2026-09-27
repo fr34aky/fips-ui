@@ -17,13 +17,31 @@ control socket to answer and confirms the running version matches what was stage
 Cargo is portable, so the build path works on every OS Rust supports. The
 OS-specific parts are isolated:
 
-| | Linux | macOS | FreeBSD | Windows |
-|---|---|---|---|---|
-| Release artifact | `fips-<v>-linux-<arch>.tar.gz` | `fips-<v>-macos-<arch>.pkg` (installed with `installer`) | `fips-<v>-freebsd-<arch>.pkg` (`pkg add`) | `fips-<v>-windows-<arch>.zip` |
-| Install dir | `/usr/bin` (or where `fips` is on PATH) | `/usr/local/bin` | `/usr/local/bin` | dir of `fips.exe` / `FIPS_BIN_DIR` |
-| Service restart | systemd (`fips.service`), OpenRC, SysV | launchd (`com.fips.daemon`) | rc.d (`service fips restart`) | SCM (`sc stop/start fips`) |
-| Privilege | helper via `sudo` | helper via `sudo` | helper via `sudo` | backend must run elevated |
-| Build deps install | pacman / apt / dnf / zypper / apk / emerge | Homebrew (no sudo) | `pkg` | winget |
+| | Linux | macOS | FreeBSD | pfSense | Windows |
+|---|---|---|---|---|---|
+| Release artifact | `fips-<v>-linux-<arch>.tar.gz` | `fips-<v>-macos-<arch>.pkg` (installed with `installer`) | `fips-<v>-freebsd-<arch>.pkg` (`pkg add`) | `fips-<v>-pfsense-<products>-<arch>.pkg` (`pkg add`), see below | `fips-<v>-windows-<arch>.zip` |
+| Install dir | `/usr/bin` (or where `fips` is on PATH) | `/usr/local/bin` | `/usr/local/bin` | `/usr/local/bin` | dir of `fips.exe` / `FIPS_BIN_DIR` |
+| Service restart | systemd (`fips.service`), OpenRC, SysV | launchd (`com.fips.daemon`) | rc.d (`service fips restart`) | its boot script (`/usr/local/etc/rc.d/fips.sh restart`) | SCM (`sc stop/start fips`) |
+| Privilege | helper via `sudo` | helper via `sudo` | helper via `sudo` | helper via `sudo` (install `bash` and `sudo` first) | backend must run elevated |
+| Build deps install | pacman / apt / dnf / zypper / apk / emerge | Homebrew (no sudo) | `pkg` | not supported: releases only | winget |
+
+### pfSense
+
+pfSense is FreeBSD underneath, but upstream's FreeBSD package does not work there (it never starts at boot and
+its DNS drop-in is never read), so fips publishes separate pfSense packages, named after the pfSense products
+an ABI serves. fips-ui detects pfSense (`/etc/platform`) and the FreeBSD ABI (from the kernel version) and
+installs only the matching one:
+
+| ABI | pfSense | Package |
+|---|---|---|
+| `FreeBSD:15:amd64` | CE 2.8 | `fips-<v>-pfsense-ce2.8-amd64.pkg` |
+| `FreeBSD:16:amd64` | CE 2.9, Plus 26.x (Intel) | `fips-<v>-pfsense-ce2.9-plus26-amd64.pkg` |
+| `FreeBSD:16:aarch64` | Plus 26.x (ARM) | `fips-<v>-pfsense-plus26-aarch64.pkg` |
+
+A release without the matching pfSense package, or an ABI not in this table, is refused rather than falling
+back to the FreeBSD package; `FIPS_UI_PFSENSE_PRODUCT` sets the product tag for a newer pfSense. Source builds
+are not offered on pfSense. The helper (v7) restarts fips through pfSense's boot script. Netgate treats
+third-party packages as unsupported; the same caution applies here.
 
 ## Privilege model
 

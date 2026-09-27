@@ -38,13 +38,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, rm, readdir, readFile, writeFile, stat, chmod, copyFile, rename } from 'node:fs/promises'
-import { createWriteStream, createReadStream, existsSync } from 'node:fs'
+import { createWriteStream, createReadStream, existsSync, readFileSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { join, dirname, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readJsonBody, BodyError, sendJson } from './http.ts'
-import { homedir, arch as osArch, platform as osPlatform } from 'node:os'
+import { homedir, arch as osArch, platform as osPlatform, release as osRelease } from 'node:os'
 import { connect as netConnect } from 'node:net'
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,25 @@ export interface Platform {
   /** Extra search paths for libclang, used only to inform the operator. */
   libclangHints: string[]
   usesHelper: boolean
+  /** pfSense (FreeBSD underneath) needs its own packages: the FreeBSD one never starts there. */
+  pfsense: { abi: string; tag: string | null } | null
 }
+
+/**
+ * Upstream names pfSense packages after the pfSense products an ABI serves (packaging/pfsense/build-pkg.sh):
+ * fips-<version>-pfsense-<products>-<arch>.pkg. FIPS_UI_PFSENSE_PRODUCT overrides the tag for a newer pfSense.
+ */
+const PFSENSE_PRODUCTS: Record<string, string> = {
+  'FreeBSD:15:amd64': 'ce2.8',
+  'FreeBSD:16:amd64': 'ce2.9-plus26',
+  'FreeBSD:16:aarch64': 'plus26',
+}
+function detectPfsense(arch: string): Platform['pfsense'] {
+  try { if (!/pfsense/i.test(readFileSync('/etc/platform', 'utf8'))) return null } catch { return null }
+  const abi = `FreeBSD:${osRelease().split('.')[0]}:${arch}`
+  return { abi, tag: process.env.FIPS_UI_PFSENSE_PRODUCT || PFSENSE_PRODUCTS[abi] || null }
+}
+const reEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 export function detectPlatform(): Platform {
   const p = osPlatform()
@@ -180,8 +198,11 @@ export function detectPlatform(): Platform {
     windows: { assetPattern: new RegExp(`^fips-.*-windows-${arch}\\.zip$`), checksumFile: 'checksums-windows.txt', artifactKind: 'archive', defaultBinDir: join(process.env.ProgramFiles ?? 'C:\\Program Files', 'fips'), defaultBackupsDir: join(process.env.ProgramData ?? 'C:\\ProgramData', 'fips-ui', 'backups'), libclangHints: [process.env.LIBCLANG_PATH ?? 'C:\\Program Files\\LLVM\\bin'] },
     other: { assetPattern: new RegExp(`^fips-.*-linux-${arch}\\.tar\\.gz$`), checksumFile: 'checksums-linux.txt', artifactKind: 'archive', defaultBinDir: '/usr/local/bin', defaultBackupsDir: '/var/lib/fips-ui/backups', libclangHints: [] },
   }
+  const pfsense = os === 'freebsd' ? detectPfsense(arch) : null
+  // On pfSense only its own package matches (never the FreeBSD one); with an unknown ABI nothing does.
+  if (pfsense) table.freebsd.assetPattern = pfsense.tag ? new RegExp(`^fips-.*-pfsense-${reEscape(pfsense.tag)}-${arch}\\.pkg$`) : /(?!)/
   return {
-    os, arch, exe,
+    os, arch, exe, pfsense,
     binaries: BASE_BINARIES.map((b) => b + exe),
     ...table[os],
     defaultWorkDir: join(dataHome, 'fips-ui'),
@@ -764,7 +785,7 @@ export class UpgradeManager {
     } else master = { error: errMsg(headR) }
     const restartPending = !!(installed.version && running?.version && (installed.version !== running.version || (installed.revFull ?? installed.rev ?? '') !== (running.revFull ?? running.rev ?? '')))
     return {
-      platform: { os: this.platform.os, arch: this.platform.arch, artifactKind: this.platform.artifactKind, installer: this.installer.kind, binDir: await this.binDir(), workDir: this.workDir, controlSocket: this.controlSocket },
+      platform: { os: this.platform.os, arch: this.platform.arch, pfsense: this.platform.pfsense, artifactKind: this.platform.artifactKind, installer: this.installer.kind, binDir: await this.binDir(), workDir: this.workDir, controlSocket: this.controlSocket },
       installed, running, package: pkg, helper, toolchain, toolchainPlan, backups, release, master, restartPending,
       helperInstallScript: this.platform.usesHelper ? resolve(import.meta.dirname, '..', 'deploy', 'install-upgrade-helper.sh') : null,
       job: this.current?.summary() ?? null,
@@ -816,6 +837,7 @@ export class UpgradeManager {
     // Flags must be real booleans: a client that sends "true" or 1 has asked for something and must get a 400,
     // never a silent flip to the destructive default.
     for (const k of ['dryRun', 'restart', 'mergeConfig'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
+    if (this.platform.pfsense && reqIn.source === 'master') throw new Error('building from source is not supported on pfSense (no Rust toolchain there, and pfSense needs its own package): install a release')
     const req: JobRequest = { ...reqIn, dryRun: reqIn.dryRun === true, restart: reqIn.restart !== false }
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
     if (req.ref && !/^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,119}$/.test(req.ref)) throw new Error('invalid ref: use a branch, tag or commit sha (no leading "-" or ".")')
@@ -844,6 +866,9 @@ export class UpgradeManager {
       const rel = await job.runStep('resolve', async () => {
         const r = job.ref === 'latest' ? await this.gh.latestRelease() : await this.gh.releaseByTag(job.ref.startsWith('v') ? job.ref : `v${job.ref}`)
         const asset = this.pickAsset(r)
+        if (!asset && P.pfsense) throw new Error(P.pfsense.tag
+          ? `release ${r.tag_name} publishes no pfSense package for ${P.pfsense.abi} (fips-…-pfsense-${P.pfsense.tag}-${P.arch}.pkg); the FreeBSD package does not work on pfSense, so nothing is installed`
+          : `no pfSense package is known for ${P.pfsense.abi}; set FIPS_UI_PFSENSE_PRODUCT to the product tag in the package name (e.g. ce2.9-plus26) or install by hand`)
         if (!asset) throw new Error(`release ${r.tag_name} publishes no artifact for ${P.os}/${P.arch} (${r.assets.map((a) => a.name).join(', ')})`)
         const sums = r.assets.find((a) => a.name === P.checksumFile) ?? null
         job.info(`release ${r.tag_name} (${r.published_at}) · ${asset.name} · ${(asset.size / 1e6).toFixed(1)} MB${sums ? '' : ` · no ${P.checksumFile} published`}`)
