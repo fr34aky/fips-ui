@@ -3,7 +3,7 @@
 // involved: the checkout belongs to the UI's user. A newer privileged helper still has to be installed by an
 // admin (sudo ./deploy/setup-local.sh); the UI only reports that it is needed.
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { RELEASE_MARKER } from './version.ts';
 
@@ -156,6 +156,11 @@ export class SelfUpdate {
     let before = '';
     let moved = false;
     let depsChanged = false;
+    // The frontend the running server serves, kept while an update rebuilds a checkout that git did not move: the
+    // build empties web/dist first, and nothing else would restore it if the build or the self-test fails.
+    const dist = path.join(this.root, 'web', 'dist');
+    const distBackup = path.join(this.root, '.git', 'fips-ui-dist-backup');
+    let distSaved = false;
     try {
       const mode = await this.installMode();
       if (mode.mode !== 'git') throw new Error(mode.reason);
@@ -175,6 +180,8 @@ export class SelfUpdate {
         if (contains.code !== 0) throw new Error(`the checkout has diverged from ${tag} (it has commits that are not in the release, and lacks some of the release); update from a shell`);
         job.log.push(`the checkout already contains ${tag}; building and restarting it`);
         depsChanged = this.depsNewerThanInstall();
+        rmSync(distBackup, { recursive: true, force: true });
+        if (existsSync(dist)) { cpSync(dist, distBackup, { recursive: true }); distSaved = true; }
       }
       // Also when the build tools are missing (a previous install without them): the build needs them.
       if (depsChanged || !this.hasBuildTools()) await step('npm ci (web)', 'npm', NPM_CI, 600_000);
@@ -186,9 +193,12 @@ export class SelfUpdate {
       job.log.push(...t.out.split('\n').slice(-15));
       if (!t.ok) throw new Error('the new version did not start (self-test failed)');
       const after = (await step('git rev-parse HEAD', 'git', ['rev-parse', 'HEAD'])).trim();
+      const tagCommit = (await run('git', ['rev-parse', '--verify', `${tag}^{commit}`], this.root, 10_000)).out.trim();
       this.remember(before, tag, job);
-      // The installed release, for when git cannot tell the version later (see version.ts).
-      try { writeFileSync(path.join(this.root, '.git', RELEASE_MARKER), `${tag} ${after}\n`); } catch { /* not essential */ }
+      // The installed release, for when git cannot tell the version later (see version.ts): only when the checkout
+      // is on the tag itself; one past it is not that version.
+      try { if (after === tagCommit) writeFileSync(path.join(this.root, '.git', RELEASE_MARKER), `${tag} ${after}\n`); } catch { /* not essential */ }
+      if (distSaved) rmSync(distBackup, { recursive: true, force: true });
       job.state = 'done';
       job.finishedAt = Date.now();
       if (this.canRestart) { job.restarting = true; job.log.push('restarting the service…'); setTimeout(onRestart, 1500); }
@@ -204,6 +214,10 @@ export class SelfUpdate {
         if (depsChanged || !this.hasBuildTools()) await run('npm', NPM_CI, this.root, 600_000);
         const rb = await run('npm', ['run', 'build'], this.root, 600_000);
         job.log.push(rb.code === 0 ? 'previous version rebuilt' : `rebuilding the previous version failed; in ${this.root} run: npm ci --prefix web && npm run build`);
+      } else if (distSaved) {
+        // Git did not move: put back the frontend the running server was serving.
+        try { rmSync(dist, { recursive: true, force: true }); renameSync(distBackup, dist); job.log.push('restored the frontend of the running version'); }
+        catch (x) { job.log.push(`restoring web/dist failed (${(x as Error).message}); in ${this.root} run: npm ci --prefix web && npm run build`); }
       }
     }
     return job;
