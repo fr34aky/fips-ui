@@ -20,7 +20,9 @@ export function UiUpdateCard({ readOnly }: { readOnly: boolean }) {
     const t = setInterval(async () => {
       if (job.state === 'running') {
         const d = await refreshUiUpdate();
-        if (d?.job) { setJob(d.job); if (d.job.state === 'failed') toast('err', d.job.error ?? 'the update failed'); if (d.job.restarting) setRestarting(true); }
+        // The server may already have exited (no answer) or restarted on the new version (no job in memory).
+        if (!d || !d.job || d.current === job.tag.slice(1)) { if (d?.current === job.tag.slice(1)) location.reload(); else { setJob({ ...job, state: 'done', restarting: true }); setRestarting(true); } return; }
+        setJob(d.job); if (d.job.state === 'failed') toast('err', d.job.error ?? 'the update failed'); if (d.job.restarting) setRestarting(true);
         return;
       }
       const h = await api.get<{ uiVersion?: string }>('/api/health').catch(() => null);

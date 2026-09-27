@@ -304,9 +304,22 @@ function hostsView(h: HostsFile) {
   return { path: h.path, entries: h.entries, local: h.local, synced: h.synced, base: h.base, error: h.error };
 }
 
+/**
+ * Self-test mode (FIPS_UI_SELFTEST=1): the self-update starts a freshly built version this way before restarting
+ * the service. It loads every module, listens on a spare loopback port, prints "fips-ui selftest ok" and exits;
+ * nothing with side effects (mesh listener and guard, hosts sync, release checks, pollers) is started.
+ */
+const SELFTEST = process.env.FIPS_UI_SELFTEST === '1';
 const selfUpdate = new SelfUpdate(ROOT, UI_VERSION);
 // Look for a new fips-ui release shortly after start and every 6 hours.
-setTimeout(() => { void selfUpdate.check(); setInterval(() => void selfUpdate.check(), 6 * 60 * 60_000).unref(); }, 10_000).unref();
+if (!SELFTEST) setTimeout(() => { void selfUpdate.check(); setInterval(() => void selfUpdate.check(), 6 * 60 * 60_000).unref(); }, 10_000).unref();
+/** Why fips-ui must not restart now (a node upgrade or node-management change would be killed with it). */
+const restartBlocker = (): string | null => {
+  const j = upgrade.manager.job;
+  if (upgradeStarting > 0 || (j && (j.state === 'running' || j.state === 'queued'))) return 'a fips upgrade job is running';
+  if (admin.changePending()) return 'a node-management change is in progress';
+  return null;
+};
 
 const hostsSync = new HostsSync({
   ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
@@ -314,7 +327,7 @@ const hostsSync = new HostsSync({
   write: writeHostsFile,
   label: async (npub) => (await readHosts()).local.find((e) => e.npub === npub)?.hostname,
 });
-void hostsSync.start();
+if (!SELFTEST) void hostsSync.start();
 
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
@@ -461,7 +474,14 @@ async function route(req: Req, res: Res) {
     await selfUpdate.check();
     if (!selfUpdate.latest || !selfUpdate.newer || tag !== selfUpdate.latest.tag) throw new HttpError(400, `only the newest release (${selfUpdate.latest?.tag ?? 'unknown'}) can be installed, and only when it is newer than ${selfUpdate.current}`);
     if (selfUpdate.job?.state === 'running') throw new HttpError(409, 'an update is already running');
-    void selfUpdate.install(tag, () => { console.log(`fips-ui updated to ${tag}; exiting so systemd restarts it`); server.close(); mesh.close(); hostsSync.close(); process.exit(75); });
+    const blocked = restartBlocker();
+    if (blocked) throw new HttpError(409, `${blocked}; update fips-ui when it has finished`);
+    // The restart waits for anything privileged that started meanwhile: exiting would kill it with the service.
+    const exitWhenIdle = () => {
+      if (restartBlocker()) { setTimeout(exitWhenIdle, 2000); return; }
+      console.log(`fips-ui updated to ${tag}; exiting so systemd restarts it`); server.close(); mesh.close(); hostsSync.close(); process.exit(75);
+    };
+    void selfUpdate.install(tag, exitWhenIdle);
     return json(res, 202, { job: selfUpdate.job });
   }
   if (p === '/api/hosts/sync/run') {
@@ -708,16 +728,17 @@ mesh.onChange = async () => { meshSync.dirty = true; };
 mesh.onTunChange = () => { meshGuardDirty = true; };
 mesh.onGuardLost = () => { void reapplyGuard().then(() => mesh.reconcile()); };
 let meshTicks = 0;
-setInterval(() => {
+if (!SELFTEST) setInterval(() => {
   if (meshSync.dirty) void syncMesh().then(() => mesh.reconcile());
   else if (meshGuardDirty) { meshGuardDirty = false; void reapplyGuard().then(() => mesh.reconcile()); }
   // The 30 s guard check always gets its tick; a failing rule retry cannot starve it.
   else if (++meshTicks % 2 === 0) void verifyGuard().then(() => mesh.reconcile());
   else if (meshRuleDirty) void syncRule();
 }, 15_000).unref();
-void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
+if (!SELFTEST) void mesh.startCanary().then(() => mesh.start()).then(() => syncMesh()).then(() => mesh.reconcile());
 
-server.listen(PORT, HOST, () => {
+server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
+  if (SELFTEST) { console.log('fips-ui selftest ok'); process.exit(0); }
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
   console.log(`  platform       : ${PLATFORM.os}${PLATFORM.distro ? ` (${PLATFORM.distro})` : ''}, services via ${PLATFORM.serviceManager}, logs via ${LOG_SOURCE ?? 'none'}`);

@@ -2,8 +2,8 @@
 // repository, fast-forward it to the release tag, rebuild and let systemd restart the service. No privileges are
 // involved: the checkout belongs to the UI's user. A newer privileged helper still has to be installed by an
 // admin (sudo ./deploy/setup-local.sh); the UI only reports that it is needed.
-import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const REPO = process.env.FIPS_UI_REPO ?? 'fr34aky/fips-ui';
@@ -84,6 +84,26 @@ export class SelfUpdate {
     catch { return null; }
   }
 
+  /** Start the checkout's server in self-test mode (FIPS_UI_SELFTEST=1) and wait for it to report that it runs. */
+  private selftest(): Promise<{ ok: boolean; out: string }> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [...process.execArgv, 'server/index.ts'], { cwd: this.root, env: { ...process.env, FIPS_UI_SELFTEST: '1', INVOCATION_ID: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      const done = (ok: boolean) => { clearTimeout(timer); child.kill('SIGKILL'); resolve({ ok, out: out.trim() }); };
+      const timer = setTimeout(() => done(false), 30_000);
+      const onData = (d: Buffer) => { out += d.toString(); if (out.includes('fips-ui selftest ok')) done(true); };
+      child.stdout.on('data', onData); child.stderr.on('data', onData);
+      child.on('exit', () => { if (!out.includes('fips-ui selftest ok')) done(false); });
+      child.on('error', (e) => { out += String(e); done(false); });
+    });
+  }
+
+  /** Keep the previous commit on disk (inside .git, not the work tree), so going back is possible from a shell. */
+  private remember(before: string, tag: string, job: UpdateJob): void {
+    try { writeFileSync(path.join(this.root, '.git', 'fips-ui-previous'), `${before} ${tag} ${new Date().toISOString()}\n`); } catch { /* not essential */ }
+    job.log.push(`previous version: ${before.slice(0, 10)}; to go back from a shell: git reset --hard ${before.slice(0, 10)} && npm run build`);
+  }
+
   /** Under systemd (Restart=on-failure) exiting with an error code restarts the service on the new code. */
   // INVOCATION_ID alone is also set in shells of a systemd session; a service's own process has systemd as parent.
   get canRestart(): boolean { return !!process.env.INVOCATION_ID && process.ppid === 1; }
@@ -118,6 +138,13 @@ export class SelfUpdate {
       depsChanged = /(^|\n)(web\/)?package(-lock)?\.json(\n|$)/.test(changed.out);
       if (depsChanged) await step('npm ci (web)', 'npm', ['ci', '--prefix', 'web', '--no-audit', '--no-fund'], 600_000);
       await step('npm run build', 'npm', ['run', 'build'], 600_000);
+      // The web build does not compile the server: start the new server once, without side effects, before the
+      // service is restarted on it.
+      job.log.push('$ self-test of the new server');
+      const t = await this.selftest();
+      job.log.push(...t.out.split('\n').slice(-15));
+      if (!t.ok) throw new Error('the new version did not start (self-test failed)');
+      this.remember(before, tag, job);
       job.state = 'done';
       job.finishedAt = Date.now();
       if (this.canRestart) { job.restarting = true; job.log.push('restarting the service…'); setTimeout(onRestart, 1500); }
@@ -132,7 +159,7 @@ export class SelfUpdate {
         await run('git', ['reset', '--hard', before], this.root, 60_000);
         if (depsChanged) await run('npm', ['ci', '--prefix', 'web', '--no-audit', '--no-fund'], this.root, 600_000);
         const rb = await run('npm', ['run', 'build'], this.root, 600_000);
-        job.log.push(rb.code === 0 ? 'previous version rebuilt' : 'rebuilding the previous version failed; run npm run build in a shell');
+        job.log.push(rb.code === 0 ? 'previous version rebuilt' : `rebuilding the previous version failed; in ${this.root} run: npm ci --prefix web && npm run build`);
       }
     }
     return job;
