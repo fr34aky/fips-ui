@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-27
+
+### Fixed
+
+- Updating fips-ui from the Upgrade page failed with `tsc: not found` when the
+  dependencies changed: the service runs with `NODE_ENV=production`, in which
+  `npm ci` leaves out the build tools. They are now always installed, and
+  reinstalled whenever they are missing. Nodes still on 0.4.0/0.5.0 run the old
+  updater: update them once from a shell (`git pull && npm ci --prefix web &&
+  npm run build`, then restart fips-ui).
+
 ## [0.5.0] - 2026-09-27
 
 ### Added
@@ -308,7 +319,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/fr34aky/fips-ui/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...v0.3.0
