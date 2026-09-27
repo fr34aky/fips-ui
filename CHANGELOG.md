@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-27
+
+### Fixed
+
+- The names synced from a master had no Status column (direct peer, this node,
+  not a direct peer) and no header row; they now show the same columns as the
+  local entries.
+
 ## [0.5.1] - 2026-09-27
 
 ### Fixed
@@ -319,7 +327,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/fr34aky/fips-ui/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/fr34aky/fips-ui/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...v0.4.0

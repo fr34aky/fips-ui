@@ -50,6 +50,11 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
   const [showLocal, setShowLocal] = useState(() => { try { return localStorage.getItem('fips-ui-hosts-local-open') === '1'; } catch { return false; } });
   const toggleLocal = (open: boolean) => { setShowLocal(open); try { localStorage.setItem('fips-ui-hosts-local-open', open ? '1' : '0'); } catch { /* storage unavailable */ } };
   const localOpen = !synced || showLocal || dirty || !!prefillNpub;
+  /** Whether a name's npub is a direct peer (and how it is connected), this node, or neither. */
+  const peerStatus = (npub: string) => {
+    const p = peers.find((x) => x.npub === npub);
+    return p ? <Chip tone="good">peer · {p.connectivity}</Chip> : npub === snap.status?.npub ? <Chip tone="accent">this node</Chip> : <Chip>not a direct peer</Chip>;
+  };
   const mode = data?.write?.mode ?? null;
   const editable = !readOnly && !!mode;
   const rows = draft ?? saved;
@@ -96,9 +101,9 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
             {synced && (
               <div className="border-t border-[var(--border)]">
                 <div className="px-4 pt-3 pb-1 text-xs text-ink-3 flex flex-wrap items-center gap-1.5">Synced from the master <NpubInline npub={synced.master} /> · {synced.entries.length} name{synced.entries.length === 1 ? '' : 's'} · read-only here, change them on the master</div>
-                <div className="overflow-auto max-h-[24rem]"><table className="data"><tbody>
+                <div className="overflow-auto max-h-[24rem]"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Status</th>{accessHead}<th /></tr></thead><tbody>
                   {synced.entries.map((h) => (
-                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>{showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}<td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
+                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td><td>{peerStatus(h.npub)}</td>{showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}<td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
                   ))}
                 </tbody></table></div>
               </div>
@@ -114,11 +119,11 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
               <>
             {rows.length === 0 ? <Empty>No names yet.</Empty> : (
               <div className="overflow-auto max-h-[32rem]"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Status</th>{accessHead}<th>Note</th><th /></tr></thead><tbody>
-                {rows.map((h, i) => { const p = peers.find((x) => x.npub === h.npub); const isNew = !saved.some((s) => s.hostname === h.hostname && s.npub === h.npub); return (
+                {rows.map((h, i) => { const isNew = !saved.some((s) => s.hostname === h.hostname && s.npub === h.npub); return (
                   <tr key={i}>
                     <td><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td>
                     <td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>
-                    <td>{isNew ? <Chip tone="accent">unsaved</Chip> : syncedNames.has(h.hostname) ? <Chip tone="warn" title="The master's entry with this name is the one in effect">overridden by master</Chip> : p ? <Chip tone="good">peer · {p.connectivity}</Chip> : h.npub === snap.status?.npub ? <Chip tone="accent">this node</Chip> : <Chip>not a direct peer</Chip>}</td>
+                    <td>{isNew ? <Chip tone="accent">unsaved</Chip> : syncedNames.has(h.hostname) ? <Chip tone="warn" title="The master's entry with this name is the one in effect">overridden by master</Chip> : peerStatus(h.npub)}</td>
                     {showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}
                     <td className="text-xs text-ink-3 max-w-[320px] truncate" title={h.comment}>{h.comment}</td>
                     <td className="text-right whitespace-nowrap">
