@@ -50,11 +50,13 @@ node=${2:-}
 if [[ -z "$node" ]]; then
   # Resolve node the way the user's login shell would (covers mise/nvm/volta), then pin the real binary
   # so the service does not depend on shims or PATH.
-  node=$(sudo -u "$user" -H bash -lc 'command -v node' 2>/dev/null || true)
+  # A login shell may print greetings first (FreeBSD's fortune tips): only the last line counts.
+  node=$(sudo -u "$user" -H bash -lc 'command -v node' 2>/dev/null | tail -n 1 || true)
+  [[ "$node" == /* && -x "$node" ]] || node=""
   [[ -n "$node" ]] || for c in /usr/bin/node /usr/local/bin/node /opt/homebrew/bin/node; do [[ -x "$c" ]] && { node=$c; break; }; done
 fi
 [[ -n "$node" && -x "$node" ]] || fail "node not found; pass the binary as the second argument"
-if [[ "$node" == */mise/shims/* ]]; then node=$(sudo -u "$user" -H bash -lc 'mise which node' 2>/dev/null || realpath_of "$node"); fi
+if [[ "$node" == */mise/shims/* ]]; then node=$(sudo -u "$user" -H bash -lc 'mise which node' 2>/dev/null | tail -n 1 || realpath_of "$node"); fi
 node=$(realpath_of "$node")
 ver=$("$node" -v 2>/dev/null | sed 's/^v//') || fail "$node -v failed"
 IFS=. read -r maj min _ <<<"$ver"
