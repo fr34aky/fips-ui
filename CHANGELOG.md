@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-27
+
 ### Added
 
 - **fips-ui updates itself**: the server looks up the newest fips-ui release on
@@ -17,7 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they changed, the UI is rebuilt (rolled back if that fails) and the service
   restarts by itself under systemd. A newer privileged helper is reported, since
   only `sudo ./deploy/setup-local.sh` can install it.
-
 - **Hosts-file sync from a master node** (Access → Hosts file): followers fetch
   the master's names over the mesh every few minutes and keep them in a marked
   block at the end of their hosts file; local entries stay, and on a duplicate
@@ -33,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With names synced from a master, the hosts card lists the synced names first
   and folds the node's own entries into a "Local entries (N)" line (opened on
   request, while editing, or from an "add a name…" link; remembered per browser).
+
+### Upgrading
+
+- Update this time from a shell (`git pull && npm run build`, then restart
+  fips-ui); from 0.4.0 on, new releases can be installed from the Upgrade page.
 
 ## [0.3.0] - 2026-09-27
 
@@ -283,7 +289,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fr34aky/fips-ui/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fr34aky/fips-ui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fr34aky/fips-ui/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/fr34aky/fips-ui/compare/v0.1.2...v0.1.3
