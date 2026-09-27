@@ -2,19 +2,21 @@
 # Install the fips daemon from its newest GitHub release (or --tag vX.Y.Z), checksum-verified, and start it.
 # Called by setup-local.sh when fips is missing; also usable on its own:
 #   sudo ./deploy/install-fips.sh [--tag vX.Y.Z]
+#   ./deploy/install-fips.sh --check     exit 0 if fips is installed (binary, socket, service or group), 1 if not
 # Linux with systemd  the .deb (Debian, Ubuntu) or the tarball's install.sh (other distributions)
 # FreeBSD             the FreeBSD package (pkg add), enabled with sysrc
 # pfSense             the pfSense package for this pfSense's ABI (FIPS_UI_PFSENSE_PRODUCT overrides the product tag)
 # macOS               the macOS package (installer)
 # Upgrades of an installed fips go through fips-ui's Upgrade page, not this script.
 set -euo pipefail
-[[ $(id -u) -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 fail() { echo "error: $*" >&2; exit 1; }
 
 repo=${FIPS_UI_FIPS_REPO:-jmcorgan/fips}
 tag=""
+check_only=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --check) check_only=true; shift ;; # exit 0 (and say what) if fips is installed, 1 if not
     --tag) [[ $# -ge 2 ]] || fail "--tag needs a value"; tag=$2; shift 2 ;;
     *) fail "unknown argument $1 (usage: $0 [--tag vX.Y.Z])" ;;
   esac
@@ -29,9 +31,26 @@ elif [[ "$os" == FreeBSD ]]; then kind=freebsd
 elif [[ "$os" == Darwin ]]; then kind=macos
 else fail "no fips install for this system ($os without systemd); see docs/install.md"; fi
 
-for b in fips /usr/bin/fips /usr/local/bin/fips; do
-  if command -v "$b" >/dev/null 2>&1; then fail "fips is already installed ($(command -v "$b")); upgrade it from fips-ui's Upgrade page"; fi
-done
+# Any trace of an installed daemon counts (a binary elsewhere, e.g. built from source, still has its group, socket
+# or service): installing a second one beside it would fight over the control socket.
+fips_installed() { # prints what it found
+  local b
+  for b in fips /usr/bin/fips /usr/local/bin/fips /usr/local/sbin/fips; do command -v "$b" >/dev/null 2>&1 && { echo "binary $(command -v "$b")"; return 0; }; done
+  for b in /run/fips/control.sock /var/run/fips/control.sock; do [[ -S "$b" ]] && { echo "control socket $b"; return 0; }; done
+  [[ -e /etc/systemd/system/fips.service || -e /lib/systemd/system/fips.service || -e /usr/lib/systemd/system/fips.service ]] && { echo "systemd unit fips.service"; return 0; }
+  [[ -e /usr/local/etc/rc.d/fips || -e /usr/local/etc/rc.d/fips.sh ]] && { echo "rc.d script fips"; return 0; }
+  [[ -e /Library/LaunchDaemons/com.fips.daemon.plist ]] && { echo "launchd job com.fips.daemon"; return 0; }
+  if command -v getent >/dev/null 2>&1; then getent group fips >/dev/null && { echo "group fips"; return 0; }
+  elif [[ "$(uname -s)" == FreeBSD ]]; then pw groupshow fips >/dev/null 2>&1 && { echo "group fips"; return 0; }; fi
+  return 1
+}
+if found=$(fips_installed); then
+  [[ "$check_only" == true ]] && { echo "$found"; exit 0; }
+  fail "fips is already installed ($found); upgrade it from fips-ui's Upgrade page"
+fi
+[[ "$check_only" == true ]] && exit 1
+
+[[ $(id -u) -eq 0 ]] || fail "run with sudo"
 
 # ---- download helpers (curl, or FreeBSD's fetch) ----
 download() { # <url> <file>
@@ -62,9 +81,10 @@ case "$machine" in x86_64|amd64) arch=x86_64 deb_arch=amd64 bsd_arch=amd64 ;; aa
 case "$kind" in
   systemd)
     sums=checksums-linux.txt
-    # FIPS_UI_FIPS_ARTIFACT=tarball skips the .deb (tests, or dpkg without apt).
+    # The .deb only where apt manages packages (dpkg alone also exists on Arch or Fedora for packaging work).
+    # FIPS_UI_FIPS_ARTIFACT=tarball skips it (tests).
     url=""
-    if command -v dpkg >/dev/null 2>&1 && [[ "${FIPS_UI_FIPS_ARTIFACT:-}" != tarball ]]; then url=$(pick "fips_[^/]*_${deb_arch}\\.deb"); fi
+    if command -v apt-get >/dev/null 2>&1 && [[ -f /etc/debian_version && "${FIPS_UI_FIPS_ARTIFACT:-}" != tarball ]]; then url=$(pick "fips_[^/]*_${deb_arch}\\.deb"); fi
     [[ -n "$url" ]] || url=$(pick "fips-[^/]*-linux-${arch}\\.tar\\.gz") ;;
   freebsd) sums=checksums-freebsd.txt; url=$(pick "fips-[^/]*-freebsd-${bsd_arch}\\.pkg") ;;
   pfsense)
@@ -96,8 +116,7 @@ echo "checksum ok"
 case "$kind" in
   systemd)
     if [[ "$file" == *.deb ]]; then
-      if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$work/$file"
-      else dpkg -i "$work/$file"; fi
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$work/$file"
     else
       tar xzf "$work/$file" -C "$work"
       "$work/${file%.tar.gz}/install.sh"

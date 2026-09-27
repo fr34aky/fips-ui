@@ -78,9 +78,7 @@ svc_path="$(dirname "$node"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 echo "== $kind: node $ver at $node, UI user $user, checkout $here"
 
 # ---- the fips daemon (installed now if missing and wanted) ----
-fips_bin=""
-for b in fips /usr/bin/fips /usr/local/bin/fips; do command -v "$b" >/dev/null 2>&1 && { fips_bin=$(command -v "$b"); break; }; done
-if [[ -z "$fips_bin" ]]; then
+if ! "$here/deploy/install-fips.sh" --check >/dev/null; then
   if [[ "$install_fips" == ask ]]; then
     if [[ -t 0 ]]; then
       read -r -p "The fips daemon is not installed. Install the newest fips release now? [y/N] " answer
