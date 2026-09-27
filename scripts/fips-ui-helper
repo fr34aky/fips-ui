@@ -1205,7 +1205,9 @@ initial_config() { # <peer>...
   tmp=$(mktemp "$cfg.XXXXXX")
   # persistent: the template's commented "# persistent: true" under node.identity, or a new line after "identity:".
   # peers: the template's "peers: []" becomes the list; a config without that line keeps its peers.
-  awk -v peers="$block" '
+  # The peers go through the environment: awk -v rejects values with newlines (BSD awk).
+  PEERS="$block" awk '
+    BEGIN { peers = ENVIRON["PEERS"] }
     /^  identity:[[:space:]]*$/ { print; idn = 1; next }
     idn && /^    # persistent: true[[:space:]]*$/ { print "    persistent: true"; done_p = 1; idn = 0; next }
     idn && /^    persistent:/ { print "    persistent: true"; done_p = 1; idn = 0; next }
@@ -1222,7 +1224,7 @@ initial_config() { # <peer>...
 }
 
 daemon_install() { # [tag] [peer...]
-  local tag=${1:-} work api tag_found urls url file sums sums_url want got arch deb_arch bsd_arch abi product sock found
+  local tag=${1:-} work tag_found file sums want got arch deb_arch bsd_arch abi product sock found
   [[ -z "$tag" || "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "invalid tag (use vX.Y.Z)"
   shift || true
   local peer; for peer in "$@"; do [[ "$peer" =~ $PEER_RE ]] || die "invalid peer $peer (use npub1...@udp/host:port)"; done
@@ -1231,41 +1233,45 @@ daemon_install() { # [tag] [peer...]
   if found=$(fips_trace); then die "fips is already installed ($found); upgrade it instead"; fi
   case "$SM" in systemd|rc|pfsense|launchd) ;; *) die "fresh installs are supported with systemd, FreeBSD rc.d, pfSense and launchd (this system: $SM)" ;; esac
   case "$(uname -m)" in x86_64|amd64) arch=x86_64 deb_arch=amd64 bsd_arch=amd64 ;; aarch64|arm64) arch=aarch64 deb_arch=arm64 bsd_arch=aarch64 ;; *) die "no fips release for $(uname -m)" ;; esac
-  work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
-  api="https://api.github.com/repos/$FIPS_RELEASE_REPO/releases/${tag:+tags/$tag}"; [[ -n "$tag" ]] || api+=latest
-  download "$api" "$work/release.json" || die "cannot read the release from $api"
-  tag_found=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$work/release.json" | head -n 1)
-  [[ "$tag_found" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "no release found at $api"
-  # Only assets of this repository's releases.
-  urls=$(grep -o '"browser_download_url": *"[^"]*"' "$work/release.json" | sed 's/.*"\(https[^"]*\)"/\1/' | grep "^https://github.com/$FIPS_RELEASE_REPO/releases/download/" || true)
-  pick() { grep -E "/$1\$" <<<"$urls" | head -n 1 || true; }
-  url=""
+  DI_WORK=$(mktemp -d); trap 'rm -rf "$DI_WORK"' EXIT; work=$DI_WORK
+  local base="https://github.com/$FIPS_RELEASE_REPO/releases"
+  # The newest release: github.com redirects releases/latest to releases/tag/<tag> (no API call, so no API rate
+  # limit). fips-ui passes the tag it already knows.
+  if [[ -z "$tag" ]]; then
+    if command -v curl >/dev/null 2>&1; then
+      tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$base/latest" 9>&- | sed -n 's|.*/releases/tag/\(v[^/]*\)$|\1|p')
+    else
+      download "https://api.github.com/repos/$FIPS_RELEASE_REPO/releases/latest" "$work/release.json" || die "cannot read the newest release"
+      tag=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$work/release.json" | head -n 1)
+    fi
+  fi
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "cannot find the newest release of $FIPS_RELEASE_REPO"
+  tag_found=$tag
+  local ver=${tag#v} candidates=() c
+  # Asset names follow upstream's packaging (as server/upgrade.ts expects them).
   case "$SM" in
     systemd)
       sums=checksums-linux.txt
       # The .deb only where apt manages packages (dpkg alone also exists on Arch or Fedora); FIPS_UI_FIPS_ARTIFACT=tarball skips it.
-      if command -v apt-get >/dev/null 2>&1 && [[ -f /etc/debian_version && "${FIPS_UI_FIPS_ARTIFACT:-}" != tarball ]]; then url=$(pick "fips_[^/]*_${deb_arch}\\.deb"); fi
-      [[ -n "$url" ]] || url=$(pick "fips-[^/]*-linux-${arch}\\.tar\\.gz") ;;
-    rc) sums=checksums-freebsd.txt; url=$(pick "fips-[^/]*-freebsd-${bsd_arch}\\.pkg") ;;
+      if command -v apt-get >/dev/null 2>&1 && [[ -f /etc/debian_version && "${FIPS_UI_FIPS_ARTIFACT:-}" != tarball ]]; then candidates+=("fips_${ver}_${deb_arch}.deb"); fi
+      candidates+=("fips-${ver}-linux-${arch}.tar.gz") ;;
+    rc) sums=checksums-freebsd.txt; candidates=("fips-${ver}-freebsd-${bsd_arch}.pkg") ;;
     pfsense)
       sums=checksums-freebsd.txt
       abi=$(pkg config abi 2>/dev/null || true)
       # Upstream names pfSense packages after the products an ABI serves (like server/upgrade.ts).
       case "$abi" in FreeBSD:15:amd64) product=ce2.8 ;; FreeBSD:16:amd64) product=ce2.9-plus26 ;; FreeBSD:16:aarch64) product=plus26 ;; *) product="" ;; esac
       product=${FIPS_UI_PFSENSE_PRODUCT:-$product}
-      [[ -n "$product" ]] || die "no pfSense package is known for ABI '$abi'; install with FIPS_UI_PFSENSE_PRODUCT set (e.g. ce2.9-plus26)"
-      url=$(pick "fips-[^/]*-pfsense-${product}-${bsd_arch}\\.pkg")
-      [[ -n "$url" ]] || die "release $tag_found publishes no pfSense package for $abi (fips-...-pfsense-$product-$bsd_arch.pkg); the FreeBSD package does not work on pfSense" ;;
-    launchd) sums=checksums-macos.txt; url=$(pick "fips-[^/]*-macos-$([[ $arch == x86_64 ]] && echo x86_64 || echo arm64)\\.pkg") ;;
+      [[ "$product" =~ ^[A-Za-z0-9.-]+$ ]] || die "no pfSense package is known for ABI '$abi'; install with FIPS_UI_PFSENSE_PRODUCT set (e.g. ce2.9-plus26)"
+      candidates=("fips-${ver}-pfsense-${product}-${bsd_arch}.pkg") ;;
+    launchd) sums=checksums-macos.txt; candidates=("fips-${ver}-macos-$([[ $arch == x86_64 ]] && echo x86_64 || echo arm64).pkg") ;;
   esac
-  [[ -n "$url" ]] || die "release $tag_found publishes no fips package for $SM/$(uname -m)"
-  file=${url##*/}
-  [[ "$file" =~ ^[A-Za-z0-9._-]+$ ]] || die "unexpected asset name $file"
-  sums_url=$(pick "${sums//./\\.}")
-  [[ -n "$sums_url" ]] || die "release $tag_found publishes no $sums to verify $file against"
+  download "$base/download/$tag/$sums" "$work/$sums" || die "release $tag publishes no $sums (or it cannot be downloaded)"
+  file=""
+  for c in "${candidates[@]}"; do grep -qE "[[:space:]]\*?$(sed 's/[.]/\\./g' <<<"$c")\$" "$work/$sums" && { file=$c; break; }; done
+  [[ -n "$file" ]] || die "release $tag publishes no fips package for this system (${candidates[*]})"
   log "fips $tag_found: $file"
-  download "$url" "$work/$file" || die "download of $file failed"
-  download "$sums_url" "$work/$sums" || die "download of $sums failed"
+  download "$base/download/$tag/$file" "$work/$file" || die "download of $file failed"
   want=$(awk -v f="$file" '$2 == f || $2 == "*" f {print $1}' "$work/$sums" | head -n 1)
   [[ -n "$want" ]] || die "$sums has no checksum for $file"
   got=$(sha256_file "$work/$file")

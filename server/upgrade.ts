@@ -891,7 +891,9 @@ export class UpgradeManager {
     return this.launch(job, async () => {
       job.defineSteps([['install', 'Download, verify, configure and start fips (privileged)'], ['confirm', 'Confirm the daemon answers']])
       job.info(peers.length ? `fips.yaml: persistent identity, peers ${peers.map((p) => p.split('@')[1]).join(', ')}` : 'fips.yaml: persistent identity, no peers (the node waits for peers to dial it)')
-      const r = await job.runStep('install', () => installer.daemonInstall(job, tag, peers as string[]))
+      // The tag this page showed (the helper finds the newest one itself when GitHub's API is unavailable here).
+      const release = tag || await this.gh.latestRelease().then((x) => x.tag_name, () => '')
+      const r = await job.runStep('install', () => installer.daemonInstall(job, /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(release) ? release : '', peers as string[]))
       job.result.artifact = r.artifact
       this.binDirCache = null
       await job.runStep('confirm', async () => {
