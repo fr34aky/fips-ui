@@ -15,20 +15,46 @@ prerequisites come from and which service manager `deploy/setup-local.sh` sets u
 
 What `setup-local.sh` does on every supported system:
 
-1. Checks the preconditions before changing anything: run with sudo, the `fips` group exists (the daemon is
-   installed), `web/dist` is built, Node 22.18+, 23.6+ or 24+.
+1. Checks the preconditions before changing anything: run with sudo, `web/dist` is built, Node 22.18+, 23.6+
+   or 24+.
 2. Finds node the way your login shell does (nvm, mise, volta, Homebrew) and pins the real binary, so the
    service does not depend on shims.
-3. Installs the privileged helper `/usr/local/libexec/fips-ui-helper` and one sudoers rule for the UI user
+3. Checks that the fips daemon is installed. If it is not, it offers to install the newest fips release
+   ([below](#installing-the-fips-daemon)); without it, it stops.
+4. Installs the privileged helper `/usr/local/libexec/fips-ui-helper` and one sudoers rule for the UI user
    ([node-management.md](node-management.md)).
-4. Adds the UI user to the `fips` group (the daemon's control socket), and on systemd to `systemd-journal`.
-5. Installs the service. It runs fips-ui from the checkout as the UI user, starts it at boot and restarts it
+5. Adds the UI user to the `fips` group (the daemon's control socket), and on systemd to `systemd-journal`.
+6. Installs the service. It runs fips-ui from the checkout as the UI user, starts it at boot and restarts it
    when it exits, which is how fips-ui restarts after [updating itself](self-update.md).
-6. (Re)starts it and checks `/api/health`.
+7. (Re)starts it and checks `/api/health`.
 
-Arguments: `sudo ./deploy/setup-local.sh [ui-user] [node-binary]`. The UI user defaults to the one running
-sudo. Run it again after moving the checkout, changing node, or when a release ships a newer helper; it keeps an
+Arguments: `sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [ui-user] [node-binary]`. The UI
+user defaults to the one running sudo. Run it again after moving the checkout, changing node, or when a release ships a newer helper; it keeps an
 existing settings file.
+
+## Installing the fips daemon
+
+On a machine without fips, `setup-local.sh` asks whether to install the newest fips release first
+(`--install-fips` installs without asking, for scripts; `--no-install-fips` stops instead). The same step on its
+own is `sudo ./deploy/install-fips.sh [--tag vX.Y.Z]`. It downloads the release from
+[jmcorgan/fips](https://github.com/jmcorgan/fips/releases), checks it against the release's
+`checksums-<os>.txt`, installs it and starts the daemon:
+
+| System | Package | How |
+| ------ | ------- | --- |
+| Debian, Ubuntu | `fips_<version>_<amd64\|arm64>.deb` | `apt-get install`, then `systemctl enable --now fips` |
+| Other Linux with systemd | `fips-<version>-linux-<x86_64\|aarch64>.tar.gz` | the tarball's `install.sh`, then `systemctl enable --now fips` |
+| FreeBSD | `fips-<version>-freebsd-<arch>.pkg` | `pkg add`, `sysrc fips_enable=YES`, `service fips start` |
+| pfSense | `fips-<version>-pfsense-<product>-<arch>.pkg` for this pfSense's ABI | `pkg add`, its boot script `rc.d/fips.sh start` |
+| macOS | `fips-<version>-macos-<arm64\|x86_64>.pkg` | `installer -pkg` (the package starts the daemon) |
+
+The daemon starts with the release's default configuration: an identity that changes at every start and no
+peers. Set a persistent identity and add peers on fips-ui's **Configuration** page (or in `fips.yaml`), then
+restart fips. An installed fips is never touched by this step; upgrade it from the **Upgrade** page
+([upgrade.md](upgrade.md)). `FIPS_UI_GITHUB_TOKEN` lifts GitHub's API limit, `FIPS_UI_FIPS_REPO` installs from
+another repository.
+
+## After the setup
 
 The dashboard listens on `http://127.0.0.1:8321`. Open it from another machine through an SSH tunnel
 (`ssh -L 8321:127.0.0.1:8321 node`), or turn on [Web UI over the mesh](mesh-access.md). Settings such as
@@ -66,7 +92,7 @@ npm run install:all && npm run build
 sudo ./deploy/setup-local.sh
 ```
 
-- The fips daemon must be installed first (its package creates the `fips` group). The PyYAML package is named
+- Without fips, the script offers to install the FreeBSD package (see above). The PyYAML package is named
   after the Python version (`py312-pyyaml`, `py311-pyyaml`, …: `pkg search pyyaml`).
 - `bash` is needed by the setup script and the helper; they are started through `#!/usr/bin/env bash`.
 - The service is `/usr/local/etc/rc.d/fips_ui`, enabled with `sysrc fips_ui_enable=YES`. It runs node under
@@ -85,7 +111,7 @@ sudo ./deploy/setup-local.sh
 Steps, if you accept that:
 
 1. Install the fips daemon's pfSense package (the one matching your pfSense version, see
-   [upgrade.md](upgrade.md)).
+   [upgrade.md](upgrade.md)), or let `setup-local.sh` install it in step 4.
 2. Install sudo from **System → Package Manager** (the official `sudo` package).
 3. Install Node (22.18+), npm, bash and git from the FreeBSD repository matching your pfSense's FreeBSD base,
    for example by enabling that repository temporarily in `/usr/local/etc/pkg/repos/` or with
