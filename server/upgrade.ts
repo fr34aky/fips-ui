@@ -903,8 +903,9 @@ export class UpgradeManager {
           await new Promise((res) => setTimeout(res, 500))
         }
         // The socket is there (the helper waited for it); this process just is not in its group yet.
+        // Its directory may be closed to non-members too (/run/fips is 0750 root:fips): then its group decides.
         let gid: number | null = null
-        try { gid = (await stat(r.socket)).gid } catch { /* checked below */ }
+        for (const p of [r.socket, dirname(r.socket)]) { try { gid = (await stat(p)).gid; if (p === r.socket || gid !== 0) break } catch { /* next */ } }
         const inGroup = gid !== null && (process.getgroups?.() ?? []).includes(gid)
         if (gid !== null && !inGroup) {
           if (this.restartUi?.()) { job.result.restarted = true; job.info('fips-ui was added to the fips group; it restarts now to open the control socket, and this page reloads'); return }
