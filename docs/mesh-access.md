@@ -67,6 +67,8 @@ Managed on **Access → Web UI over the mesh** (admins only) and stored in
 { "enabled": true, "port": 8321, "allowed": [ { "npub": "npub1…", "label": "laptop", "role": "admin" } ] }
 ```
 
-Browsers may address the mesh listener by this node's fips0 address, `<its npub>.fips`, or a hosts-file name for it; other `Host` and
-`Origin` values are refused, as on the local listener. Someone who is not on the list gets a page that tells
+Browsers may address the mesh listener by this node's fips0 address or any `<name>.fips` name, including a
+name from the visitor's own hosts file (`.fips` names are resolved by the visitor's FIPS daemon, never by
+public DNS, so they cannot be rebound to this node). Other `Host` values, such as a bare name without `.fips`,
+are refused, and the browser shows the reason; cross-origin writes need the request's exact `Origin`. Someone who is not on the list gets a page that tells
 them their own npub, so they can send it to you.

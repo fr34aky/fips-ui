@@ -27,7 +27,6 @@ import { dirname, join } from 'node:path';
 import { expand6, isMeshAddress } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
-import { readHosts } from './system.ts';
 
 export type Role = 'viewer' | 'admin';
 export interface AccessEntry { npub: string; label?: string; role: Role }
@@ -254,11 +253,13 @@ export class MeshAccess {
     }
   }
 
-  /** Names a browser may use for this node over the mesh: its fips0 address, <own npub>.fips, hosts-file aliases of it. */
-  private ownNames = new Set<string>();
+  /** Names a browser may use for this node over the mesh: its fips0 address or any <name>.fips. */
   hostAllowed(hostname: string | null): boolean {
     if (!hostname || !this.own) return false;
-    if (hostname.endsWith('.fips')) return this.ownNames.has(hostname) || hostname === `${this.own.npub.toLowerCase()}.fips`;
+    // Any <name>.fips: the visitor may call this node by a name from their own hosts file. Such names are resolved
+    // by the visitor's FIPS daemon from npubs or its own hosts file, never by public DNS, so a web page elsewhere
+    // cannot rebind one to this node; cross-origin writes still need the exact Origin.
+    if (hostname.endsWith('.fips')) return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.fips$/.test(hostname);
     const e = expand6(hostname);
     return !!e && e === expand6(this.own.address);
   }
@@ -335,8 +336,6 @@ export class MeshAccess {
       const st = await query<{ ipv6_addr?: string; npub?: string; tun_name?: string }>('show_status', undefined, { timeoutMs: 3000 });
       if (st.ipv6_addr && st.npub) {
         this.own = { address: st.ipv6_addr, npub: st.npub };
-        const hosts = await readHosts().catch(() => ({ entries: [] as { hostname: string; npub: string }[] }));
-        this.ownNames = new Set(hosts.entries.filter((h) => h.npub === st.npub).map((h) => `${h.hostname.toLowerCase()}.fips`));
       }
       if (st.tun_name && st.tun_name !== this.tun) {
         this.tun = st.tun_name;
