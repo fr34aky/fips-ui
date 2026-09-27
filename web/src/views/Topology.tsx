@@ -3,6 +3,7 @@ import type { Snapshot } from '../lib/types';
 import { Card, Chip, Copyable, KV, Empty, ErrorNote } from '../components/ui';
 import { shortKey, fmtMs, fmtCompact } from '../lib/format';
 import { CounterTable } from '../components/CounterTable';
+import { NpubInline } from '../components/PeerName';
 
 interface Node { id: string; label: string; kind: 'root' | 'ancestor' | 'parent' | 'me' | 'child' | 'cross'; depth?: number; npub?: string; rtt?: number | null }
 
@@ -82,7 +83,7 @@ export function Topology({ snap, onSelectPeer }: { snap: Snapshot; onSelectPeer:
         <Card title="Tree state">
           <KV items={[
             ['Role', tree.is_root ? <Chip tone="accent">root</Chip> : <Chip>depth {tree.depth}</Chip>],
-            ['Root', <Copyable text={tree.root_npub ?? tree.root} display={shortKey(tree.root_npub ?? tree.root, 12, 6)} />],
+            ['Root', tree.root_npub ? <NpubInline npub={tree.root_npub} head={12} tail={6} /> : <Copyable text={tree.root} display={shortKey(tree.root, 12, 6)} />],
             ['Parent', tree.parent ? `${tree.parent_display_name ?? shortKey(tree.parent, 8, 4)}` : '–'],
             ['Declaration seq', tree.declaration_sequence],
             ['Signed', tree.declaration_signed ? 'yes' : 'no'],

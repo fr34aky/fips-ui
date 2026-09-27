@@ -16,6 +16,8 @@ import { unitStates } from './system.ts';
 export const MIN_HELPER_VERSION = 4;
 /** The helper version that can load the mesh-access spoofing guard. */
 export const GUARD_HELPER_VERSION = 5;
+/** The helper version that can write the FIPS hosts file. */
+export const HOSTS_HELPER_VERSION = 6;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
@@ -377,8 +379,18 @@ export function createAdminHandler(opts: AdminOptions) {
     catch { return null; }
   }
 
+  /** Replace /etc/fips/hosts through the helper; `base` is the hash of the file the change was made on. */
+  async function hostsApply(content: string, base: string): Promise<{ ok: boolean; changed?: boolean; error?: string }> {
+    const busy = opts.busy();
+    if (busy) throw new Error(busy);
+    const h = await helperInfo();
+    if ((h.version ?? 0) < HOSTS_HELPER_VERSION) throw new Error(`editing the hosts file needs helper v${HOSTS_HELPER_VERSION} (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh`);
+    return exclusive(() => helperJson(['hosts-apply', '--base', base], content));
+  }
+
   return Object.assign(handler, {
     helperInfo,
+    hostsApply,
     meshGuard,
     meshGuardStatus,
     updateManagedRules,
