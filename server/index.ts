@@ -438,7 +438,7 @@ async function route(req: Req, res: Res) {
     const chain = own ? await hostsSync.chainFor(own) : undefined;
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;
-    return json(res, 200, { ...hostsView(h), ...(chain ? { chain } : {}), ...(write !== undefined ? { write } : {}) });
+    return json(res, 200, { ...hostsView(h), ...(chain ? { chain, chainComplete: hostsSync.chainComplete() } : {}), ...(write !== undefined ? { write } : {}) });
   }
   if (p === '/api/hosts/followers' && method === 'GET') {
     if (!canChange(req)) return json(res, 403, { error: 'admin role required' });

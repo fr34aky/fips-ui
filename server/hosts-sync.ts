@@ -26,8 +26,9 @@ export interface SyncStatus {
   nextAttempt?: number;
   /** The master and the nodes it syncs from in turn, nearest first (as the master reported it). */
   chain?: string[];
-  /** Whether `chain` is the master's own report; otherwise it is just the configured master (after a failed sync, or
-   *  from a master too old to send one), and what is above it is unknown. */
+  /** Whether `chain` is complete up to the master node: every node in it reported its own upstream (it travels up
+   *  as `chainComplete` in the sync answers). Otherwise the top of `chain` is only the highest node known (after a
+   *  failed sync somewhere, or through a node too old to report), and what is above it is unknown. */
   chainConfirmed?: boolean;
 }
 
@@ -87,6 +88,9 @@ export class HostsSync {
   constructor(deps: SyncDeps) { this.deps = deps; }
 
   get file(): string { return FILE; }
+
+  /** Whether the chain this node reports is known up to the master node (true on the master node itself). */
+  chainComplete(): boolean { return !this.config.enabled || this.status.chainConfirmed === true; }
 
   /** The chain this node reports to its own followers: itself, then its master and that master's chain. */
   async chainFor(own: string): Promise<string[]> {
@@ -177,7 +181,7 @@ export class HostsSync {
     const subtree = await this.deps.subtree?.().catch(() => undefined);
     try { res = await fetch(url, { headers: { accept: 'application/json', 'x-fips-ui-sync': sync, 'user-agent': 'fips-ui-sync', ...(subtree !== undefined ? { 'x-fips-ui-subtree': subtree } : {}) }, signal: AbortSignal.timeout(15_000) }); }
     catch (e) { throw new SyncError(`cannot reach the upstream node at [${addr}]:${port} (${(e as Error).cause ? String(((e as Error).cause as Error).message ?? (e as Error).cause) : (e as Error).message}); is it online with "Web UI over the mesh" enabled on that port? Retrying once a day, or use Sync now`, 'offline'); }
-    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown } | null;
+    const body = await res.json().catch(() => null) as { entries?: HostEntry[]; error?: string; chain?: unknown; chainComplete?: unknown } | null;
     if (res.status === 403) {
       const own = await this.deps.ownNpub().catch(() => undefined);
       throw new SyncError(`the upstream node refused this node${body?.error ? ` (${body.error})` : ''}: on it, add ${own ?? "this node's npub"} as a viewer under Access → Web UI over the mesh, then use Sync now`, 'offline');
@@ -207,7 +211,7 @@ export class HostsSync {
     }
     if (chain.length > MAX_CHAIN) throw new SyncError(`the chain of upstream nodes is longer than ${MAX_CHAIN} nodes; this node keeps its current names`);
     this.status.chain = chain;
-    this.status.chainConfirmed = Array.isArray(body.chain);
+    this.status.chainConfirmed = Array.isArray(body.chain) && body.chainComplete === true;
     return { valid: [...byName].map(([hostname, npub]) => ({ hostname, npub })), skipped };
   }
 

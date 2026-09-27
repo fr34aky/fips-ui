@@ -224,7 +224,7 @@ function SyncChain({ chain, confirmed, failing }: { chain: string[]; confirmed: 
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs" aria-label="Sync hierarchy">
       <span className="text-ink-3 mr-1">Names flow</span>
       {/* Only the upstream node's own report shows what is above it; otherwise just that node is known. */}
-      {!confirmed && <span className="text-ink-3 inline-flex items-center gap-1.5" title={failing ? 'Known again after the next successful sync' : 'The upstream node runs a fips-ui version that does not report where its names come from'}>{failing ? 'upstream unknown' : 'further up not reported'}<ChevronRight size={13} /></span>}
+      {!confirmed && <span className="text-ink-3 inline-flex items-center gap-1.5" title={failing ? 'Known again after the next successful sync' : 'A node further up could not confirm where its names come from (its own sync is failing, or it runs an older fips-ui)'}>{failing ? 'upstream unknown' : 'further up not confirmed'}<ChevronRight size={13} /></span>}
       {path.map((n, i) => (
         <span key={n} className="inline-flex items-center gap-1.5">
           <span className="rounded-md bg-surface-2 px-2 py-0.5 inline-flex items-center gap-1.5">
@@ -321,16 +321,17 @@ function FollowersPanel({ readOnly }: { readOnly: boolean }) {
         {list.map((f) => {
           // Overdue after three missed intervals (5 minutes when the follower does not report its interval).
           const overdue = Date.now() - f.lastSeen > 3 * (f.intervalMin ?? 5) * 60_000;
-          const below = f.below?.length ?? 0;
+          // Its role as it reported it on its last sync; a node that stopped syncing is not shown as passing names on.
+          const below = (f.below?.length ?? 0) + (f.belowMore ?? 0);
           const isOpen = open.has(f.npub);
           return (
             <FollowerRows key={f.npub} f={f} isOpen={isOpen}>
               <tr>
                 <td>
                   <span className="inline-flex items-center gap-1.5 min-w-0">
-                    {below > 0 ? <button className="btn ghost icon sm -ml-1" aria-expanded={isOpen} title={isOpen ? 'Hide the nodes below' : 'Show the nodes below'} onClick={() => toggle(f.npub)}>{isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button> : <span className="w-6" />}
+                    {(f.below?.length ?? 0) > 0 ? <button className="btn ghost icon sm -ml-1" aria-expanded={isOpen} title={isOpen ? 'Hide the nodes below' : 'Show the nodes below'} onClick={() => toggle(f.npub)}>{isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button> : <span className="w-6" />}
                     <NpubInline npub={f.npub} />
-                    {below > 0 && <><RoleChip role="distribution" /><Chip title="Nodes syncing from this one, directly or further down, as it reports them">{below + (f.belowMore ?? 0)} below</Chip></>}
+                    {below > 0 && !overdue && <><RoleChip role="distribution" /><Chip title="Nodes syncing from this one, directly or further down, as it reports them">{below} below</Chip></>}
                   </span>
                 </td>
                 <td>{overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>

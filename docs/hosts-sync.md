@@ -84,8 +84,9 @@ versions before this check send no chain, so loops through them are not detected
 
 - **Upward**: a syncing node's card shows where its names come from, from the chain its upstream node reported:
   `A (master node) › B (distribution node, parent) › this node`. It changes with the next sync when a node
-  moves. After a failed sync, or when the upstream node runs an older fips-ui, only the parent is known and the
-  card says so.
+  moves. The top is labelled master node only when every node on the way confirmed its own upstream (each sync
+  answer says whether its chain is complete); after a failed sync anywhere above, or through a node on an older
+  fips-ui, the card shows the nodes known and says that what is further up is not confirmed.
 - **Downward**: the list of nodes syncing from this one is a tree. Each node's row shows its role and how many
   nodes sync below it (`3 below`); the arrow opens them, indented by depth, with the node each one syncs from.
 
