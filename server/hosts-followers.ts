@@ -15,6 +15,15 @@ const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
  * node describes its own subtree, so nothing is granted or changed because of it.
  */
 export interface SubNode { npub: string; parent: string }
+
+/**
+ * A node's place in the sync tree: the master node is the origin of the names (others sync from it, it syncs from
+ * no one), a distribution node syncs from another node and is synced from in turn, a follower only syncs.
+ */
+export type SyncRole = 'master' | 'distribution' | 'follower' | 'none';
+export function syncRole(syncing: boolean, activeFollowers: number): SyncRole {
+  return syncing ? (activeFollowers > 0 ? 'distribution' : 'follower') : activeFollowers > 0 ? 'master' : 'none';
+}
 /** Nodes reported in one subtree at most (the header stays under ~9 KB); the rest is only counted. */
 export const MAX_SUBTREE = 128;
 /** Depth below a follower, like the chain of masters upward (server/hosts-sync.ts MAX_CHAIN). */
@@ -135,6 +144,9 @@ export class HostsFollowers {
     for (const f of active) { for (const n of f.below ?? []) add(n.npub, n.parent); more += f.belowMore ?? 0; }
     return [...out, ...(more ? [`+${more}`] : [])].join(',');
   }
+
+  /** How many followers still sync (see active). */
+  async activeCount(now = Date.now()): Promise<number> { await this.load(); return [...this.map.values()].filter((f) => HostsFollowers.active(f, now)).length; }
 
   async list(): Promise<Follower[]> { await this.load(); return [...this.map.values()].sort((a, b) => b.lastSeen - a.lastSeen); }
 

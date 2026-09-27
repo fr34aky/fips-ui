@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request reports the sender's own subtree (header `x-fips-ui-subtree`, at most
   128 nodes), so no extra requests are made; nodes that stop syncing drop out.
   `npm test` runs the new unit tests, also in CI.
+- **Sync roles**: each node shows its role in the sync tree: **master node**
+  (the origin of the names), **distribution node** (syncs from another node and
+  passes the names on) or **follower**; the breadcrumb and the tree label nodes
+  the same way. The setting is now "Sync names from another node", and the node
+  synced from is called the upstream node.
 
 - **Installing fips from scratch** (helper v9, verb `daemon-install`): on a
   machine without the fips daemon, `deploy/setup-local.sh` offers to install the

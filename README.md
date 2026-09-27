@@ -5,7 +5,7 @@ It talks to the daemon's control socket directly, streams live state to the brow
 Server-Sent Events and follows the daemon's log. It can connect and disconnect peers and run
 reachability probes. With its small privileged helper it also edits `fips.yaml`, manages the fips
 firewall and services, and upgrades the daemon. Other FIPS nodes can open the dashboard over the mesh,
-authorised by npub. Names from the FIPS hosts file (optionally synced from a master node) are shown next
+authorised by npub. Names from the FIPS hosts file (optionally synced from another node, in a tree below a master node) are shown next
 to npubs throughout, and fips-ui can update itself to its newest release.
 
 ![overview](docs/screenshots/overview.png)
@@ -22,7 +22,7 @@ to npubs throughout, and fips-ui can update itself to its newest release.
 | **Internals** | Every protocol counter family (searchable), routing state (pending lookups, retries, congestion), Bloom filters with fill meters, coordinate and identity caches. |
 | **Logs** | Live `journalctl -u fips` with level filter, search, pause, and target highlighting. |
 | **Diagnostics** | Staged reachability probes (bloom → discovery → path → session → RTT) against any npub or hosts-file name, with path visualisation and a run history. |
-| **Access** | **Web UI over the mesh**: other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). The **hosts file** editor: names for npubs, resolved as `<name>.fips` and shown next to npubs everywhere in the UI, with each name's web UI access ([docs/hosts.md](docs/hosts.md)); optionally synced from a master node over the mesh, with the followers listed on the master ([docs/hosts-sync.md](docs/hosts-sync.md)). Also peer ACL state, firewall exposure of local listeners and identity file facts. |
+| **Access** | **Web UI over the mesh**: other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). The **hosts file** editor: names for npubs, resolved as `<name>.fips` and shown next to npubs everywhere in the UI, with each name's web UI access ([docs/hosts.md](docs/hosts.md)); optionally synced from another node over the mesh, in a tree of master, distribution and follower nodes that each node shows ([docs/hosts-sync.md](docs/hosts-sync.md)). Also peer ACL state, firewall exposure of local listeners and identity file facts. |
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
 | **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. Offers template merges from daemon upgrades that need review. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
@@ -102,8 +102,8 @@ Everything is via environment variables.
 | `FIPS_GATEWAY_SOCKET` | auto | Gateway control socket override. |
 | `FIPS_UNIT` | `fips.service` | Journal unit to follow (systemd only). |
 | `FIPS_HOSTS` | per OS | Hosts file ([docs/hosts.md](docs/hosts.md)). |
-| `FIPS_UI_HOSTS_SYNC_FILE` | `~/.config/fips-ui/hosts-sync.json` | Settings for syncing names from a master. |
-| `FIPS_UI_HOSTS_FOLLOWERS_FILE` | `~/.config/fips-ui/hosts-followers.json` | On a master: the nodes that sync from it. |
+| `FIPS_UI_HOSTS_SYNC_FILE` | `~/.config/fips-ui/hosts-sync.json` | Settings for syncing names from another node. |
+| `FIPS_UI_HOSTS_FOLLOWERS_FILE` | `~/.config/fips-ui/hosts-followers.json` | On a master or distribution node: the nodes that sync from it. |
 | `FIPS_UI_CONFIG_PROPOSAL_FILE` | `~/.config/fips-ui/config-proposal.json` | A fips.yaml template merge waiting for review. |
 | `FIPS_UI_REPO` | `fr34aky/fips-ui` | Repository whose releases fips-ui installs for itself. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
@@ -164,9 +164,9 @@ POST /api/service/<id>/<action>      start|stop|restart|reload for fips, fips-dn
 
 GET  /api/hosts                      hosts file: effective names, local entries, synced block (+ how it can be written, for admins)
 POST /api/hosts                      {entries, base}  replace the local entries (admin)
-GET  /api/hosts/sync                 sync-from-master settings and status (admin);  POST {enabled, master, port, intervalMin}
+GET  /api/hosts/sync                 sync settings, status and this node's role (admin);  POST {enabled, master (the upstream node), port, intervalMin}
 POST /api/hosts/sync/run             sync now
-GET  /api/hosts/followers            on a master: the nodes that sync from it (admin);  POST /api/hosts/followers/forget {npub}
+GET  /api/hosts/followers            the nodes that sync from this one, with their subtrees (admin);  POST /api/hosts/followers/forget {npub}
 GET  /api/access                     Web UI over the mesh: settings, status, who you are;  POST (admin) saves them
 GET  /api/ui-update                  newest fips-ui release and update state;  POST /api/ui-update/install {tag} (admin)
      /api/admin/*                    configuration, firewall, services through the helper (admin), see docs/node-management.md
@@ -183,7 +183,7 @@ server/        zero-dependency Node backend
   control.ts     control-socket client        platform.ts, system.ts  service state, logs, host facts per OS
   access.ts      Web UI over the mesh         net6.ts                 IPv6 helpers
   admin.ts       configuration, firewall and services through the helper
-  hosts.ts       hosts file                   hosts-sync.ts, hosts-followers.ts  syncing names from a master
+  hosts.ts       hosts file                   hosts-sync.ts, hosts-followers.ts  syncing names between nodes
   upgrade.ts     daemon upgrades              config-merge.ts         fips.yaml template merge after upgrades
   self-update.ts fips-ui's own updates        journal.ts, http.ts     log follower, HTTP helpers
 web/           Vite + React + Tailwind frontend (src/views/* one file per page, src/components/* shared, src/lib/* API and stores)
@@ -199,7 +199,7 @@ docs/          feature documentation, screenshots
 | [docs/install.md](docs/install.md) | Installing and running fips-ui as a service on Linux, FreeBSD, pfSense, macOS and Windows |
 | [docs/mesh-access.md](docs/mesh-access.md) | Web UI over the mesh: why no login is needed, roles, the spoofing guard |
 | [docs/hosts.md](docs/hosts.md) | The hosts-file editor, names next to npubs, web UI access per name |
-| [docs/hosts-sync.md](docs/hosts-sync.md) | Syncing names from a master, followers, chains of masters, loops, conflicts |
+| [docs/hosts-sync.md](docs/hosts-sync.md) | Syncing names between nodes: master, distribution and follower nodes, the hierarchy, loops, conflicts |
 | [docs/node-management.md](docs/node-management.md) | The helper, the configuration editor and its redaction, firewall rules, services |
 | [docs/upgrade.md](docs/upgrade.md) | Upgrading the fips daemon, the privilege model, the fips.yaml template merge |
 | [docs/self-update.md](docs/self-update.md) | fips-ui updating itself |
