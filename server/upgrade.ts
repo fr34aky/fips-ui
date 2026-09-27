@@ -679,8 +679,8 @@ export class UpgradeManager {
     return { path, raw: r.stdout.trim(), ...(p ?? {}) }
   }
 
-  async runningVersion(): Promise<{ version?: string; rev?: string; revFull?: string; uptime_secs?: number; pid?: number } | null> {
-    const d = await controlQuery(this.controlSocket, 'show_status')
+  async runningVersion(socket = this.controlSocket): Promise<{ version?: string; rev?: string; revFull?: string; uptime_secs?: number; pid?: number } | null> {
+    const d = await controlQuery(socket, 'show_status')
     if (!d) return null
     const p = parseVersionOutput(`fips ${String(d.version ?? '')}`)
     return { version: p?.version, rev: p?.rev, revFull: p?.revFull, uptime_secs: d.uptime_secs as number | undefined, pid: d.pid as number | undefined }
@@ -891,15 +891,28 @@ export class UpgradeManager {
     return this.launch(job, async () => {
       job.defineSteps([['install', 'Download, verify, configure and start fips (privileged)'], ['confirm', 'Confirm the daemon answers']])
       job.info(peers.length ? `fips.yaml: persistent identity, peers ${peers.map((p) => p.split('@')[1]).join(', ')}` : 'fips.yaml: persistent identity, no peers (the node waits for peers to dial it)')
+      // Interrupting the helper mid-install (apt, pkg, installer, the fips.yaml edit) would leave a half-installed
+      // fips that the helper then refuses to install again.
+      job.cancellable = false; job.emitState()
       // The tag this page showed (the helper finds the newest one itself when GitHub's API is unavailable here).
       const release = tag || await this.gh.latestRelease().then((x) => x.tag_name, () => '')
       const r = await job.runStep('install', () => installer.daemonInstall(job, /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(release) ? release : '', peers as string[]))
       job.result.artifact = r.artifact
       this.binDirCache = null
       await job.runStep('confirm', async () => {
+        // The socket the helper found: fips-ui chose its socket path at startup, before fips existed, and may
+        // have fallen back to a path nothing listens on. Then it restarts too, to pick up the real one.
+        const restartFor = (why: string) => {
+          if (this.restartUi?.()) { job.result.restarted = true; job.info(`${why}; fips-ui restarts now, and this page reloads`); return }
+          job.info(`${why}; restart fips-ui`)
+        }
         for (let i = 0; i < 20; i++) {
-          const v = await this.runningVersion()
-          if (v?.version) { job.result.runningVersion = v.version; job.info(`fips ${v.version} answers on ${this.controlSocket}`); return }
+          const v = await this.runningVersion(r.socket)
+          if (v?.version) {
+            job.result.runningVersion = v.version; job.info(`fips ${v.version} answers on ${r.socket}`)
+            if (r.socket !== this.controlSocket) restartFor(`fips-ui was started with the control socket ${this.controlSocket}`)
+            return
+          }
           await new Promise((res) => setTimeout(res, 500))
         }
         // The socket is there (the helper waited for it); this process just is not in its group yet.
@@ -907,10 +920,7 @@ export class UpgradeManager {
         let gid: number | null = null
         for (const p of [r.socket, dirname(r.socket)]) { try { gid = (await stat(p)).gid; if (p === r.socket || gid !== 0) break } catch { /* next */ } }
         const inGroup = gid !== null && (process.getgroups?.() ?? []).includes(gid)
-        if (gid !== null && !inGroup) {
-          if (this.restartUi?.()) { job.result.restarted = true; job.info('fips-ui was added to the fips group; it restarts now to open the control socket, and this page reloads'); return }
-          job.info('fips-ui was added to the fips group; restart fips-ui so it can open the control socket'); return
-        }
+        if (gid !== null && !inGroup) { restartFor('fips-ui was added to the fips group, which it needs to open the control socket'); return }
         throw new Error(`the daemon does not answer on ${r.socket}; check its log`)
       })
     })

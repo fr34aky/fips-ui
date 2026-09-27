@@ -27,5 +27,6 @@ while [[ $# -gt 0 ]]; do
     *) usage ;;
   esac
 done
-"$helper" daemon-install "$tag" ${peers[@]+"${peers[@]}"} >/dev/null
+# SUDO_USER is whoever typed sudo, not necessarily fips-ui's user: setup-local.sh adds that one to the group.
+SUDO_USER= "$helper" daemon-install "$tag" ${peers[@]+"${peers[@]}"} >/dev/null
 [[ ${#peers[@]} -gt 0 ]] || echo "note: no peers configured; add some on fips-ui's Configuration page (or in fips.yaml) and restart fips."
