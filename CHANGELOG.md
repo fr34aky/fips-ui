@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-27
+
 ### Added
 
 - **Node management beyond Linux/systemd** (helper v8): the configuration editor,
@@ -29,9 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where sudo from pkg reads `/usr/local/etc/sudoers.d`.
 - Service status showed fips as inactive on FreeBSD (root-only pid file); it now
   falls back to the daemon's own answer.
-
-### Fixed
-
 - **pfSense upgrades**: fips-ui treated pfSense like FreeBSD and would have
   installed the FreeBSD package, which does not work there (it never starts at
   boot). pfSense is now detected, and only the pfSense package for its ABI is
@@ -48,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settings, security, API, project layout) with an overview of the docs; new
   `docs/hosts.md` (hosts-file editor, names next to npubs, web UI access per
   name) and `docs/self-update.md`; followers section in `docs/hosts-sync.md`.
+
+### Upgrading
+
+- Install from the Upgrade page, then install helper v8: `sudo ./deploy/setup-local.sh`
+  (Linux with systemd) or `sudo ./deploy/install-upgrade-helper.sh` (FreeBSD,
+  pfSense, macOS; needs `bash`, `sudo` and `python3` with PyYAML).
 
 ## [0.6.0] - 2026-09-27
 
@@ -411,7 +416,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/fr34aky/fips-ui/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/fr34aky/fips-ui/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/fr34aky/fips-ui/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/fr34aky/fips-ui/compare/v0.5.2...v0.5.3
