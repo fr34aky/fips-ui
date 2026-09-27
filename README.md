@@ -2,8 +2,11 @@
 
 A modern web dashboard to **watch and manage a [FIPS](https://github.com/jmcorgan/fips) mesh node**.
 It talks to the daemon's control socket directly, streams live state to the browser over
-Server-Sent Events, follows the daemon's journal, and can connect/disconnect peers, run
-reachability probes, and (optionally) upgrade the node.
+Server-Sent Events and follows the daemon's log. It can connect and disconnect peers and run
+reachability probes. With its small privileged helper it also edits `fips.yaml`, manages the fips
+firewall and services, and upgrades the daemon. Other FIPS nodes can open the dashboard over the mesh,
+authorised by npub. Names from the FIPS hosts file (optionally synced from a master node) are shown next
+to npubs throughout, and fips-ui can update itself to its newest release.
 
 ![overview](docs/screenshots/overview.png)
 
@@ -12,18 +15,18 @@ reachability probes, and (optionally) upgrade the node.
 | Page | What you get |
 | ---- | ------------ |
 | **Overview** | Identity (npub, IPv6, node address), role in the tree, mesh-size / peers / depth / traffic / loss tiles with sparklines, uplink quality, systemd unit health, forwarding counters, transports, and which local services are exposed on `fips0` and how the fips firewall treats them. |
-| **Peers** | Sortable, filterable table of authenticated peers with role, RTT, loss, ETX, goodput and traffic. Click a peer for a detail panel with 10-minute RTT / loss / throughput charts, tree coordinates, Noise counters. **Connect** (npub or hostname, address, transport) and **Disconnect** with confirmation. |
+| **Peers** | Sortable, filterable table of authenticated peers (by name and npub) with role, RTT, loss, ETX, goodput and traffic. Click a peer for a detail panel with 10-minute RTT / loss / throughput charts, tree coordinates, Noise counters and a link to name it. **Connect** (npub or hostname, address, transport) and **Disconnect** with confirmation. |
 | **Topology** | The spanning tree drawn from the root down through the ancestry to this node and its children, with crosslink peers on the side. Coordinates, tree state and protocol counters. |
 | **Metrics** | Time series from the daemon's history rings: every node-level metric, one metric compared across peers, or all metrics for one peer. 10 min / 1 h at 1 s resolution, 6 h / 24 h at 1 min. |
 | **Network** | Transports (with interface presence for interface-bound ones), links per transport, end-to-end sessions, native datagram flows and listeners. |
 | **Internals** | Every protocol counter family (searchable), routing state (pending lookups, retries, congestion), Bloom filters with fill meters, coordinate and identity caches. |
 | **Logs** | Live `journalctl -u fips` with level filter, search, pause, and target highlighting. |
 | **Diagnostics** | Staged reachability probes (bloom → discovery → path → session → RTT) against any npub or hosts-file name, with path visualisation and a run history. |
-| **Access** | **Web UI over the mesh**: let other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). Also peer ACL state, firewall exposure of local listeners, identity file facts, and an editor for the FIPS **hosts file**: names for npubs, resolved as `<name>.fips` and shown next to npubs everywhere in the UI, optionally synced from a master node over the mesh ([docs/hosts-sync.md](docs/hosts-sync.md)). |
+| **Access** | **Web UI over the mesh**: other FIPS nodes open this dashboard, authorised by npub with viewer or admin roles and no password, because the mesh authenticates every connection's source address ([docs/mesh-access.md](docs/mesh-access.md)). The **hosts file** editor: names for npubs, resolved as `<name>.fips` and shown next to npubs everywhere in the UI, with each name's web UI access ([docs/hosts.md](docs/hosts.md)); optionally synced from a master node over the mesh, with the followers listed on the master ([docs/hosts-sync.md](docs/hosts-sync.md)). Also peer ACL state, firewall exposure of local listeners and identity file facts. |
 | **Gateway** | `fips-gateway` pool utilisation and mappings when the gateway socket is present. |
-| **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. See [docs/node-management.md](docs/node-management.md). |
+| **Configuration** | Edit `/etc/fips/fips.yaml` with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. Offers template merges from daemon upgrades that need review. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
-| **Upgrade** | Install the latest GitHub release (checksum-verified) or build any ref from source with cargo, with backups and rollback. Root steps go through a tiny helper you install once from a shell. See [docs/upgrade.md](docs/upgrade.md). Also updates **fips-ui itself** to its newest release (a git checkout is fast-forwarded, rebuilt and the service restarted); a new release shows next to the version in the sidebar. |
+| **Upgrade** | Install the latest fips release (checksum-verified) or build any ref from source with cargo, with backups and rollback; afterwards `fips.yaml` is merged with the new version's template ([docs/upgrade.md](docs/upgrade.md)). Root steps go through a tiny helper you install once from a shell. Also updates **fips-ui itself** to its newest release, shown next to the version in the sidebar ([docs/self-update.md](docs/self-update.md)). |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
 
@@ -32,6 +35,8 @@ Dark and light themes, responsive down to phone width, no external fonts or CDNs
 - Node.js 22.18+, 23.6+ or 24+ (the backend is TypeScript run directly by Node's unflagged type stripping; no build step for the server)
 - A running `fips` daemon; the UI user must be in the **`fips`** group to reach `/run/fips/control.sock`
 - `journalctl` access to the fips unit for the Logs page (membership in `systemd-journal`, or `adm` on Debian, or being the same user that runs the daemon)
+- For node management (Linux with systemd): the privileged helper (`sudo ./deploy/setup-local.sh`), `python3` with PyYAML for the configuration editor (Arch `python-yaml`, Debian/Ubuntu `python3-yaml`, Fedora `python3-pyyaml`), `nft` for the firewall
+- `git` for fips-ui's self-update and for merging `fips.yaml` with the template after daemon upgrades
 
 ## Operating systems
 
@@ -47,13 +52,18 @@ for everything else, so the read-only pages work wherever FIPS runs:
 | FreeBSD | `/var/run/fips/control.sock` | rc.d (`service fips`) | `/var/log/fips/fips.log` or `/var/log/fips.log` |
 | Windows | TCP `127.0.0.1:21210` | Service Control Manager | `%ProgramData%\fips\logs\fips.log` |
 
-The node-management pages (configuration editor, firewall) and remote access over the mesh currently need
-Linux with systemd. The hosts-file editor works everywhere: through the helper on Linux with systemd, elsewhere
-directly when the UI's user may write the hosts file (the per-OS path is in the Access page); the upgrade flow targets all of the above but has only been tested on Linux.
+What works beyond the read-only pages:
+
+| Feature | Where |
+| ------- | ----- |
+| Configuration editor, firewall, service buttons through the helper | Linux with systemd |
+| Web UI over the mesh | Linux with systemd (the helper loads its spoofing guard) |
+| Hosts-file editor | everywhere: through the helper on Linux with systemd, elsewhere directly when the UI may write the file |
+| fips.yaml template merge after daemon upgrades | Linux with systemd (skipped elsewhere) |
+| Daemon upgrade | all of the above (tested on Linux) |
+| fips-ui self-update | everywhere from a git checkout; restarts itself only under systemd |
+
 `deploy/setup-local.sh` is systemd-only.
-fips-ui's own update (Upgrade page) needs a git checkout and works on every system, but restarts itself only
-under systemd; elsewhere it builds the new version and asks you to restart fips-ui. The fips.yaml template
-merge after daemon upgrades needs Linux with systemd (the helper applies the file) and is skipped elsewhere.
 
 ## Quick start
 
@@ -90,10 +100,14 @@ Everything is via environment variables.
 | `FIPS_UI_LOG_FILE` | per OS | Read the daemon log from this file instead of the OS log system. |
 | `FIPS_GATEWAY_SOCKET` | auto | Gateway control socket override. |
 | `FIPS_UNIT` | `fips.service` | Journal unit to follow (systemd only). |
-| `FIPS_HOSTS` | `/etc/fips/hosts` | Hosts file to read. |
+| `FIPS_HOSTS` | per OS | Hosts file ([docs/hosts.md](docs/hosts.md)). |
+| `FIPS_UI_HOSTS_SYNC_FILE` | `~/.config/fips-ui/hosts-sync.json` | Settings for syncing names from a master. |
+| `FIPS_UI_HOSTS_FOLLOWERS_FILE` | `~/.config/fips-ui/hosts-followers.json` | On a master: the nodes that sync from it. |
+| `FIPS_UI_CONFIG_PROPOSAL_FILE` | `~/.config/fips-ui/config-proposal.json` | A fips.yaml template merge waiting for review. |
+| `FIPS_UI_REPO` | `fr34aky/fips-ui` | Repository whose releases fips-ui installs for itself. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
 
-Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are listed in [docs/upgrade.md](docs/upgrade.md).
+Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are listed in [docs/upgrade.md](docs/upgrade.md). `FIPS_UI_GITHUB_TOKEN` (a token without permissions) also lifts GitHub's 60-requests-per-hour limit for the release checks.
 
 ## Running as a service
 
@@ -114,8 +128,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fips-ui
 ```
 
 Then browse to `http://127.0.0.1:8321`, or put it behind a reverse proxy with TLS and authentication.
-Because the UI itself runs over the mesh just fine, you can also bind it to the node's `fd00::/8`
-address and open the port in the fips firewall to reach it from other mesh nodes.
+To open the dashboard from other FIPS nodes, turn on **Access → Web UI over the mesh** and allow their npubs;
+fips-ui then listens on the node's fips0 address and opens the port in the fips firewall for exactly those
+npubs ([docs/mesh-access.md](docs/mesh-access.md)). Updates of fips-ui itself are installed from the Upgrade page
+([docs/self-update.md](docs/self-update.md)).
 
 ## Security model
 
@@ -123,24 +139,35 @@ address and open the port in the fips firewall to reach it from other mesh nodes
 - Read queries are proxied through an allow-list; only `connect`, `disconnect` and the probe triplet are mutating, plus service control and upgrade when explicitly enabled/installed.
 - The web UI never asks for a sudo password. The only root-capable path is the helper, installed by an administrator from a shell with a single-command sudoers rule ([docs/upgrade.md](docs/upgrade.md#privilege-model)). With it, the UI can upgrade the node and manage its configuration, firewall and services ([docs/node-management.md](docs/node-management.md)); on a host shared with other users, set `FIPS_UI_TOKEN`.
 - Bind to loopback (default) or set `FIPS_UI_TOKEN`.
+- Over the mesh there is no password: FIPS authenticates each connection's source address, a kernel guard stops spoofed mesh addresses from the LAN, and only allowed npubs get in, as viewers or admins ([docs/mesh-access.md](docs/mesh-access.md)).
+- Secret values in `fips.yaml` never reach the browser: the helper redacts them and restores them on save ([docs/node-management.md](docs/node-management.md#what-the-redaction-protects-and-what-it-does-not)).
 
 ## API
 
 The frontend uses a small JSON API you can script against as well:
 
 ```
-GET  /api/health                     UI + daemon health, enabled features
+GET  /api/health                     UI + daemon health, enabled features, who you are
 GET  /api/snapshot                   latest polled state (status, peers, links, transports, tree, sessions, …)
-GET  /api/events                     SSE stream: `snapshot` every poll, `log` per journal line
+GET  /api/events                     SSE stream: `snapshot` every poll, `log` per log line
 GET  /api/q/<show_command>?k=v       any read-only control-socket query, e.g. /api/q/show_stats_history?metric=srtt_ms&peer=home&window=1h
-GET  /api/logs?lines=300             recent journal lines (parsed)
-GET  /api/hosts                      parsed /etc/fips/hosts
-GET  /api/system                     host + systemd unit state
+GET  /api/logs?lines=300             recent daemon log lines (parsed)
+GET  /api/system                     host facts + service state
+GET  /api/resolve?id=<name>          npub for an npub, hosts-file name or peer name
 POST /api/connect                    {peer, address, transport}
 POST /api/disconnect                 {peer}
 POST /api/probe/start                {peer}  → {probe_id}; POST /api/probe/:id (poll), POST /api/probe/:id/cancel
-POST /api/service/<unit>/<action>    start|stop|restart|reload (needs FIPS_UI_ALLOW_SERVICE_CONTROL=1)
-     /api/upgrade/*                  see docs/upgrade.md
+POST /api/service/<id>/<action>      start|stop|restart|reload for fips, fips-dns, fips-firewall, fips-gateway
+
+GET  /api/hosts                      hosts file: effective names, local entries, synced block (+ how it can be written, for admins)
+POST /api/hosts                      {entries, base}  replace the local entries (admin)
+GET  /api/hosts/sync                 sync-from-master settings and status (admin);  POST {enabled, master, port, intervalMin}
+POST /api/hosts/sync/run             sync now
+GET  /api/hosts/followers            on a master: the nodes that sync from it (admin);  POST /api/hosts/followers/forget {npub}
+GET  /api/access                     Web UI over the mesh: settings, status, who you are;  POST (admin) saves them
+GET  /api/ui-update                  newest fips-ui release and update state;  POST /api/ui-update/install {tag} (admin)
+     /api/admin/*                    configuration, firewall, services through the helper (admin), see docs/node-management.md
+     /api/upgrade/*                  daemon upgrades, see docs/upgrade.md
 ```
 
 `peer` accepts an npub, a name from `/etc/fips/hosts`, or the display name of a known peer.
@@ -148,12 +175,30 @@ POST /api/service/<unit>/<action>    start|stop|restart|reload (needs FIPS_UI_AL
 ## Project layout
 
 ```
-server/        zero-dependency Node backend (control.ts socket client, index.ts HTTP+SSE, journal.ts, system.ts, upgrade.ts)
-web/           Vite + React + Tailwind frontend (src/views/* one file per page, src/components/* shared)
-scripts/       fips-ui-helper (privileged upgrade helper), dev.mjs
-deploy/        systemd unit, helper installer, sudoers snippet
-docs/          upgrade.md, screenshots
+server/        zero-dependency Node backend
+  index.ts       HTTP + SSE server, routing, mesh-access wiring
+  control.ts     control-socket client        platform.ts, system.ts  service state, logs, host facts per OS
+  access.ts      Web UI over the mesh         net6.ts                 IPv6 helpers
+  admin.ts       configuration, firewall and services through the helper
+  hosts.ts       hosts file                   hosts-sync.ts, hosts-followers.ts  syncing names from a master
+  upgrade.ts     daemon upgrades              config-merge.ts         fips.yaml template merge after upgrades
+  self-update.ts fips-ui's own updates        journal.ts, http.ts     log follower, HTTP helpers
+web/           Vite + React + Tailwind frontend (src/views/* one file per page, src/components/* shared, src/lib/* API and stores)
+scripts/       fips-ui-helper (the privileged helper), dev.mjs
+deploy/        setup-local.sh, systemd unit, helper installer, sudoers snippet
+docs/          feature documentation, screenshots
 ```
+
+## Documentation
+
+| Document | Covers |
+| -------- | ------ |
+| [docs/mesh-access.md](docs/mesh-access.md) | Web UI over the mesh: why no login is needed, roles, the spoofing guard |
+| [docs/hosts.md](docs/hosts.md) | The hosts-file editor, names next to npubs, web UI access per name |
+| [docs/hosts-sync.md](docs/hosts-sync.md) | Syncing names from a master, followers, chains of masters, loops, conflicts |
+| [docs/node-management.md](docs/node-management.md) | The helper, the configuration editor and its redaction, firewall rules, services |
+| [docs/upgrade.md](docs/upgrade.md) | Upgrading the fips daemon, the privilege model, the fips.yaml template merge |
+| [docs/self-update.md](docs/self-update.md) | fips-ui updating itself |
 
 ## Contributing
 
