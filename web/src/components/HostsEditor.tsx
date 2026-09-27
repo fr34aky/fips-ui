@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, RefreshCw, Save, Stethoscope, Trash2, Undo2 } from 'lucide-react';
-import { Card, Chip, Copyable, Empty, ErrorNote, useToast } from './ui';
+import { Card, Chip, ConfirmDialog, Copyable, Empty, ErrorNote, useToast } from './ui';
 import { api, usePoll } from '../lib/api';
 import { NpubInline } from './PeerName';
+import { saveAccess, saveMessage, useAccess, type Role } from '../lib/access';
 import { fmtAgo } from '../lib/format';
 import { shortKey } from '../lib/format';
 import { refreshHosts, setHosts, useHosts, type HostsData } from '../lib/names';
@@ -26,6 +27,10 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
   const ref = useRef<HTMLDivElement>(null);
   const nameInput = useRef<HTMLInputElement>(null);
   const peers = snap.peers?.peers ?? [];
+  // Admins see and change each name's web UI access ("Web UI over the mesh"); others get no column.
+  const access = useAccess().data;
+  const showAccess = !!access?.config;
+  const accessHead = showAccess && <th title="Web UI over the mesh: which of these npubs may open this dashboard">Web UI{access!.config!.enabled ? '' : ' (off)'}</th>;
 
   // Adopt the file whenever it changes on disk and nothing is being edited.
   const saved: Row[] = useMemo(() => (data?.local ?? data?.entries)?.map((e) => ({ hostname: e.hostname, npub: e.npub, comment: e.comment })) ?? [], [data]);
@@ -84,12 +89,13 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
           <div className="grid">
             {data.error && <div className="p-4"><ErrorNote>{data.error}</ErrorNote></div>}
             {rows.length === 0 ? <Empty>No names yet.</Empty> : (
-              <div className="overflow-auto max-h-[32rem]"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Status</th><th>Note</th><th /></tr></thead><tbody>
+              <div className="overflow-auto max-h-[32rem]"><table className="data"><thead><tr><th>Name</th><th>npub</th><th>Status</th>{accessHead}<th>Note</th><th /></tr></thead><tbody>
                 {rows.map((h, i) => { const p = peers.find((x) => x.npub === h.npub); const isNew = !saved.some((s) => s.hostname === h.hostname && s.npub === h.npub); return (
                   <tr key={i}>
                     <td><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td>
                     <td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>
                     <td>{isNew ? <Chip tone="accent">unsaved</Chip> : syncedNames.has(h.hostname) ? <Chip tone="warn" title="The master's entry with this name is the one in effect">overridden by master</Chip> : p ? <Chip tone="good">peer · {p.connectivity}</Chip> : h.npub === snap.status?.npub ? <Chip tone="accent">this node</Chip> : <Chip>not a direct peer</Chip>}</td>
+                    {showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}
                     <td className="text-xs text-ink-3 max-w-[320px] truncate" title={h.comment}>{h.comment}</td>
                     <td className="text-right whitespace-nowrap">
                       <button className="btn sm ghost" onClick={() => onProbe(h.hostname)} disabled={isNew}><Stethoscope size={13} />Probe</button>
@@ -104,7 +110,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                 <div className="px-4 pt-3 pb-1 text-xs text-ink-3 flex flex-wrap items-center gap-1.5">Synced from the master <NpubInline npub={synced.master} /> · {synced.entries.length} name{synced.entries.length === 1 ? '' : 's'} · read-only here, change them on the master</div>
                 <div className="overflow-auto max-h-[24rem]"><table className="data"><tbody>
                   {synced.entries.map((h) => (
-                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td><td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
+                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>{showAccess && <td><AccessCell npub={h.npub} hostname={h.hostname} readOnly={readOnly} /></td>}<td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
                   ))}
                 </tbody></table></div>
               </div>
@@ -190,4 +196,44 @@ const strip = (r: Row) => ({ hostname: r.hostname, npub: r.npub });
 function fmtIn(ts: number): string {
   const s = Math.max(0, Math.round((ts - Date.now()) / 1000));
   return s < 90 ? 'in a minute' : s < 5400 ? `in ${Math.round(s / 60)} min` : `in ${Math.round(s / 3600)} h`;
+}
+
+/** One name's web UI access: not allowed, viewer or admin. Changing it saves the allowed list at once. */
+function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: string; readOnly: boolean }) {
+  const toast = useToast();
+  const { data } = useAccess();
+  const [busy, setBusy] = useState(false);
+  const [confirmAdmin, setConfirmAdmin] = useState(false);
+  const cfg = data?.config;
+  if (!cfg) return null;
+  const entry = cfg.allowed.find((e) => e.npub === npub);
+  if (data.status?.npub === npub) return <span className="text-xs text-ink-3">this node</span>;
+  if (readOnly) return entry ? <Chip tone={entry.role === 'admin' ? 'accent' : 'neutral'}>{entry.role}</Chip> : <span className="text-xs text-ink-3">not allowed</span>;
+  const set = async (role: Role | 'none') => {
+    const you = data.you;
+    if (you.kind === 'mesh' && you.npub === npub && role !== 'admin') { toast('err', 'That would remove your own admin access; change it in the list under Web UI over the mesh'); return; }
+    const allowed = role === 'none' ? cfg.allowed.filter((e) => e.npub !== npub)
+      : entry ? cfg.allowed.map((e) => (e.npub === npub ? { ...e, role } : e))
+        : [...cfg.allowed, { npub, role, label: hostname }];
+    setBusy(true);
+    try {
+      const res = await saveAccess({ ...cfg, allowed });
+      const m = saveMessage(res);
+      toast(m.tone, `${hostname}: ${role === 'none' ? 'no web UI access' : `${role} access`}${m.tone === 'ok' ? '' : ` (${m.text.replace(/^Access saved; /, '')})`}`);
+    } catch (x) { toast('err', (x as Error).message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <>
+      <select className={`input h-8 w-32 ${entry ? '' : 'text-ink-3'}`} aria-label={`Web UI access for ${hostname}`} value={entry?.role ?? 'none'} disabled={busy}
+        onChange={(e) => { const role = e.target.value as Role | 'none'; if (role === 'admin') setConfirmAdmin(true); else void set(role); }}>
+        <option value="none">not allowed</option>
+        <option value="viewer">viewer</option>
+        <option value="admin">admin</option>
+      </select>
+      <ConfirmDialog open={confirmAdmin} onClose={() => setConfirmAdmin(false)} onConfirm={async () => { setConfirmAdmin(false); await set('admin'); }} busy={busy} danger
+        title={`Give ${hostname} admin access?`} confirmLabel="Give admin access"
+        body={<>Admin over the mesh has the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to an npub whose key you trust as much as this host's own login; every local user of that node shares the grant.</>} />
+    </>
+  );
 }
