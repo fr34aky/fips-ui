@@ -51,13 +51,21 @@ export function parseHosts(raw: string): HostEntry[] {
   return [...byName.values()];
 }
 
-export function validateEntries(input: unknown): { hostname: string; npub: string }[] {
+/**
+ * Validate the entries of a save. An entry exactly as it already is in the file is accepted unchanged (a
+ * hand-written line the UI would not create must not block every other change); new and changed entries must
+ * be valid.
+ */
+export function validateEntries(input: unknown, existing: HostEntry[] = []): { hostname: string; npub: string }[] {
   if (!Array.isArray(input) || input.length > 2000) throw new HostsError('entries must be an array of at most 2000 items');
+  const kept = new Set(existing.map((e) => `${e.hostname} ${e.npub}`));
   const seen = new Set<string>();
   return input.map((x) => {
     const e = x as { hostname?: unknown; npub?: unknown };
-    const hostname = String(e?.hostname ?? '').trim().toLowerCase();
-    const npub = String(e?.npub ?? '').trim();
+    const raw = { hostname: String(e?.hostname ?? '').trim(), npub: String(e?.npub ?? '').trim() };
+    if (kept.has(`${raw.hostname} ${raw.npub}`) && !seen.has(raw.hostname)) { seen.add(raw.hostname); return raw; }
+    const hostname = raw.hostname.toLowerCase();
+    const npub = raw.npub;
     if (!HOSTNAME_RE.test(hostname)) throw new HostsError(`'${hostname}' is not a valid name: lowercase letters, digits and hyphens, at most 63 characters, no hyphen at either end`);
     if (!NPUB_RE.test(npub)) throw new HostsError(`invalid npub for ${hostname}`);
     if (seen.has(hostname)) throw new HostsError(`${hostname} is listed twice`);
@@ -102,10 +110,15 @@ export async function writeHostsDirect(content: string): Promise<void> {
   const dir = path.dirname(HOSTS_PATH);
   const tmp = path.join(dir, `.hosts.fips-ui-${process.pid}.tmp`);
   try {
-    // Atomic when the directory is writable; otherwise overwrite the file in place (it is small).
-    try { await fs.writeFile(tmp, content, { mode: 0o644 }); await fs.rename(tmp, HOSTS_PATH); return; }
-    catch (e) { await fs.unlink(tmp).catch(() => {}); if (!['EACCES', 'EPERM'].includes((e as NodeJS.ErrnoException).code ?? '')) throw e; }
-    await fs.writeFile(HOSTS_PATH, content);
+    if (existsSync(HOSTS_PATH)) {
+      // Rewritten in place, in one write, so its owner, group and mode stay as the admin set them (a rename would
+      // give the file to the UI's user and drop group write access).
+      await fs.writeFile(HOSTS_PATH, content);
+      return;
+    }
+    // A new file is created whole: written next to its final name, then renamed.
+    try { await fs.writeFile(tmp, content, { mode: 0o644 }); await fs.rename(tmp, HOSTS_PATH); }
+    catch (e) { await fs.unlink(tmp).catch(() => {}); throw e; }
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === 'EACCES' || code === 'EPERM') {

@@ -389,10 +389,10 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/hosts') {
     const { entries, base } = body as { entries?: unknown; base?: unknown };
-    let want: { hostname: string; npub: string }[];
-    try { want = validateEntries(entries); } catch (e) { throw new HttpError(400, (e as Error).message); }
     const cur = await readHosts();
     if (cur.error) throw new HttpError(500, `cannot read ${cur.path}: ${cur.error}`);
+    let want: { hostname: string; npub: string }[];
+    try { want = validateEntries(entries, cur.entries); } catch (e) { throw new HttpError(400, (e as Error).message); }
     if (base !== cur.base) throw new HttpError(409, `${cur.path} changed since it was loaded; reload and make the change again`);
     const content = renderHosts(cur.raw, want);
     const mode = await hostsWriteMode();

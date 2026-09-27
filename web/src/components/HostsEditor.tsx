@@ -52,7 +52,10 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
       try { npub = (await api.get<{ npub: string }>(`/api/resolve?id=${encodeURIComponent(npub)}`)).npub; }
       catch { toast('err', 'Enter an npub (npub1…) or the name of a connected peer'); return; }
     }
-    setDraft([...rows, { hostname, npub }]);
+    // An npub that already has a name is renamed (the "change…" link on a peer lands here).
+    const existing = rows.findIndex((r) => r.npub === npub);
+    if (existing >= 0) { toast('info', `${rows[existing].hostname} renamed to ${hostname}`); setDraft(rows.map((r, j) => (j === existing ? { hostname, npub } : r))); }
+    else setDraft([...rows, { hostname, npub }]);
     setAdd({ hostname: '', npub: '' });
   };
 
