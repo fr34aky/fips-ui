@@ -1,5 +1,5 @@
 # Smoke tests: install fips-ui the way docs/install.md describes on each system, next to the newest fips daemon
-# release where upstream ships one for it, and check the running UI with scripts/smoke-test.mjs.
+# release where upstream ships one for it (installed by setup-local.sh --install-fips where it supports the system), and check the running UI with scripts/smoke-test.mjs.
 # release.yml runs them on a tag before it publishes the release.
 # pfSense and OpenWrt have no images that run on GitHub's runners; they are not covered.
 name: Smoke tests
@@ -39,25 +39,25 @@ jobs:
           retention-days: 1
 
   linux-systemd:
-    name: Linux with systemd (Ubuntu 24.04, setup-local.sh)
-    needs: fips-release
+    name: Linux with systemd (Ubuntu 24.04, setup-local.sh --install-fips, ${{ matrix.artifact }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: [deb, tarball]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with: { name: fips-pkg, path: /tmp/fips-pkg }
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
-      - name: Install the fips daemon (.deb)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-yaml nftables /tmp/fips-pkg/fips_*_amd64.deb
-          sudo systemctl enable --now fips.service
-          sleep 3; systemctl --no-pager status fips.service | head -5
+      - name: Packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml nftables
       - name: Build
         run: npm run install:all && npm run build
-      - name: setup-local.sh
-        run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
+      - name: setup-local.sh, installing fips
+        run: |
+          sudo FIPS_UI_GITHUB_TOKEN=${{ github.token }} FIPS_UI_FIPS_ARTIFACT=${{ matrix.artifact }} \
+            ./deploy/setup-local.sh --install-fips "$USER" "$(command -v node)"
+          systemctl --no-pager status fips.service | head -4
       - name: Smoke test
         run: node scripts/smoke-test.mjs --os linux --daemon --helper --supervised
       - name: Restart after the process dies
@@ -141,30 +141,27 @@ jobs:
         run: cat /tmp/fips-ui.log /tmp/fips.log || true
 
   freebsd:
-    name: FreeBSD 15.1 (setup-local.sh)
-    needs: fips-release
+    name: FreeBSD 15.1 (setup-local.sh --install-fips)
     runs-on: ubuntu-24.04
+    env:
+      FIPS_UI_GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with: { name: fips-pkg, path: fips-pkg }
       - uses: vmactions/freebsd-vm@v1
         with:
           release: '15.1'
           usesh: true
+          envs: FIPS_UI_GITHUB_TOKEN
           prepare: |
             pkg install -y git bash sudo node24 npm-node24 python3 py312-pyyaml
           run: |
             set -e
-            pkg add fips-pkg/fips-*-freebsd-amd64.pkg
-            sysrc fips_enable=YES
-            service fips start </dev/null >/dev/null 2>&1
-            sleep 3; service fips status || true
             npm run install:all && npm run build
             pw useradd smoke -m -s /usr/local/bin/bash
             chmod -R a+rX "$GITHUB_WORKSPACE"
             p=$GITHUB_WORKSPACE; while [ "$p" != / ]; do chmod a+x "$p"; p=$(dirname "$p"); done
-            ./deploy/setup-local.sh smoke /usr/local/bin/node
+            ./deploy/setup-local.sh --install-fips smoke /usr/local/bin/node
+            service fips status
             node scripts/smoke-test.mjs --os freebsd --daemon --helper --supervised
             killed=$(date +%s); sleep 1
             pkill -KILL -u smoke node
@@ -173,27 +170,22 @@ jobs:
               || { tail -n 40 /var/log/fips-ui.log; exit 1; }
 
   macos:
-    name: macOS (setup-local.sh, experimental)
-    needs: fips-release
+    name: macOS (setup-local.sh --install-fips, experimental)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with: { name: fips-pkg, path: /tmp/fips-pkg }
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
-      - name: Install the fips daemon (.pkg)
+      - name: PyYAML
         run: |
-          sudo installer -pkg /tmp/fips-pkg/fips-*-macos-arm64.pkg -target /
           # PyYAML for the python3 the helper finds on the service's PATH (Homebrew's /opt/homebrew is not on it).
           py=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v python3); echo "helper python: $py"
           sudo PIP_BREAK_SYSTEM_PACKAGES=1 "$py" -m pip install -q pyyaml
           sudo "$py" -I -c 'import yaml; print("PyYAML", yaml.__version__)'
-          sleep 5; sudo launchctl list | grep -i fips || true; ls -l /var/run/fips || true
       - name: Build
         run: npm run install:all && npm run build
-      - name: setup-local.sh
-        run: sudo ./deploy/setup-local.sh "$USER" "$(command -v node)"
+      - name: setup-local.sh, installing fips
+        run: sudo FIPS_UI_GITHUB_TOKEN=${{ github.token }} ./deploy/setup-local.sh --install-fips "$USER" "$(command -v node)"
       - name: Smoke test
         run: node scripts/smoke-test.mjs --os macos --daemon --helper --supervised
       - name: Restart after the process dies

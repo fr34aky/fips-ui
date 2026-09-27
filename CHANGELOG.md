@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Installing fips from scratch**: on a machine without the fips daemon,
+  `deploy/setup-local.sh` offers to install the newest fips release first
+  (`--install-fips` without asking): the .deb on Debian/Ubuntu, the tarball's
+  installer on other Linux with systemd, the FreeBSD, pfSense or macOS package,
+  checksum-verified, then started. `deploy/install-fips.sh` does that step on
+  its own.
+
 ### Changed
 
 - **Releases are tags**: pushing a `vX.Y.Z` tag on `main` runs the smoke tests

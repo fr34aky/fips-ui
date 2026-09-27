@@ -114,7 +114,8 @@ Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are 
 
 On the machine where the checkout lives, one command installs the upgrade helper, a service running the UI
 from the checkout as your user (systemd, FreeBSD rc.d, pfSense boot script or macOS LaunchDaemon), and starts
-it; per-system details are in [docs/install.md](docs/install.md):
+it. On a machine without fips it offers to install the newest fips release first (`--install-fips` skips the
+question). Per-system details are in [docs/install.md](docs/install.md):
 
 ```sh
 sudo ./deploy/setup-local.sh
@@ -187,7 +188,7 @@ server/        zero-dependency Node backend
   self-update.ts fips-ui's own updates        journal.ts, http.ts     log follower, HTTP helpers
 web/           Vite + React + Tailwind frontend (src/views/* one file per page, src/components/* shared, src/lib/* API and stores)
 scripts/       fips-ui-helper (the privileged helper), dev.mjs
-deploy/        setup-local.sh (systemd, FreeBSD, pfSense, macOS), systemd unit, helper installer, sudoers snippet
+deploy/        setup-local.sh (systemd, FreeBSD, pfSense, macOS), install-fips.sh (fresh fips install), systemd unit, helper installer, sudoers snippet
 docs/          feature documentation, screenshots
 ```
 

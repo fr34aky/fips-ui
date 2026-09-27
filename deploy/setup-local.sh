@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-shot local setup, run with sudo from the repo checkout:
-#   sudo ./deploy/setup-local.sh [ui-user] [node-binary]
-# 1. checks preconditions (fips group, built frontend, Node 22.18+/23.6+/24+)
+#   sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [ui-user] [node-binary]
+# 1. checks preconditions (built frontend, Node 22.18+/23.6+/24+, the fips daemon); without fips it offers to
+#    install the newest fips release (deploy/install-fips.sh): asks on a terminal, --install-fips installs without
+#    asking, --no-install-fips stops instead
 # 2. installs the privileged helper + its single sudoers rule for <ui-user>
 # 3. installs a service that runs fips-ui from this checkout as <ui-user>, restarted when it exits (so the
 #    Upgrade page can update fips-ui itself):
@@ -13,9 +15,20 @@
 set -euo pipefail
 [[ $(id -u) -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 here=$(cd "$(dirname "$0")/.." && pwd)
-user=${1:-${SUDO_USER:-}}
-[[ -n "$user" ]] && id "$user" >/dev/null 2>&1 || { echo "usage: $0 <ui-user> [node-binary]" >&2; exit 1; }
 fail() { echo "error: $*" >&2; exit 1; }
+install_fips=ask
+args=()
+for a in "$@"; do
+  case "$a" in
+    --install-fips) install_fips=yes ;;
+    --no-install-fips) install_fips=no ;;
+    -*) fail "unknown option $a (usage: $0 [--install-fips|--no-install-fips] [ui-user] [node-binary])" ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+user=${1:-${SUDO_USER:-}}
+[[ -n "$user" ]] && id "$user" >/dev/null 2>&1 || { echo "usage: $0 [--install-fips|--no-install-fips] <ui-user> [node-binary]" >&2; exit 1; }
 
 # ---- which system ----
 os=$(uname -s)
@@ -43,9 +56,6 @@ home=$(home_of "$user")
 # ---- preconditions (nothing is changed until these pass) ----
 for p in "$here" "$home"; do [[ "$p" =~ [[:space:]%] ]] && fail "path '$p' contains whitespace or '%', which this script does not escape"; done
 [[ -d "$here/web/dist" ]] || fail "$here/web/dist missing: run 'npm run build' first"
-# The daemon's control socket belongs to group fips on Linux and FreeBSD; on macOS the package may not create it.
-fips_group=true; group_exists fips || fips_group=false
-[[ "$kind" == macos ]] || $fips_group || fail "group 'fips' does not exist; install and start the fips daemon first"
 node=${2:-}
 if [[ -z "$node" ]]; then
   # Resolve node the way the user's login shell would (covers mise/nvm/volta), then pin the real binary
@@ -66,6 +76,22 @@ IFS=. read -r maj min _ <<<"$ver"
 # node's own directory first on PATH: npm (self-update) lives next to it when node comes from nvm, mise or a tarball.
 svc_path="$(dirname "$node"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 echo "== $kind: node $ver at $node, UI user $user, checkout $here"
+
+# ---- the fips daemon (installed now if missing and wanted) ----
+if ! "$here/deploy/install-fips.sh" --check >/dev/null; then
+  if [[ "$install_fips" == ask ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "The fips daemon is not installed. Install the newest fips release now? [y/N] " answer
+      [[ "$answer" =~ ^[Yy] ]] && install_fips=yes || install_fips=no
+    else install_fips=no; fi
+  fi
+  [[ "$install_fips" == yes ]] || fail "the fips daemon is not installed; install it first, or run again with --install-fips"
+  echo "== fips daemon"
+  "$here/deploy/install-fips.sh"
+fi
+# The daemon's control socket belongs to group fips on Linux and FreeBSD; on macOS the package may not create it.
+fips_group=true; group_exists fips || fips_group=false
+[[ "$kind" == macos ]] || $fips_group || fail "group 'fips' does not exist; install and start the fips daemon first"
 
 # ---- helper + sudoers rule (prints its own self-test) ----
 echo "== helper"
