@@ -9,7 +9,9 @@ export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?:
 export interface FirewallRule { proto: 'tcp' | 'udp'; ports: string; sources: RuleSource[]; comment?: string; tag?: string }
 export interface Dropin { name: string; content: string; size: number; mtime: number; managed: boolean }
 export interface FirewallState {
-  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null } | { error: string };
+  /** nftables (Linux) or pf (FreeBSD, macOS), and where the drop-ins live. */
+  backend?: 'nft' | 'pf'; dropinDir?: string; dropinExt?: string;
+  status: { unitActive: boolean; unitEnabled: string; tableLoaded: boolean; summary: { dropPackets: number; dropBytes: number; rules: number } | null; pfEnabled?: boolean; anchorReferenced?: boolean; anchor?: string } | { error: string };
   unit: { active: string; sub: string; unitFileState?: string; since?: number } | null;
   managedRules: FirewallRule[];
   dropins: Dropin[];

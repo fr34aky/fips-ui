@@ -103,7 +103,20 @@ export async function meshAddress(npub: string): Promise<string> {
   return addr.toLowerCase();
 }
 
-export async function renderManagedDropin(rules: FirewallRule[]): Promise<string> {
+/** Where the firewall's drop-ins live and in which language: nftables (Linux) or pf (FreeBSD, macOS). */
+export interface FwTarget { backend: 'nft' | 'pf'; dir: string; ext: string }
+
+/** A rule set in pf syntax, for the pf anchor ($tun is the FIPS interface, defined by the helper's baseline). */
+function renderPfRule(r: FirewallRule, resolved: RuleSource[]): string {
+  const pfPorts = r.ports.split(',').map((p) => p.replace('-', ':'));
+  const ports = pfPorts.length > 1 ? `{ ${pfPorts.join(', ')} }` : pfPorts[0];
+  const addrs = resolved.flatMap((s) => (s.kind === 'npub' ? [`${s.addr}/128`] : s.kind === 'prefix' ? [s.prefix.includes('/') ? s.prefix : `${s.prefix}/128`] : []));
+  const from = addrs.length === 0 ? 'any' : addrs.length === 1 ? addrs[0] : `{ ${addrs.join(', ')} }`;
+  const label = cleanComment(r.comment ?? `fips-ui ${r.proto} ${r.ports}`);
+  return `pass in on $tun inet6 proto ${r.proto} from ${from} to any port ${ports} keep state${label ? ` label "${label}"` : ''}`;
+}
+
+export async function renderManagedDropin(rules: FirewallRule[], backend: 'nft' | 'pf' = 'nft'): Promise<string> {
   const out = [
     '# Managed by fips-ui (Firewall page). Manual edits to this file are overwritten.',
     '# Each rule is preceded by its definition so the UI can read it back.',
@@ -117,7 +130,7 @@ export async function renderManagedDropin(rules: FirewallRule[]): Promise<string
     const saddr = addrs.length === 0 ? '' : addrs.length === 1 ? `ip6 saddr ${addrs[0]} ` : `ip6 saddr { ${addrs.join(', ')} } `;
     const comment = cleanComment(r.comment ?? `fips-ui ${r.proto} ${r.ports}`);
     out.push(`# fips-ui-rule ${JSON.stringify({ ...r, comment: cleanComment(r.comment) || undefined, sources: resolved })}`);
-    out.push(`${saddr}${r.proto} dport ${ports} accept${comment ? ` comment "${comment}"` : ''}`);
+    out.push(backend === 'pf' ? renderPfRule(r, resolved) : `${saddr}${r.proto} dport ${ports} accept${comment ? ` comment "${comment}"` : ''}`);
   }
   return out.join('\n') + '\n';
 }
@@ -136,13 +149,13 @@ export function parseManagedDropinStrict(text: string): { rules: FirewallRule[];
   return { rules, invalid };
 }
 
-async function readDropins(): Promise<{ name: string; content: string; size: number; mtime: number; managed: boolean }[]> {
-  if (!existsSync(DROPIN_DIR)) return [];
-  const names = (await readdir(DROPIN_DIR)).filter((n) => n.endsWith('.nft')).sort();
+async function readDropins(fw: FwTarget = { backend: 'nft', dir: DROPIN_DIR, ext: '.nft' }): Promise<{ name: string; content: string; size: number; mtime: number; managed: boolean }[]> {
+  if (!existsSync(fw.dir)) return [];
+  const names = (await readdir(fw.dir)).filter((n) => n.endsWith(fw.ext)).sort();
   return Promise.all(names.map(async (n) => {
-    const p = join(DROPIN_DIR, n);
+    const p = join(fw.dir, n);
     const [content, st] = await Promise.all([readFile(p, 'utf8').catch(() => ''), stat(p)]);
-    const name = n.slice(0, -4);
+    const name = n.slice(0, -fw.ext.length);
     return { name, content, size: st.size, mtime: st.mtimeMs, managed: name === MANAGED_DROPIN };
   }));
 }
@@ -183,6 +196,8 @@ export type HelperInfo = {
   managementCapable: boolean;
   features: HelperFeatures;
   serviceManager?: string; configPath?: string; hostsPath?: string;
+  /** Where the firewall's drop-ins live (/etc/fips/fips.d with .nft, or $etc/pf.d with .pf). */
+  firewallDropinDir?: string; firewallDropinExt?: string;
 };
 
 export function createAdminHandler(opts: AdminOptions) {
@@ -206,7 +221,7 @@ export function createAdminHandler(opts: AdminOptions) {
       if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false, features: NO_FEATURES };
       else {
         try {
-          const j = lastJson<{ ok: boolean; version: number; service_manager?: string; config_path?: string; hosts_path?: string; features?: Partial<HelperFeatures> }>(r.stdout);
+          const j = lastJson<{ ok: boolean; version: number; service_manager?: string; config_path?: string; hosts_path?: string; firewall_dropin_dir?: string; firewall_dropin_ext?: string; features?: Partial<HelperFeatures> }>(r.stdout);
           const systemd = j.service_manager === 'systemd';
           // Helpers before v8 do not report features: they did everything with systemd, nothing without it.
           const f: HelperFeatures = j.features
@@ -217,6 +232,7 @@ export function createAdminHandler(opts: AdminOptions) {
             installed: true, available: j.ok, version: j.version, features: f,
             managementCapable: j.ok && !tooOld && f.config,
             serviceManager: j.service_manager, configPath: j.config_path ?? '/etc/fips/fips.yaml', hostsPath: j.hosts_path ?? '/etc/fips/hosts',
+            firewallDropinDir: j.firewall_dropin_dir, firewallDropinExt: j.firewall_dropin_ext,
             error: tooOld ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh`
               : !f.config ? `node management is not supported with ${j.service_manager ?? 'this service manager'}` : undefined,
           };
@@ -254,15 +270,23 @@ export function createAdminHandler(opts: AdminOptions) {
     return helperJson(['service', action, name], undefined, 150_000);
   }
 
+  /** The firewall's backend and drop-in directory, as the helper reports them. */
+  async function fwTarget(): Promise<FwTarget> {
+    const h = await helperInfo();
+    return h.features.firewall === 'pf' && h.firewallDropinDir ? { backend: 'pf', dir: h.firewallDropinDir, ext: h.firewallDropinExt ?? '.pf' } : { backend: 'nft', dir: DROPIN_DIR, ext: '.nft' };
+  }
+
   async function firewallStatus() {
+    const fw = await fwTarget();
     const [st, dropins, units] = await Promise.all([
-      helperJson<{ unit_active: boolean; unit_enabled: string; table_loaded: boolean; ruleset: unknown }>(['firewall-status']).catch((e: Error) => ({ error: e.message })),
-      readDropins(),
+      helperJson<{ unit_active: boolean; unit_enabled: string; table_loaded: boolean; ruleset: unknown; summary?: { dropPackets: number; dropBytes: number; rules: number }; pf_enabled?: boolean; anchor_referenced?: boolean; anchor?: string }>(['firewall-status']).catch((e: Error) => ({ error: e.message })),
+      readDropins(fw),
       unitStates(),
     ]);
     const managed = dropins.find((d) => d.managed);
     return {
-      status: 'error' in st ? { error: st.error } : { unitActive: st.unit_active, unitEnabled: st.unit_enabled, tableLoaded: st.table_loaded, summary: summariseRuleset(st.ruleset) },
+      backend: fw.backend, dropinDir: fw.dir, dropinExt: fw.ext,
+      status: 'error' in st ? { error: st.error } : { unitActive: st.unit_active, unitEnabled: st.unit_enabled, tableLoaded: st.table_loaded, summary: st.summary ?? summariseRuleset(st.ruleset), pfEnabled: st.pf_enabled, anchorReferenced: st.anchor_referenced, anchor: st.anchor },
       unit: units.find((u) => u.id === 'fips-firewall') ?? null,
       managedRules: managed ? parseManagedDropin(managed.content) : [],
       dropins,
@@ -331,18 +355,19 @@ export function createAdminHandler(opts: AdminOptions) {
         if (!Array.isArray(body.rules)) throw new BodyError(400, 'rules (array) required');
         // Tagged rules (mesh access) belong to the UI itself: whatever a possibly stale page sends for them is
         // replaced by the rules currently on disk.
-        const managed = (await readDropins()).find((d) => d.managed);
+        const fw = await fwTarget();
+        const managed = (await readDropins(fw)).find((d) => d.managed);
         const kept = managed ? parseManagedDropinStrict(managed.content).rules.filter((r) => r.tag) : [];
         const rules = [...body.rules.map(validateRule).filter((r: FirewallRule) => !r.tag), ...kept];
         const result = await (rules.length === 0
-          ? (existsSync(join(DROPIN_DIR, `${MANAGED_DROPIN}.nft`)) ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false })
-          : helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(rules)));
+          ? (existsSync(join(fw.dir, `${MANAGED_DROPIN}${fw.ext}`)) ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false })
+          : helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], await renderManagedDropin(rules, fw.backend)));
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/firewall/dropin') {
         const { name, content } = body as { name?: unknown; content?: unknown };
         if (typeof name !== 'string' || !DROPIN_RE.test(name)) throw new BodyError(400, 'name must match [a-z0-9][a-z0-9_-]{0,40}');
-        if (name === MANAGED_DROPIN) throw new BodyError(400, `${MANAGED_DROPIN}.nft is managed through the rules editor`);
+        if (name === MANAGED_DROPIN) throw new BodyError(400, `the ${MANAGED_DROPIN} drop-in is managed through the rules editor`);
         if (typeof content !== 'string' || !content.trim()) throw new BodyError(400, 'content (non-empty string) required');
         const result = await helperJson<Record<string, unknown>>(['dropin-apply', name], content.endsWith('\n') ? content : content + '\n');
         sendJson(res, result.ok ? 200 : 422, result); return true;
@@ -374,12 +399,13 @@ export function createAdminHandler(opts: AdminOptions) {
     if (busy) return Promise.reject(new Error(busy));
     return exclusive(async () => {
       await requireHelper();
-      const managed = (await readDropins()).find((d) => d.managed);
+      const fw = await fwTarget();
+      const managed = (await readDropins(fw)).find((d) => d.managed);
       const current = managed ? parseManagedDropinStrict(managed.content) : { rules: [], invalid: 0 };
       if (current.invalid) throw new Error(`${MANAGED_DROPIN}.nft has ${current.invalid} rule definition(s) that no longer validate; fix them on the Firewall page first so they are not lost`);
       const next = mutate(current.rules).map(validateRule);
       if (next.length === 0) return managed ? helperJson<Record<string, unknown>>(['dropin-delete', MANAGED_DROPIN]) : { ok: true, reloaded: false };
-      const content = await renderManagedDropin(next);
+      const content = await renderManagedDropin(next, fw.backend);
       // Unchanged rules need no write and no firewall reload.
       if (managed && managed.content === content) return { ok: true, reloaded: false, unchanged: true };
       return helperJson<Record<string, unknown>>(['dropin-apply', MANAGED_DROPIN], content);
@@ -389,9 +415,12 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Load or remove the kernel guard that makes fd00::/8 source addresses trustworthy (see server/access.ts). */
   async function meshGuard(ports: number[] | null, tun: string, canary?: number): Promise<{ ok: boolean; error?: string }> {
     const h = await helperInfo();
-    // A helper older than the guard cannot have loaded it, so "off" is trivially satisfied.
-    if (!(ports && ports.length) && (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: true };
-    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return { ok: false, error: `mesh access needs helper v${GUARD_HELPER_VERSION} or newer (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh` };
+    // The nftables guard came with helper v5, the pf guard with v8.
+    const need = h.features.guard === 'pf' ? 8 : GUARD_HELPER_VERSION;
+    // A helper older than the guard (or one without a guard here) cannot have loaded it: "off" is trivially satisfied.
+    if (!(ports && ports.length) && ((h.version ?? 0) < need || h.features.guard === 'none')) return { ok: true };
+    if (h.available && h.features.guard === 'none') return { ok: false, error: 'the spoofing guard is not supported on this system, so mesh access stays off' };
+    if (!h.available || (h.version ?? 0) < need) return { ok: false, error: `mesh access needs helper v${need} or newer (installed: ${h.version ? `v${h.version}` : 'none'}); install it from the fips-ui directory` };
     const r = await runHelper(helperPath, ['mesh-guard', ports && ports.length ? ports.join(',') : 'off', tun, ...(canary ? [String(canary)] : [])], undefined, 30_000);
     if (r.code !== 0) return { ok: false, error: helperError(r) };
     return lastJson<{ ok: boolean; error?: string }>(r.stdout);
@@ -400,7 +429,7 @@ export function createAdminHandler(opts: AdminOptions) {
   /** Read-only: is the guard loaded, and for which ports and interface? */
   async function meshGuardStatus(): Promise<{ active: boolean; ports: number[]; tun: string; canary: number } | null> {
     const h = await helperInfo();
-    if (!h.available || (h.version ?? 0) < GUARD_HELPER_VERSION) return null;
+    if (!h.available || h.features.guard === 'none' || (h.version ?? 0) < (h.features.guard === 'pf' ? 8 : GUARD_HELPER_VERSION)) return null;
     const r = await runHelper(helperPath, ['mesh-guard', 'status'], undefined, 15_000);
     if (r.code !== 0) return null;
     try { const j = lastJson<{ active: boolean; ports?: string; tun?: string; canary?: string }>(r.stdout); return { active: j.active, ports: (j.ports ?? '').split(',').filter(Boolean).map(Number), tun: j.tun ?? '', canary: Number(j.canary ?? 0) }; }
