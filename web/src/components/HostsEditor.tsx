@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, Save, Stethoscope, Trash2, Undo2 } from 'lucide-react';
+import { Plus, RefreshCw, Save, Stethoscope, Trash2, Undo2 } from 'lucide-react';
 import { Card, Chip, Copyable, Empty, ErrorNote, useToast } from './ui';
-import { api } from '../lib/api';
+import { api, usePoll } from '../lib/api';
+import { NpubInline } from './PeerName';
+import { fmtAgo } from '../lib/format';
 import { shortKey } from '../lib/format';
 import { refreshHosts, setHosts, useHosts, type HostsData } from '../lib/names';
 import type { Snapshot } from '../lib/types';
@@ -26,7 +28,9 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
   const peers = snap.peers?.peers ?? [];
 
   // Adopt the file whenever it changes on disk and nothing is being edited.
-  const saved: Row[] = useMemo(() => data?.entries.map((e) => ({ hostname: e.hostname, npub: e.npub, comment: e.comment })) ?? [], [data]);
+  const saved: Row[] = useMemo(() => (data?.local ?? data?.entries)?.map((e) => ({ hostname: e.hostname, npub: e.npub, comment: e.comment })) ?? [], [data]);
+  const synced = data?.synced ?? null;
+  const syncedNames = useMemo(() => new Set(synced?.entries.map((e) => e.hostname) ?? []), [synced]);
   const dirty = draft !== null && JSON.stringify(draft.map(strip)) !== JSON.stringify(saved.map(strip));
   useEffect(() => { if (data && (!dirty || base === null)) { setDraft(saved); setBase(data.base); } }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -64,11 +68,11 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
     setBusy(true);
     try {
       const r = await api.post<HostsData>('/api/hosts', { entries: draft.map(({ hostname, npub }) => ({ hostname, npub })), base });
-      setHosts(r); setDraft(r.entries.map((x) => ({ ...x }))); setBase(r.base);
+      setHosts(r); setDraft((r.local ?? r.entries).map((x) => ({ ...x }))); setBase(r.base);
       toast('ok', 'Hosts file saved; the daemon picks it up on the next lookup');
     } catch (x) {
       toast('err', (x as Error).message);
-      if (/changed since/.test((x as Error).message)) { const d = await refreshHosts(); if (d) { setDraft(d.entries.map((e) => ({ ...e }))); setBase(d.base); } }
+      if (/changed since/.test((x as Error).message)) { const d = await refreshHosts(); if (d) { setDraft((d.local ?? d.entries).map((e) => ({ ...e }))); setBase(d.base); } }
     } finally { setBusy(false); }
   };
 
@@ -85,7 +89,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                   <tr key={i}>
                     <td><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td>
                     <td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td>
-                    <td>{isNew ? <Chip tone="accent">unsaved</Chip> : p ? <Chip tone="good">peer · {p.connectivity}</Chip> : h.npub === snap.status?.npub ? <Chip tone="accent">this node</Chip> : <Chip>not a direct peer</Chip>}</td>
+                    <td>{isNew ? <Chip tone="accent">unsaved</Chip> : syncedNames.has(h.hostname) ? <Chip tone="warn" title="The master's entry with this name is the one in effect">overridden by master</Chip> : p ? <Chip tone="good">peer · {p.connectivity}</Chip> : h.npub === snap.status?.npub ? <Chip tone="accent">this node</Chip> : <Chip>not a direct peer</Chip>}</td>
                     <td className="text-xs text-ink-3 max-w-[320px] truncate" title={h.comment}>{h.comment}</td>
                     <td className="text-right whitespace-nowrap">
                       <button className="btn sm ghost" onClick={() => onProbe(h.hostname)} disabled={isNew}><Stethoscope size={13} />Probe</button>
@@ -94,6 +98,16 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                   </tr>
                 ); })}
               </tbody></table></div>
+            )}
+            {synced && (
+              <div className="border-t border-[var(--border)]">
+                <div className="px-4 pt-3 pb-1 text-xs text-ink-3 flex flex-wrap items-center gap-1.5">Synced from the master <NpubInline npub={synced.master} /> · {synced.entries.length} name{synced.entries.length === 1 ? '' : 's'} · read-only here, change them on the master</div>
+                <div className="overflow-auto max-h-[24rem]"><table className="data"><tbody>
+                  {synced.entries.map((h) => (
+                    <tr key={h.hostname}><td className="w-48"><Copyable text={`${h.hostname}.fips`} display={<b>{h.hostname}</b>} mono={false} /></td><td><Copyable text={h.npub} display={shortKey(h.npub, 14, 8)} /></td><td className="text-right"><button className="btn sm ghost" onClick={() => onProbe(h.hostname)}><Stethoscope size={13} />Probe</button></td></tr>
+                  ))}
+                </tbody></table></div>
+              </div>
             )}
             {!readOnly && data.write && !mode && <div className="px-4 pt-3"><ErrorNote>{data.write.hint}</ErrorNote></div>}
             {editable && (
@@ -111,6 +125,7 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
                 </div>
               </div>
             )}
+            {!readOnly && data.write && <SyncPanel peers={peers} />}
           </div>
         )}
       </Card>
@@ -118,4 +133,60 @@ export function HostsEditor({ snap, onProbe, readOnly, prefillNpub }: { snap: Sn
   );
 }
 
+interface SyncConfig { enabled: boolean; master: string; port: number; intervalMin: number }
+interface SyncStatus { running: boolean; lastAttempt?: number; lastSuccess?: number; lastChange?: number; received?: number; skipped?: number; error?: string; unreachableSince?: number; nextAttempt?: number }
+
+/** Follow a master node: its hosts entries are fetched over the mesh and kept in a synced block of this file. */
+function SyncPanel({ peers }: { peers: { npub: string; display_name?: string | null }[] }) {
+  const toast = useToast();
+  const r = usePoll(() => api.get<{ config: SyncConfig; status: SyncStatus; own?: string }>('/api/hosts/sync'), [], 15000);
+  const [draft, setDraft] = useState<SyncConfig | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { if (r.data && !draft) setDraft(r.data.config); }, [r.data, draft]);
+  if (!r.data || !draft) return null;
+  const { config, status } = r.data;
+  const dirty = JSON.stringify(draft) !== JSON.stringify(config);
+  const post = async (path: string, body: unknown, ok: string) => {
+    setBusy(true);
+    try {
+      const res = await api.post<{ config: SyncConfig; status: SyncStatus }>(path, body);
+      setDraft(res.config); r.refresh(); void refreshHosts();
+      toast(res.status.error ? 'err' : 'ok', res.status.error ?? ok);
+    } catch (x) { toast('err', (x as Error).message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="grid gap-3 p-4 border-t border-[var(--border)]">
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" className="accent-[var(--accent)]" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} />Sync names from a master node</label>
+        {config.enabled && (status.error ? <Chip tone="crit" title={status.error}>sync failing</Chip> : status.lastSuccess ? <Chip tone="good">synced {fmtAgo(status.lastSuccess)}</Chip> : <Chip>not synced yet</Chip>)}
+        {config.enabled && <button className="btn sm ml-auto" disabled={busy || status.running} onClick={() => post('/api/hosts/sync/run', {}, 'Synced from the master')}><RefreshCw size={13} />Sync now</button>}
+      </div>
+      {draft.enabled && (
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="grid gap-1 text-xs text-ink-3 flex-1 min-w-[280px]">Master (npub or name)
+            <input className="input mono" list="hosts-sync-master" placeholder="npub1… or a name" value={draft.master} onChange={(e) => setDraft({ ...draft, master: e.target.value.trim() })} />
+            <datalist id="hosts-sync-master">{peers.map((p) => <option key={p.npub} value={p.npub}>{p.display_name ?? shortKey(p.npub, 12, 6)}</option>)}</datalist>
+          </label>
+          <label className="grid gap-1 text-xs text-ink-3">Its UI port<input className="input mono w-24" type="number" min={1} max={65535} value={draft.port} onChange={(e) => setDraft({ ...draft, port: Number(e.target.value) })} /></label>
+          <label className="grid gap-1 text-xs text-ink-3">Every (min)<input className="input mono w-24" type="number" min={1} max={1440} value={draft.intervalMin} onChange={(e) => setDraft({ ...draft, intervalMin: Number(e.target.value) })} /></label>
+        </div>
+      )}
+      {config.enabled && status.error && <ErrorNote>{status.error}{status.unreachableSince ? <> Offline since {fmtAgo(status.unreachableSince)}; the names synced last stay in effect.</> : null}{status.nextAttempt ? <> Next automatic try {fmtIn(status.nextAttempt)}.</> : null}</ErrorNote>}
+      {config.enabled && !status.error && status.lastSuccess && <p className="text-xs text-ink-3">{status.received} name{status.received === 1 ? '' : 's'} from the master{status.skipped ? `, ${status.skipped} invalid left out` : ''}; last change {status.lastChange ? fmtAgo(status.lastChange) : 'none since start'}.</p>}
+      <div className="flex items-center gap-2">
+        <p className="text-xs text-ink-3 mr-auto">The master's names are fetched over the mesh from its web UI and kept in a marked block at the end of this file; on a duplicate name the master's entry wins. On the master, enable <b>Web UI over the mesh</b> and add {r.data.own ? <span className="mono">{shortKey(r.data.own, 12, 6)}</span> : "this node's npub"} as a <b>viewer</b>. Turning sync off removes the synced names.</p>
+        {dirty && <button className="btn ghost" onClick={() => setDraft(config)}><Undo2 size={14} />Discard</button>}
+        <button className="btn primary" disabled={!dirty || busy} onClick={() => post('/api/hosts/sync', draft, draft.enabled ? 'Sync settings saved' : 'Sync turned off')}><Save size={14} />Save</button>
+      </div>
+    </div>
+  );
+}
+
 const strip = (r: Row) => ({ hostname: r.hostname, npub: r.npub });
+
+/** "in 5 min", "in 23 h" for a future timestamp. */
+function fmtIn(ts: number): string {
+  const s = Math.max(0, Math.round((ts - Date.now()) / 1000));
+  return s < 90 ? 'in a minute' : s < 5400 ? `in ${Math.round(s / 60)} min` : `in ${Math.round(s / 3600)} h`;
+}

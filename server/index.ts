@@ -9,8 +9,9 @@ import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, type FirewallRule } from './admin.ts';
-import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect } from './hosts.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
+import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
+import { HostsSync, SyncError } from './hosts-sync.ts';
 import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
@@ -282,6 +283,34 @@ async function hostsWriteMode(): Promise<{ mode: 'helper' | 'direct' | null; hin
   }
 }
 
+/** Write the whole hosts file through the helper or directly; `base` is the hash of the file it was built from. */
+async function writeHostsFile(content: string, base: string): Promise<void> {
+  const mode = await hostsWriteMode();
+  if (!mode.mode) throw new HostsError(mode.hint);
+  if (mode.mode === 'helper') {
+    const r = await admin.hostsApply(content, base);
+    if (!r.ok) throw new Error(r.error ?? 'the helper refused the change');
+    return;
+  }
+  // Direct: the same stale-file check the helper makes.
+  const now = await readHosts();
+  if (now.base !== base) throw new Error(`${HOSTS_PATH} changed since it was read`);
+  await writeHostsDirect(content);
+}
+
+/** What /api/hosts shows: the effective names, the node's own entries and the synced block. */
+function hostsView(h: HostsFile) {
+  return { path: h.path, entries: h.entries, local: h.local, synced: h.synced, base: h.base, error: h.error };
+}
+
+const hostsSync = new HostsSync({
+  ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
+  meshAddress,
+  write: writeHostsFile,
+  label: async (npub) => (await readHosts()).local.find((e) => e.npub === npub)?.hostname,
+});
+void hostsSync.start();
+
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   if (READ_ONLY) return null;
@@ -351,7 +380,11 @@ async function route(req: Req, res: Res) {
     const h = await readHosts();
     // Admins also learn whether (and how) this instance can write the file.
     const write = canChange(req) ? await hostsWriteMode() : undefined;
-    return json(res, 200, { path: h.path, entries: h.entries, base: h.base, error: h.error, ...(write !== undefined ? { write } : {}) });
+    return json(res, 200, { ...hostsView(h), ...(write !== undefined ? { write } : {}) });
+  }
+  if (p === '/api/hosts/sync' && method === 'GET') {
+    if (!canChange(req)) return json(res, 403, { error: 'admin role required' });
+    return json(res, 200, { config: hostsSync.config, status: hostsSync.status, file: hostsSync.file, own: lastSnapshot?.status && (lastSnapshot.status as { npub?: string }).npub });
   }
   if (p === '/api/system') return json(res, 200, { host: await hostInfo(), units: await unitStates() });
   if (p === '/api/logs') {
@@ -391,23 +424,28 @@ async function route(req: Req, res: Res) {
     const { entries, base } = body as { entries?: unknown; base?: unknown };
     const cur = await readHosts();
     if (cur.error) throw new HttpError(500, `cannot read ${cur.path}: ${cur.error}`);
+    // The editor changes the node's own entries; a synced block is kept as it is.
     let want: { hostname: string; npub: string }[];
-    try { want = validateEntries(entries, cur.entries); } catch (e) { throw new HttpError(400, (e as Error).message); }
+    try { want = validateEntries(entries, cur.local); } catch (e) { throw new HttpError(400, (e as Error).message); }
     if (base !== cur.base) throw new HttpError(409, `${cur.path} changed since it was loaded; reload and make the change again`);
     const content = renderHosts(cur.raw, want);
-    const mode = await hostsWriteMode();
-    if (!mode.mode) throw new HttpError(403, mode.hint);
+    try { if (content !== cur.raw) await writeHostsFile(content, cur.base); }
+    catch (e) { throw new HttpError(e instanceof HostsError ? 403 : /changed since|in progress/.test((e as Error).message) ? 409 : 500, (e as Error).message); }
+    return json(res, 200, { ok: true, ...hostsView(await readHosts()) });
+  }
+
+  if (p === '/api/hosts/sync') {
     try {
-      if (mode.mode === 'helper') {
-        const r = await admin.hostsApply(content, cur.base);
-        if (!r.ok) throw new HttpError(422, r.error ?? 'the helper refused the change');
-      } else if (content !== cur.raw) await writeHostsDirect(content);
-    } catch (e) {
-      if (e instanceof HttpError) throw e;
-      throw new HttpError(e instanceof HostsError ? 403 : /changed since/.test((e as Error).message) ? 409 : /in progress/.test((e as Error).message) ? 409 : 500, (e as Error).message);
-    }
-    const after = await readHosts();
-    return json(res, 200, { ok: true, path: after.path, entries: after.entries, base: after.base });
+      const b = body as { enabled?: unknown; master?: unknown; port?: unknown; intervalMin?: unknown };
+      // The master may be given by npub or by a name this node knows.
+      const master = b.enabled === true && typeof b.master === 'string' && b.master.trim() ? (await resolvePeer(b.master)).npub : b.master;
+      const status = await hostsSync.save({ ...b, master });
+      return json(res, 200, { config: hostsSync.config, status });
+    } catch (e) { throw e instanceof HttpError ? e : new HttpError(e instanceof SyncError ? 400 : 500, (e as Error).message); }
+  }
+  if (p === '/api/hosts/sync/run') {
+    if (!hostsSync.config.enabled) throw new HttpError(400, 'syncing from a master is not configured');
+    return json(res, 200, { config: hostsSync.config, status: await hostsSync.run() });
   }
 
   if (p === '/api/connect') {
@@ -667,4 +705,4 @@ server.listen(PORT, HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); hostsSync.close(); process.exit(0); });

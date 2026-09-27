@@ -5,7 +5,13 @@ import { api } from './api';
 
 export interface HostEntry { hostname: string; npub: string; comment?: string }
 export interface HostsData {
-  path: string; entries: HostEntry[]; base: string; error?: string;
+  path: string; base: string; error?: string;
+  /** Every name the daemon resolves (the last entry wins on a duplicate). */
+  entries: HostEntry[];
+  /** This node's own entries, which the editor changes. */
+  local?: HostEntry[];
+  /** Names synced from a master node, if this node follows one. */
+  synced?: { master: string; entries: HostEntry[] } | null;
   /** Present for admins: whether and how this UI can write the file. */
   write?: { mode: 'helper' | 'direct' | null; hint: string };
 }
