@@ -164,6 +164,8 @@ export interface Platform {
   usesHelper: boolean
   /** pfSense (FreeBSD underneath) needs its own packages: the FreeBSD one never starts there. */
   pfsense: { abi: string; tag: string | null } | null
+  /** NixOS: fips comes from the Nix store and is updated through the NixOS configuration, not from this page. */
+  nixos: boolean
 }
 
 /**
@@ -207,7 +209,7 @@ export function detectPlatform(): Platform {
   // On pfSense only its own package matches (never the FreeBSD one); with an unknown ABI nothing does.
   if (pfsense) table.freebsd.assetPattern = pfsense.tag ? new RegExp(`^fips-.*-pfsense-${reEscape(pfsense.tag)}-${arch}\\.pkg$`) : /(?!)/
   return {
-    os, arch, exe, pfsense,
+    os, arch, exe, pfsense, nixos: os === 'linux' && existsSync('/etc/NIXOS'),
     binaries: BASE_BINARIES.map((b) => b + exe),
     ...table[os],
     defaultWorkDir: join(dataHome, 'fips-ui'),
@@ -397,6 +399,8 @@ class GitHub {
 // ---------------------------------------------------------------------------
 
 type Listener = (ev: { type: 'log'; data: LogLine } | { type: 'state'; data: JobSummary }) => void
+const NIX_MANAGED = 'fips is managed by Nix on this NixOS system: update the fips flake input (nix flake update fips) and run nixos-rebuild switch'
+
 /** A bootstrap peer for a fresh install, as the helper takes it: npub1...@udp|tcp/host:port (same as its PEER_RE). */
 export const PEER_SPEC_RE = /^npub1[02-9ac-hj-np-z]{58}@(udp|tcp)\/([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\]|[0-9.]{7,15}):[0-9]{1,5}$/
 
@@ -797,7 +801,7 @@ export class UpgradeManager {
     } else master = { error: errMsg(headR) }
     const restartPending = !!(installed.version && running?.version && (installed.version !== running.version || (installed.revFull ?? installed.rev ?? '') !== (running.revFull ?? running.rev ?? '')))
     return {
-      platform: { os: this.platform.os, arch: this.platform.arch, pfsense: this.platform.pfsense, artifactKind: this.platform.artifactKind, installer: this.installer.kind, binDir: await this.binDir(), workDir: this.workDir, controlSocket: this.controlSocket },
+      platform: { os: this.platform.os, arch: this.platform.arch, pfsense: this.platform.pfsense, nixos: this.platform.nixos, artifactKind: this.platform.artifactKind, installer: this.installer.kind, binDir: await this.binDir(), workDir: this.workDir, controlSocket: this.controlSocket },
       installed, running, package: pkg, helper, toolchain, toolchainPlan, backups, release, master, restartPending,
       helperInstallScript: this.platform.usesHelper ? resolve(import.meta.dirname, '..', 'deploy', 'install-upgrade-helper.sh') : null,
       job: this.current?.summary() ?? null,
@@ -849,6 +853,7 @@ export class UpgradeManager {
     // Flags must be real booleans: a client that sends "true" or 1 has asked for something and must get a 400,
     // never a silent flip to the destructive default.
     for (const k of ['dryRun', 'restart', 'mergeConfig'] as const) if (reqIn[k] !== undefined && typeof reqIn[k] !== 'boolean') throw new Error(`${k} must be a boolean`)
+    if (this.platform.nixos) throw new Error(NIX_MANAGED)
     if (this.platform.pfsense && reqIn.source === 'master') throw new Error('building from source is not supported on pfSense (no Rust toolchain there, and pfSense needs its own package): install a release')
     const req: JobRequest = { ...reqIn, dryRun: reqIn.dryRun === true, restart: reqIn.restart !== false }
     if (req.source !== 'release' && req.source !== 'master') throw new Error('source must be "release" or "master"')
@@ -871,6 +876,7 @@ export class UpgradeManager {
    * the release's checksums, installs and starts it, and adds fips-ui's user to the fips group.
    */
   async installDaemon(reqIn: { tag?: unknown; peers?: unknown }): Promise<Job> {
+    if (this.platform.nixos) throw new Error(NIX_MANAGED)
     if (!(this.installer instanceof HelperInstaller)) throw new Error('installing fips from the UI needs the privileged helper, which this system does not have; install fips by hand (docs/install.md)')
     const tag = reqIn.tag === undefined || reqIn.tag === '' || reqIn.tag === 'latest' ? '' : reqIn.tag
     if (typeof tag !== 'string' || (tag && !/^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(tag))) throw new Error('tag must look like v0.5.1 (or be empty for the newest release)')
@@ -1135,6 +1141,7 @@ export class UpgradeManager {
   }
 
   async rollback(id: string): Promise<Job> {
+    if (this.platform.nixos) throw new Error(NIX_MANAGED)
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) throw new Error('invalid backup id')
     this.claimSlot()
     const job = new Job('release', { source: 'release' }, `rollback:${id}`, 'rollback')

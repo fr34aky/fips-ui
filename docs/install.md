@@ -7,6 +7,7 @@ prerequisites come from and which service manager `deploy/setup-local.sh` sets u
 | System | `setup-local.sh` installs | Settings file | Log | Status |
 | ------ | ------------------------- | ------------- | --- | ------ |
 | [Linux with systemd](#linux-with-systemd) | systemd unit `fips-ui.service` | `/etc/default/fips-ui` | `journalctl -u fips-ui` | tested, smoke-tested in CI (Ubuntu 24.04) |
+| [NixOS](#nixos) | the flake's NixOS module (`services.fips-ui`), next to upstream's `services.fips` | the module's options | `journalctl -u fips-ui` | NixOS VM test in CI |
 | [FreeBSD](#freebsd) | rc.d script `fips_ui` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | tested (FreeBSD 15.1 VM), smoke-tested in CI |
 | [pfSense](#pfsense) | boot script `rc.d/fips-ui.sh` (daemon(8)) | `/usr/local/etc/fips-ui.env` | `/var/log/fips-ui.log` | untested (no CI image), see the warning |
 | [macOS](#macos) | LaunchDaemon `network.fips-ui` | the plist itself | `/usr/local/var/log/fips-ui.log` | experimental, smoke-tested in CI |
@@ -101,6 +102,68 @@ for the firewall and Web UI over the mesh.
 
 Manage it with `sudo systemctl restart fips-ui`, logs with `journalctl -u fips-ui -f`. A dedicated service
 account instead of your own user is described in the README (Running as a service).
+
+## NixOS
+
+`setup-local.sh` does not fit NixOS: units, sudo rules and packages are declared in the NixOS configuration. fips-ui
+ships a flake with a package and a NixOS module instead, to use next to upstream fips' own module
+([packaging/nixos](https://github.com/jmcorgan/fips/tree/master/packaging/nixos)):
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fips = { url = "github:jmcorgan/fips"; inputs.nixpkgs.follows = "nixpkgs"; };
+    fips-ui = { url = "github:fr34aky/fips-ui"; inputs.nixpkgs.follows = "nixpkgs"; };
+  };
+  outputs = { nixpkgs, fips, fips-ui, ... }: {
+    nixosConfigurations.mynode = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        fips.nixosModules.default
+        fips-ui.nixosModules.default
+        {
+          nixpkgs.overlays = [ fips.overlays.default ];
+          services.fips.enable = true;
+          services.fips-ui.enable = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+Then `sudo nixos-rebuild switch --flake .#mynode`. To follow a release, pin the input to its tag
+(`github:fr34aky/fips-ui/v0.8.0`): such a build reports exactly that version; one from `main` reports the last
+release plus its commit (`0.8.0+nix.1a2b3c4`).
+
+| Option | Default | |
+| ------ | ------- | --- |
+| `services.fips-ui.enable` | `false` | Run fips-ui as `fips-ui.service`. |
+| `services.fips-ui.user` | `"fips-ui"` | The user it runs as; the default is a system user. Any user is added to the `fips` and `systemd-journal` groups. |
+| `services.fips-ui.host`, `.port` | `127.0.0.1`, `8321` | Where the dashboard listens. |
+| `services.fips-ui.environment` | `{ }` | Further `FIPS_UI_*` settings (README). |
+| `services.fips-ui.environmentFile` | `null` | A file with secrets such as `FIPS_UI_TOKEN`, read by systemd. |
+| `services.fips-ui.helper.enable` | `true` | The privileged helper, with its tools on its PATH, and one NOPASSWD sudo rule for the UI user. |
+| `services.fips-ui.meshAccess.openFirewall` | `false` | Open the dashboard's port on `fips0` in the NixOS firewall, for Web UI over the mesh. |
+
+What is different on NixOS:
+
+- **fips and fips-ui are updated with the flake** (`nix flake update fips fips-ui`, then `nixos-rebuild switch`). The
+  Upgrade page says so instead of installing, upgrading or rolling back fips, and fips-ui's own update card points
+  to the flake.
+- The **configuration editor** edits `/var/lib/fips/fips.yaml`, where upstream's module keeps it, with the usual
+  backup, health check and rollback; the file keeps its mode (group-writable for `fips`). The hosts file keeps
+  upstream's `root:fips 0664`.
+- **Services** can be started, stopped and restarted; whether they start at boot is part of the configuration.
+- The **Firewall page** does not apply: NixOS declares its firewall, and upstream's module has no
+  `fips-firewall` unit. **Web UI over the mesh** works: its guard is a separate nftables table that fips-ui
+  loads through the helper (a rebuild that flushes nftables removes it; fips-ui then stops mesh access until it has
+  loaded it again). Open the port on `fips0` with `meshAccess.openFirewall`.
+- The frontend is built by Nix from `web/package-lock.json`; the native build tools (rolldown, Tailwind's oxide,
+  lightningcss) are patched for the Nix store, so `programs.nix-ld` is not needed.
 
 ## FreeBSD
 

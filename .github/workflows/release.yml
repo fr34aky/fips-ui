@@ -71,7 +71,7 @@ jobs:
           [[ "$notes" == file ]] && args+=(--notes-file notes.md) || args+=(--generate-notes)
           [[ "$PRERELEASE" == true ]] && args+=(--prerelease) || args+=(--latest)
           gh release create "$TAG" "${args[@]}"
-      - name: Move [Unreleased] under the new version on main
+      - name: Move [Unreleased] under the new version on main, set package.json's version
         if: env.PRERELEASE == 'false'
         run: |
           prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$GITHUB_SHA^" 2>/dev/null || true)
@@ -95,9 +95,16 @@ jobs:
           s = re.sub(r'\n{3,}', '\n\n', s)
           open(p, 'w').write(s)
           PY
+          # package.json carries the last release for builds without git history (the Nix flake's version).
+          node -e '
+            const fs = require("fs"); const v = process.argv[1];
+            for (const f of ["package.json", "web/package.json"]) { const j = JSON.parse(fs.readFileSync(f, "utf8")); j.version = v; fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n"); }
+            const l = JSON.parse(fs.readFileSync("web/package-lock.json", "utf8")); l.version = v; if (l.packages && l.packages[""]) l.packages[""].version = v;
+            fs.writeFileSync("web/package-lock.json", JSON.stringify(l, null, 2) + "\n");
+          ' "$VERSION"
           git diff --quiet && exit 0
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -qam "Changelog: $VERSION"
+          git commit -qam "Changelog and version: $VERSION"
           for _ in 1 2 3; do git push origin HEAD:main && exit 0; git pull -q --rebase origin main; done
           echo "::warning::could not update CHANGELOG.md on main; move [Unreleased] under $VERSION by hand"

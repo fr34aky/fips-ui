@@ -28,6 +28,27 @@ jobs:
         with: { node-version: 24 }
       - run: npm test
 
+  nixos:
+    name: NixOS (flake package and VM test with upstream's fips module)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM for the NixOS VM test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: system-features = nixos-test benchmark big-parallel kvm
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - name: Package
+        run: nix build .#default -L
+      - name: NixOS VM test (fips + fips-ui modules, smoke test)
+        run: nix build .#checks.x86_64-linux.nixos -L
+
   fips-release:
     name: Fetch the fips daemon release
     runs-on: ubuntu-24.04

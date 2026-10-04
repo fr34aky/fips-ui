@@ -49,6 +49,7 @@ for everything else, so the read-only pages work wherever FIPS runs:
 | Linux, OpenRC | `/run/fips/control.sock` | rc-service | `/var/log/fips/fips.log` or `/var/log/fips.log` |
 | OpenWrt | `/run/fips/control.sock` | procd (ubus, `/etc/init.d/fips`) | logread |
 | macOS | `/var/run/fips/control.sock` | launchd (`com.fips.daemon`) | `/var/log/fips/fips.log`, else unified log |
+| NixOS | `/run/fips/control.sock` | systemd; installed with the flake's NixOS module ([docs/install.md](docs/install.md#nixos)) | journald |
 | FreeBSD | `/var/run/fips/control.sock` | rc.d (`service fips`) | `/var/log/fips/fips.log` or `/var/log/fips.log` |
 | Windows | TCP `127.0.0.1:21210` | Service Control Manager | `%ProgramData%\fips\logs\fips.log` |
 
