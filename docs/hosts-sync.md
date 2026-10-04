@@ -97,6 +97,10 @@ C and D, and each level knows its whole subtree one sync interval after the leve
 has not synced for three of its intervals drops out of its upstream node's report, and with it everything it
 reported, so a removed node disappears from every tree above it within a few intervals.
 
+A node that switched its upstream node (it synced from here, now syncs from a node below) keeps its old entry in the
+list until it is forgotten. While that entry is overdue and the node appears below a node that still syncs, the
+entry says **moved under** that node instead of showing it as overdue, and the tree counts it once.
+
 The tree is informational: each node describes its own subtree, so the rows below a node are labelled
 "reported by" it, and nothing is granted or changed because of them. Reports are checked (valid npubs, no
 repeats, no reference to the receiving node, depth at most 16); nodes on older fips-ui versions send none and

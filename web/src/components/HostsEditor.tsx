@@ -312,15 +312,23 @@ function FollowersPanel({ readOnly }: { readOnly: boolean }) {
   const forget = async (npub: string) => {
     try { await api.post('/api/hosts/followers/forget', { npub }); r.refresh(); } catch (x) { toast('err', (x as Error).message); }
   };
-  const total = list.length + list.reduce((n, f) => n + (f.below?.length ?? 0) + (f.belowMore ?? 0), 0);
+  // Overdue after three missed intervals (5 minutes when the follower does not report its interval).
+  const isOverdue = (f: Follower) => Date.now() - f.lastSeen > 3 * (f.intervalMin ?? 5) * 60_000;
+  // A follower that stopped syncing here but appears below a node that still syncs has moved there (it switched its
+  // upstream node): shown as moved, not as overdue, and counted once.
+  const movedUnder = new Map<string, Follower>();
+  for (const f of list) if (!isOverdue(f)) for (const n of f.below ?? []) if (!movedUnder.has(n.npub)) movedUnder.set(n.npub, f);
+  const tree = new Set<string>();
+  for (const f of list) { if (!isOverdue(f) || !movedUnder.has(f.npub)) tree.add(f.npub); for (const n of f.below ?? []) tree.add(n.npub); }
+  const total = tree.size + list.reduce((n, f) => n + (f.belowMore ?? 0), 0);
   const toggle = (npub: string) => setOpen((o) => { const n = new Set(o); if (n.has(npub)) n.delete(npub); else n.add(npub); return n; });
   return (
     <div className="border-t border-[var(--border)]">
       <div className="px-4 pt-3 pb-1 text-xs text-ink-3">Nodes syncing their names from this node · {list.length} direct{total > list.length ? `, ${total} in the whole tree` : ''}</div>
       <div className="overflow-auto max-h-[24rem]"><table className="data"><thead><tr><th>Node</th><th>Last sync</th><th>Names</th><th>Every</th><th>fips-ui</th><th /></tr></thead><tbody>
         {list.map((f) => {
-          // Overdue after three missed intervals (5 minutes when the follower does not report its interval).
-          const overdue = Date.now() - f.lastSeen > 3 * (f.intervalMin ?? 5) * 60_000;
+          const overdue = isOverdue(f);
+          const movedTo = overdue ? movedUnder.get(f.npub) : undefined;
           // Its role as it reported it on its last sync; a node that stopped syncing is not shown as passing names on.
           const below = (f.below?.length ?? 0) + (f.belowMore ?? 0);
           const isOpen = open.has(f.npub);
@@ -334,7 +342,7 @@ function FollowersPanel({ readOnly }: { readOnly: boolean }) {
                     {below > 0 && !overdue && <><RoleChip role="distribution" /><Chip title="Nodes syncing from this one, directly or further down, as it reports them">{below} below</Chip></>}
                   </span>
                 </td>
-                <td>{overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>
+                <td>{movedTo ? <span className="inline-flex items-center gap-1.5 text-xs text-ink-3" title={`Last synced from this node ${fmtAgo(f.lastSeen)}; it now syncs below another node. Forget removes this entry.`}><Chip>moved</Chip>under <NpubInline npub={movedTo.npub} head={8} tail={4} /></span> : overdue ? <Chip tone="warn" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip> : <Chip tone="good" title={`${f.count} syncs since ${new Date(f.firstSeen).toLocaleString()}`}>{fmtAgo(f.lastSeen)}</Chip>}</td>
                 <td className="tabular">{f.entries}</td>
                 <td className="text-xs text-ink-3">{f.intervalMin ? `${f.intervalMin} min` : '–'}</td>
                 <td className="text-xs text-ink-3" title={f.below === undefined ? 'Reports no subtree (older fips-ui)' : undefined}>{f.version ?? 'older'}</td>
