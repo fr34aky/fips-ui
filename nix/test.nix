@@ -11,7 +11,8 @@
         fips.nixosModules.default
         self.nixosModules.default
       ];
-      nixpkgs.overlays = [ fips.overlays.default ];
+      # The test framework fixes nixpkgs (no overlays): give upstream's module its package directly.
+      services.fips.package = fips.packages.${pkgs.stdenv.hostPlatform.system}.default;
       services.fips.enable = true;
       services.fips.dns.enable = false;
       services.fips-ui.enable = true;
@@ -36,7 +37,7 @@
       machine.succeed("curl -sf http://127.0.0.1:8321/api/admin/config | grep -q '/var/lib/fips/fips.yaml'")
       # The helper knows NixOS: no firewall unit to manage, fips binaries are not installed from the UI.
       machine.succeed("curl -sf http://127.0.0.1:8321/api/admin/status | grep -q '\"firewall\":\"none\"'")
-      out = machine.fail("curl -sf -X POST -H 'content-type: application/json' -d '{\"source\":\"release\"}' http://127.0.0.1:8321/api/upgrade/jobs")
+      machine.fail("curl -sf -X POST -H 'content-type: application/json' -d '{\"source\":\"release\"}' http://127.0.0.1:8321/api/upgrade/jobs")
       machine.succeed("curl -s -X POST -H 'content-type: application/json' -d '{\"source\":\"release\"}' http://127.0.0.1:8321/api/upgrade/jobs | grep -q 'managed by Nix'")
       # fips-ui's self-update points to the flake.
       machine.succeed("curl -sf http://127.0.0.1:8321/api/ui-update | grep -q 'installed with Nix'")
