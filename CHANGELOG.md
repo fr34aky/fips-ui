@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The followers list labels a node that stopped syncing from this node but now
+  syncs below another one as **moved under** that node, instead of overdue, and
+  counts it once in the tree.
+
 - **NixOS**: a flake with a fips-ui package and a NixOS module
   (`services.fips-ui`), to use next to upstream fips' `services.fips`. The
   helper (v10) knows NixOS: it edits `/var/lib/fips/fips.yaml`, keeps upstream's
