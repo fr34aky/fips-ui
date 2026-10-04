@@ -318,9 +318,17 @@ function FollowersPanel({ readOnly }: { readOnly: boolean }) {
   // upstream node): shown as moved, not as overdue, and counted once.
   const movedUnder = new Map<string, Follower>();
   for (const f of list) if (!isOverdue(f)) for (const n of f.below ?? []) if (!movedUnder.has(n.npub)) movedUnder.set(n.npub, f);
+  // The whole tree as this node reports it upward (server/hosts-followers.ts subtreeHeader): what followers that still
+  // sync report below them; an overdue follower counts only itself, and not at all once it moved.
   const tree = new Set<string>();
-  for (const f of list) { if (!isOverdue(f) || !movedUnder.has(f.npub)) tree.add(f.npub); for (const n of f.below ?? []) tree.add(n.npub); }
-  const total = tree.size + list.reduce((n, f) => n + (f.belowMore ?? 0), 0);
+  let more = 0;
+  for (const f of list) {
+    if (isOverdue(f)) { if (!movedUnder.has(f.npub)) tree.add(f.npub); continue; }
+    tree.add(f.npub);
+    for (const n of f.below ?? []) tree.add(n.npub);
+    more += f.belowMore ?? 0;
+  }
+  const total = tree.size + more;
   const toggle = (npub: string) => setOpen((o) => { const n = new Set(o); if (n.has(npub)) n.delete(npub); else n.add(npub); return n; });
   return (
     <div className="border-t border-[var(--border)]">
