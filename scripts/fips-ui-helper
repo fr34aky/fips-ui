@@ -49,7 +49,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=9
+HELPER_VERSION=10
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -74,6 +74,13 @@ case "$OS" in
     GATEWAY_DEFAULT=fips-gateway
     ;;
 esac
+
+# NixOS: the system, fips included, is declared in the NixOS configuration (upstream's services.fips module, and
+# fips-ui's own module, which installs this helper with its dependencies): binaries come from the Nix store, units
+# cannot be enabled by hand, and fips.yaml lives in /var/lib/fips.
+NIXOS=false; [[ -e /etc/NIXOS || ${FIPS_UI_NIXOS:-0} == 1 ]] && NIXOS=true
+if $NIXOS && [[ -x /run/current-system/sw/bin/fips ]]; then BIN_DIR_DEFAULT=/run/current-system/sw/bin; fi
+nix_managed() { $NIXOS && die "fips is managed by Nix on NixOS: update the fips flake input and run nixos-rebuild switch"; return 0; }
 
 BIN_DIR=${FIPS_BIN_DIR:-$BIN_DIR_DEFAULT}
 BACKUPS_DIR=${FIPS_UI_BACKUPS:-$BACKUPS_DEFAULT}
@@ -165,6 +172,7 @@ svc_stop() {
 }
 # Start at boot or not. pfSense runs every rc.d/*.sh at boot itself (its own knob lives in fips.conf).
 svc_enable() { # <name> <true|false>
+  $NIXOS && die "on NixOS, whether a unit starts at boot is set in the NixOS configuration"
   case "$SM" in
     systemd) if $2; then systemctl enable "$1"; else systemctl disable "$1"; fi ;;
     launchd) if $2; then launchctl enable "system/$1"; else launchctl disable "system/$1"; fi ;;
@@ -280,6 +288,8 @@ case "$OS" in
   *)              FIPS_ETC=/etc/fips ;;
 esac
 FIPS_CONFIG=$FIPS_ETC/fips.yaml
+# Upstream's NixOS module starts fips with --config /var/lib/fips/fips.yaml.
+if $NIXOS && [[ -f /var/lib/fips/fips.yaml ]]; then FIPS_CONFIG=/var/lib/fips/fips.yaml; fi
 FIPS_HOSTS=$FIPS_ETC/hosts
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d
@@ -945,10 +955,12 @@ backup_config() {
 # Signals are ignored from here on: a client that gives up must not interrupt an install or a rollback.
 # Replace fips.yaml atomically: a temp file in the same directory, then rename (never a half-written file).
 put_config() {
-  # Always 0600 (it holds secrets); owner and group stay as they were (root:root when there is no file).
-  local m u=0 g=0
+  # 0600 (it holds secrets); owner and group stay as they were (root:root when there is no file). On NixOS the mode
+  # stays too: upstream's module keeps the file group-writable for the fips group on purpose.
+  local m u=0 g=0 mode=0600
   [[ -f "$FIPS_CONFIG" ]] && read -r m u g < <(file_perms "$FIPS_CONFIG")
-  install -m 0600 -o "$u" -g "$g" "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"
+  $NIXOS && [[ -n "${m:-}" ]] && mode=$m
+  install -m "$mode" -o "$u" -g "$g" "$1" "$FIPS_CONFIG.fips-ui.new" && mv -f "$FIPS_CONFIG.fips-ui.new" "$FIPS_CONFIG"
 }
 
 install_config_and_restart() {
@@ -1006,7 +1018,9 @@ firewall_reload_if_active() {
 # nft: Linux with systemd (fips-firewall.service, table inet fips). pf: FreeBSD and macOS; not pfSense, which
 # owns pf and regenerates its rules.
 fw_backend() {
-  if [[ "$SM" == systemd ]] && command -v nft >/dev/null 2>&1; then echo nft
+  # NixOS declares its firewall (and upstream's module ships no fips-firewall unit): not managed here.
+  if $NIXOS; then echo none
+  elif [[ "$SM" == systemd ]] && command -v nft >/dev/null 2>&1; then echo nft
   elif [[ "$OS" == FreeBSD && "$SM" != pfsense || "$OS" == Darwin ]] && command -v pfctl >/dev/null 2>&1; then echo pf
   else echo none; fi
 }
@@ -1313,13 +1327,14 @@ case "$cmd" in
     managed=false; ( require_managed ) >/dev/null 2>&1 && managed=true
     fw=$(fw_backend); guard=$(guard_backend)
     if [[ "$fw" == pf ]]; then fw_dir=$PF_DROPIN_DIR; fw_ext=.pf; else fw_dir=$DROPIN_DIR; fw_ext=.nft; fi
-    printf '{"ok":true,"version":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s}}\n' \
-      "$HELPER_VERSION" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
+    printf '{"ok":true,"version":%s,"managed_by":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s}}\n' \
+      "$HELPER_VERSION" "$($NIXOS && echo '"nix"' || echo null)" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
       "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")" \
       "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")"
     ;;
 
   install)
+    nix_managed
     take_lock
     stage=${2:-}
     [[ -n "$stage" ]] || die "usage: install <stagedir> [--no-restart]"
@@ -1347,6 +1362,7 @@ case "$cmd" in
     ;;
 
   rollback)
+    nix_managed
     take_lock
     id=${2:-}
     [[ "$id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || die "invalid backup id"
@@ -1491,7 +1507,10 @@ case "$cmd" in
       keep_newest 20 "$CONFIG_BACKUPS_DIR"/hosts-*
     fi
     mkdir -p "$(dirname "$FIPS_HOSTS")"
-    install -m 0644 -o 0 -g 0 "$tmp" "$FIPS_HOSTS.fips-ui.new" && mv -f "$FIPS_HOSTS.fips-ui.new" "$FIPS_HOSTS"
+    # root:root 0644; on NixOS as upstream's module seeds it (root:fips 0664, the fips group edits it too).
+    hm=0644 hu=0 hg=0
+    if $NIXOS && [[ -f "$FIPS_HOSTS" ]]; then read -r hm hu hg < <(file_perms "$FIPS_HOSTS"); fi
+    install -m "$hm" -o "$hu" -g "$hg" "$tmp" "$FIPS_HOSTS.fips-ui.new" && mv -f "$FIPS_HOSTS.fips-ui.new" "$FIPS_HOSTS"
     printf '{"ok":true,"changed":true,"file":%s}\n' "$(json_escape "$FIPS_HOSTS")"
     ;;
 
@@ -1632,6 +1651,7 @@ NFT
     ;;
 
   daemon-install)
+    nix_managed
     take_lock
     shift
     daemon_install "$@"

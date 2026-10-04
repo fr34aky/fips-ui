@@ -92,6 +92,9 @@ export class SelfUpdate {
 
   /** Whether this installation can update itself: a clean git checkout of the release repository, on a branch. */
   async installMode(): Promise<InstallMode> {
+    // Installed by fips-ui's Nix flake (nix/module.nix sets FIPS_UI_NIX): the Nix store is read-only, and updates
+    // come with the flake input.
+    if (process.env.FIPS_UI_NIX === '1') return { mode: 'manual', reason: 'installed with Nix: update the fips-ui flake input (nix flake update fips-ui) and run nixos-rebuild switch' };
     const inside = await run('git', ['rev-parse', '--is-inside-work-tree'], this.root, 10_000);
     if (inside.code !== 0 || inside.out !== 'true') return { mode: 'manual', reason: `${this.root} is not a git checkout; download the release and run deploy/setup-local.sh again` };
     const remote = await run('git', ['remote', 'get-url', 'origin'], this.root, 10_000);

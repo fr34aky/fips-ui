@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **NixOS**: a flake with a fips-ui package and a NixOS module
+  (`services.fips-ui`), to use next to upstream fips' `services.fips`. The
+  helper (v10) knows NixOS: it edits `/var/lib/fips/fips.yaml`, keeps upstream's
+  file modes, leaves the firewall and boot-time unit settings to the NixOS
+  configuration, and refuses to install fips binaries; the Upgrade page and the
+  self-update point to the flake instead. A NixOS VM test (both modules, smoke
+  test) runs in CI.
+
+### Changed
+
+- The release workflow's changelog commit also sets `package.json` to the
+  released version (the version of builds without git history, such as Nix).
+
 ### Fixed
 
 - fips-ui's self-update refused a checkout that follows `main` past the release

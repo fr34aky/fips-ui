@@ -19,7 +19,7 @@ export interface JobSummary {
 export interface Backup { id: string; createdAt: number; version: string; files: string[] }
 
 export interface UpgradeStatus {
-  platform: { os: string; arch: string; pfsense?: { abi: string; tag: string | null } | null; artifactKind: 'archive' | 'pkg'; installer: string; binDir: string; workDir: string; controlSocket: string };
+  platform: { os: string; arch: string; pfsense?: { abi: string; tag: string | null } | null; nixos?: boolean; artifactKind: 'archive' | 'pkg'; installer: string; binDir: string; workDir: string; controlSocket: string };
   installed: { path: string | null; version?: string; rev?: string; target?: string; raw?: string };
   running: { version?: string; rev?: string; uptime_secs?: number; pid?: number } | null;
   package: { manager: string; name: string; version?: string; note: string } | null;

@@ -52,7 +52,8 @@ export function Upgrade() {
 
   const canInstall = !!st?.helper.available;
   // No fips on this machine (no binary, nothing answering): offer the fresh install instead of the upgrade sources.
-  const notInstalled = !!st && !st.installed.path && !st.running;
+  const nixos = !!st?.platform.nixos;
+  const notInstalled = !!st && !nixos && !st.installed.path && !st.running;
 
   // A fresh install can end with fips-ui restarting itself (to join the fips group): reload once it is back.
   const restarting = job?.kind === 'install' && job.state === 'succeeded' && !!job.result?.restarted;
@@ -120,11 +121,19 @@ export function Upgrade() {
 
       {st?.package && <div className="text-xs text-ink-3 flex items-start gap-2 px-1"><Package size={13} className="mt-0.5 flex-none" /><span>{st.package.note}</span></div>}
 
+      {nixos && (
+        <div className="card p-4 grid gap-2 border-l-4" style={{ borderLeftColor: 'var(--accent)' }}>
+          <div className="card-title flex items-center gap-2"><Package size={14} /> fips is managed by Nix</div>
+          <p className="text-sm text-ink-2 max-w-3xl">On NixOS, fips comes from the Nix store and is declared in your NixOS configuration (<span className="mono">services.fips</span>), so this page does not install, upgrade or roll it back. Update it with your flake:</p>
+          <Copyable text="nix flake update fips && sudo nixos-rebuild switch" className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit max-w-full" />
+          <p className="text-xs text-ink-3">fips-ui itself updates the same way (<span className="mono">nix flake update fips-ui</span>). The configuration editor, services and hosts file keep working through the helper.</p>
+        </div>
+      )}
       {notInstalled && <InstallDaemonCard st={st} disabled={busy} onInstall={(peers) => launch(() => upgradeApi.installDaemon({ peers }))} />}
       {restarting && <div className="card p-3 text-sm flex items-center gap-2"><Loader2 size={15} className="animate-spin" /> fips-ui restarts to open the new daemon's control socket; this page reloads when it is back.</div>}
 
       {/* ---- sources ------------------------------------------------------- */}
-      {!notInstalled && <>
+      {!notInstalled && !nixos && <>
       <section className="grid gap-4 lg:grid-cols-2">
         <ReleaseCard st={st} disabled={busy} onInstall={(ref, label) => setConfirm({ source: 'release', ref, label })} />
         {st?.platform.pfsense
@@ -149,7 +158,7 @@ export function Upgrade() {
       {job && <JobPanel job={job} log={log} onCancel={() => upgradeApi.cancel().catch((e) => setActionErr(e.message))} onDismiss={() => { setDismissedId(job.id); setActiveJobId(null); }} />}
 
       {/* ---- backups ------------------------------------------------------- */}
-      <BackupsCard backups={st?.backups ?? []} disabled={busy || !canInstall} onRollback={(b) => setConfirm({ source: 'release', ref: `rollback:${b.id}`, label: `Roll back to ${b.version || b.id}` })} />
+      {!nixos && <BackupsCard backups={st?.backups ?? []} disabled={busy || !canInstall} onRollback={(b) => setConfirm({ source: 'release', ref: `rollback:${b.id}`, label: `Roll back to ${b.version || b.id}` })} />}
 
       {/* ---- dialogs ------------------------------------------------------- */}
       {confirm && (

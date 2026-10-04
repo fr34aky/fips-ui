@@ -48,8 +48,12 @@ export function uiVersion(root: string): string {
     const m = TAG_RE.exec(tag ?? '');
     if (m && commit && commit === headCommit(gitDir)) return m[1];
   }
-  // "$Format:%D$" in the repository; "HEAD -> main, tag: v0.8.0, …" in a source archive of a release.
-  const archived = /\btag: v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)(?:,|$)/.exec(read(path.join(root, 'VERSION'))?.trim() ?? '');
+  // "$Format:%D$" in the repository; "HEAD -> main, tag: v0.8.0, …" in a source archive of a release; a package
+  // build (the Nix flake) writes "version: <version>" instead.
+  const file = read(path.join(root, 'VERSION'))?.trim() ?? '';
+  const built = /^version: ([0-9A-Za-z.+-]{1,64})$/m.exec(file);
+  if (built) return built[1];
+  const archived = /\btag: v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)(?:,|$)/.exec(file);
   if (archived) return archived[1];
   return packageVersion(root);
 }
