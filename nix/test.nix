@@ -39,6 +39,9 @@
       machine.succeed("curl -sf http://127.0.0.1:8321/api/admin/status | grep -q '\"firewall\":\"none\"'")
       machine.fail("curl -sf -X POST -H 'content-type: application/json' -d '{\"source\":\"release\"}' http://127.0.0.1:8321/api/upgrade/jobs")
       machine.succeed("curl -s -X POST -H 'content-type: application/json' -d '{\"source\":\"release\"}' http://127.0.0.1:8321/api/upgrade/jobs | grep -q 'managed by Nix'")
+      # Mesh addresses come from fipsctl, which upstream's module does not put on PATH (the module adds it for fips-ui).
+      npub = machine.succeed("curl -sf http://127.0.0.1:8321/api/snapshot | grep -o 'npub1[02-9ac-hj-np-z]\\{58\\}' | head -n 1").strip()
+      machine.succeed(f"curl -sf 'http://127.0.0.1:8321/api/admin/address?npub={npub}' | grep -q '\"address\":\"fd'")
       # fips-ui's self-update points to the flake.
       machine.succeed("curl -sf http://127.0.0.1:8321/api/ui-update | grep -q 'installed with Nix'")
     '';

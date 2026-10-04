@@ -44,6 +44,7 @@ stdenv.mkDerivation {
       (src + "/scripts")
       (src + "/deploy")
       (src + "/package.json")
+      (src + "/VERSION")
     ];
   };
 

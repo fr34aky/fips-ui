@@ -146,8 +146,9 @@ in
         "fips.service"
       ];
       wants = [ "network-online.target" ];
-      # sudo (for the helper) is a NixOS wrapper.
-      path = [ "/run/wrappers" ];
+      # sudo (for the helper) is a NixOS wrapper; fipsctl (mesh addresses) comes from upstream's package, which is not
+      # on the system PATH.
+      path = [ "/run/wrappers" ] ++ lib.optional (fipsBin != "") config.services.fips.package;
       environment = {
         FIPS_UI_HOST = cfg.host;
         FIPS_UI_PORT = toString cfg.port;

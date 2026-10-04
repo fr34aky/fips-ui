@@ -23,9 +23,15 @@
         "aarch64-linux"
       ];
       forAll = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      # Releases are git tags; package.json carries the last release (the release workflow updates it), so a build
-      # reports e.g. 0.8.0+nix.1a2b3c4.
-      version = "${(lib.importJSON ./package.json).version}+nix.${self.shortRev or self.dirtyShortRev or "unknown"}";
+      # Releases are git tags. A release fetched from GitHub (github:fr34aky/fips-ui/v0.8.0) has its tag in VERSION
+      # (export-subst: "tag: v0.8.0"); anything else reports the last release, which package.json carries (the
+      # release workflow updates it), plus the commit: 0.8.0+nix.1a2b3c4.
+      tagged = builtins.match ".*tag: v([0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?)(,.*)?" (lib.strings.trim (builtins.readFile ./VERSION));
+      version =
+        if tagged != null then
+          builtins.head tagged
+        else
+          "${(lib.importJSON ./package.json).version}+nix.${self.shortRev or self.dirtyShortRev or "unknown"}";
     in
     {
       packages = forAll (pkgs: rec {

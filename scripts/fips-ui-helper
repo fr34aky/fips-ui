@@ -288,8 +288,9 @@ case "$OS" in
   *)              FIPS_ETC=/etc/fips ;;
 esac
 FIPS_CONFIG=$FIPS_ETC/fips.yaml
-# Upstream's NixOS module starts fips with --config /var/lib/fips/fips.yaml.
-if $NIXOS && [[ -f /var/lib/fips/fips.yaml ]]; then FIPS_CONFIG=/var/lib/fips/fips.yaml; fi
+# Upstream's NixOS module starts fips with --config /var/lib/fips/fips.yaml (seeding it on the first start): that is
+# the file, even before it exists; /etc/fips/fips.yaml is never read there.
+if $NIXOS; then FIPS_CONFIG=/var/lib/fips/fips.yaml; fi
 FIPS_HOSTS=$FIPS_ETC/hosts
 FIPS_NFT=/etc/fips/fips.nft
 DROPIN_DIR=/etc/fips/fips.d

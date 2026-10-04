@@ -136,7 +136,8 @@ ships a flake with a package and a NixOS module instead, to use next to upstream
 ```
 
 Then `sudo nixos-rebuild switch --flake .#mynode`. To follow a release, pin the input to its tag
-(`github:fr34aky/fips-ui/v0.8.0`).
+(`github:fr34aky/fips-ui/v0.8.0`): such a build reports exactly that version; one from `main` reports the last
+release plus its commit (`0.8.0+nix.1a2b3c4`).
 
 | Option | Default | |
 | ------ | ------- | --- |
