@@ -2,7 +2,10 @@
 import { api } from './api';
 
 export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
-export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string }
+export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string; pubdom?: { server: boolean; resolver: boolean } }
+/** Helper version with the public-domains verbs (server/admin.ts). */
+export const PUBDOM_HELPER_VERSION = 11;
+export interface PubdomResult { ok: boolean; changed?: boolean; restarted?: boolean; file?: string; error?: string; detail?: string }
 export interface ConfigBackup { id: string; size: number; mtime: number }
 export interface ApplyResult { ok: boolean; changed?: boolean; restarted?: boolean; backup_id?: string; rolled_back?: boolean; restored_healthy?: boolean; error?: string; journal?: string }
 export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?: string; addr?: string } | { kind: 'prefix'; prefix: string; label?: string };
@@ -30,6 +33,11 @@ export const adminApi = {
   deleteDropin: (name: string) => api.post<DropinResult>('/api/admin/firewall/dropin/delete', { name }),
   service: (unit: string, action: 'start' | 'stop' | 'restart' | 'reload' | 'enable' | 'disable') => api.post<{ ok: boolean; active: boolean; enabled: string }>('/api/admin/service', { unit, action }),
   address: (npub: string) => api.get<{ npub: string; address: string }>(`/api/admin/address?npub=${encodeURIComponent(npub)}`),
+  // Public domains (docs/public-domains.md): files through the helper, actions over the control sockets.
+  pubdomZone: (file: string, content: string, base: string) => api.post<PubdomResult>('/api/admin/pubdom/zone', { file, content, base }),
+  pubdomZoneDelete: (file: string) => api.post<PubdomResult>('/api/admin/pubdom/zone/delete', { file }),
+  pubdomConfig: (side: 'server' | 'resolver', yaml: string, base: string, restart: boolean) => api.post<PubdomResult>('/api/admin/pubdom/config', { side, yaml, base, restart }),
+  pubdomAction: <T = unknown>(side: 'server' | 'resolver', command: 'publish' | 'check-dns' | 'forget' | 'flush', domain?: string) => api.post<{ ok: boolean; result: T }>('/api/admin/pubdom/action', { side, command, ...(domain ? { domain } : {}) }),
 };
 
 /** 422 answers carry a structured result; surface it instead of a bare error string. */

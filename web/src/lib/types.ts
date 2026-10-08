@@ -71,6 +71,10 @@ export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principa
 // control sockets answer (that repository's docs/webui.md).
 export interface PubdomSide { socket: string; running: boolean; installed: boolean }
 export interface PubdomState { resolver: PubdomSide; server: PubdomSide }
+export interface PubdomAttestation { witness: string; servers: string[]; names_this_server: boolean; method: string; verified_at: number; created_at: number }
+export interface PubdomCheckDns { domain: string; verdict: string; detail: string | null; ttl: number | null; upstreams: string[]; txt_record: string }
+/** A file the editors show: its text and the hash the helper checks before replacing it ('none' when it does not exist). */
+export interface PubdomFileText { path: string; text: string; base: string }
 export interface PubdomRelay { url: string; accepted_at: number | null; last_error: string | null }
 export interface PubdomServerStatus { version: string; npub: string; address: string; bind: string; port: number; zones_dir: string | null; publishing: boolean; relays: PubdomRelay[] }
 export interface PubdomName { label: string; target: string }

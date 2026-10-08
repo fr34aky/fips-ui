@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The **Public domains** page acts as well as shows (helper v11): admins
+  add, edit and remove zone files as a table of names (or as the file),
+  edit `server.yaml` and `config.yaml`, publish now, check the DNS
+  record, forget a pin, flush the resolver's caches and start a stopped
+  unit; everyone can list who attested a domain on the relays. Files
+  are checked with the fips-pub-domains binaries' own `validate`
+  commands before they are written and refused if they changed since
+  the editor read them. Needs fips-pub-domains newer than 0.2.7 for
+  the attestations listing and the resolver's `validate config`.
+
 - A **Public domains** page, shown when the node runs
   [fips-pub-domains](https://github.com/fr34aky/fips-pub-domains)' domain server
   or resolver (their control sockets, or their configuration on disk): the

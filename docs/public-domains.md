@@ -21,9 +21,30 @@ the sidebar. It reads the sockets (fips's own line-JSON protocol, so the same cl
 | **Resolver** | Online or offline, upstreams and where they come from, the OS integration `setup` chose, DNSSEC and plain-probe settings, witnesses and the attestation threshold, relays; the verified (pinned) domains with their server, port, verification method and time. |
 | **Log** | The last lines of the chosen process, from its own ring buffer — no journal access needed. |
 
-Everything on the page is read-only in this version, for viewers and admins alike. Editing zone files,
-the configuration, **Publish now**, **Check DNS**, **Forget** and **Flush** follow with the next
-helper version.
+Viewers see all of it. Admins also get the buttons:
+
+| Button | What it does |
+| ------ | ------------ |
+| **Publish now** / **Publish all now** | Asks the server to publish the domain's claim and zone record (or every domain's) at once; the outcome shows on the relays table and the domain card within seconds. |
+| **Check DNS** | The server verifies the domain's `_fips-dns` TXT record as a client would (DNSSEC, or two agreeing resolvers) and says `verified`, `no record`, `names another key`, `names this server with another port`, `resolvers disagree` or `unreachable`. |
+| **Attestations** | Who vouches for the domain on the configured relays: every attestation (kind 37198), the newest per witness, and whether it names this server. The server's view, not a verification — a resolver believes only the witnesses it configured. Available to viewers too. |
+| **Add domain**, **Edit**, remove | A zone file as a table: each name under the domain and where it points (this node, another node by npub, or *legacy* for a name that stays on the ordinary Internet), the port, with the wildcard's warning; or the file itself under **File**. |
+| **Publishing and server settings**, **Resolver settings** | `/etc/fips-pubdom/server.yaml` and `/etc/fips-pubdom/config.yaml` as text, with YAML syntax checked as you type. |
+| **Forget** | Drops a verified domain's pin; the next lookup verifies it again. |
+| **Flush caches** | Forgets cached answers and decisions; the pins stay. |
+| **Start** | On a side that is installed but not running, starts its unit (with service control enabled). |
+
+The actions go over the control sockets, which trust whoever can open them, so they need no helper. The
+files are read by the backend for admins only (a `server.yaml` whose `key:` holds the key itself rather
+than a path is not shown at all) and written through the privileged helper (version 11 or newer, `sudo ./deploy/setup-local.sh`): each is
+checked with the binary's own parser before it is written — `fips-pubdom-server validate zone`,
+`fips-pubdom-server validate config`, `fips-pubdomd validate config` — refused if the file changed since
+the editor read it, backed up, and replaced atomically as `root:root 0644`. A zone file is picked up by
+the server within a second — into the directory the running server reports, which the helper checks
+against its own; a configuration change restarts the unit if it was running (the checkbox in the
+confirmation turns that off). Comments in a hand-written zone file do not survive a save from the
+table; the **File** view offers to start from the file on disk to keep them. A file the server skipped
+(it would not parse) opens as text under **Repair**.
 
 A side that is installed but whose unit is not running shows the page with a note instead of data. The
 UI's user must be in group `fips` (the sockets are group-readable and -writable), as it already is for

@@ -6,6 +6,7 @@
 // paths, so nothing can be swapped between validation and install.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { spawn, execFile } from 'node:child_process';
+import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,6 +19,8 @@ export const MIN_HELPER_VERSION = 4;
 export const GUARD_HELPER_VERSION = 5;
 /** The helper version that can write the FIPS hosts file. */
 export const HOSTS_HELPER_VERSION = 6;
+/** Helper version that writes fips-pub-domains' zone and configuration files (docs/public-domains.md). */
+export const PUBDOM_HELPER_VERSION = 11;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
@@ -198,6 +201,8 @@ export type HelperInfo = {
   serviceManager?: string; configPath?: string; hostsPath?: string;
   /** Where the firewall's drop-ins live (/etc/fips/fips.d with .nft, or $etc/pf.d with .pf). */
   firewallDropinDir?: string; firewallDropinExt?: string;
+  /** fips-pub-domains binaries the helper found (v11+), whose `validate` commands check every file before it is written. */
+  pubdom?: { server: boolean; resolver: boolean };
 };
 
 export function createAdminHandler(opts: AdminOptions) {
@@ -221,7 +226,7 @@ export function createAdminHandler(opts: AdminOptions) {
       if (r.code !== 0) value = { installed: true, available: false, version: null, error: helperError(r), managementCapable: false, features: NO_FEATURES };
       else {
         try {
-          const j = lastJson<{ ok: boolean; version: number; service_manager?: string; config_path?: string; hosts_path?: string; firewall_dropin_dir?: string; firewall_dropin_ext?: string; features?: Partial<HelperFeatures> }>(r.stdout);
+          const j = lastJson<{ ok: boolean; version: number; service_manager?: string; config_path?: string; hosts_path?: string; firewall_dropin_dir?: string; firewall_dropin_ext?: string; features?: Partial<HelperFeatures>; pubdom?: { server?: boolean; resolver?: boolean } }>(r.stdout);
           const systemd = j.service_manager === 'systemd';
           // Helpers before v8 do not report features: they did everything with systemd, nothing without it.
           const f: HelperFeatures = j.features
@@ -233,6 +238,7 @@ export function createAdminHandler(opts: AdminOptions) {
             managementCapable: j.ok && !tooOld && f.config,
             serviceManager: j.service_manager, configPath: j.config_path ?? '/etc/fips/fips.yaml', hostsPath: j.hosts_path ?? '/etc/fips/hosts',
             firewallDropinDir: j.firewall_dropin_dir, firewallDropinExt: j.firewall_dropin_ext,
+            pubdom: j.pubdom ? { server: !!j.pubdom.server, resolver: !!j.pubdom.resolver } : undefined,
             error: tooOld ? `helper v${j.version} is too old for node management (needs v${MIN_HELPER_VERSION}); re-run deploy/setup-local.sh`
               : !f.config ? `node management is not supported with ${j.service_manager ?? 'this service manager'}` : undefined,
           };
@@ -255,6 +261,13 @@ export function createAdminHandler(opts: AdminOptions) {
   async function requireHelper(): Promise<void> {
     const h = await helperInfo();
     if (!h.managementCapable) throw new Error(h.error ?? 'the privileged helper is not available');
+  }
+
+  /** The public-domains verbs came with helper v11; an older helper gets a precise message, not a usage error. */
+  async function requirePubdomHelper(): Promise<void> {
+    const h = await helperInfo();
+    if (!h.managementCapable) throw new Error(h.error ?? 'the privileged helper is not available');
+    if ((h.version ?? 0) < PUBDOM_HELPER_VERSION) throw new Error(`editing public domains needs helper v${PUBDOM_HELPER_VERSION} (installed: v${h.version}); run sudo ./deploy/setup-local.sh`);
   }
 
   async function helperJson<T>(args: string[], input?: string, timeoutMs?: number): Promise<T> {
@@ -377,9 +390,44 @@ export function createAdminHandler(opts: AdminOptions) {
         if (typeof name !== 'string' || !DROPIN_RE.test(name)) throw new BodyError(400, 'invalid drop-in name');
         sendJson(res, 200, await helperJson<Record<string, unknown>>(['dropin-delete', name])); return true;
       }
+      // Public domains (server/pubdom.ts, docs/public-domains.md): files through the helper, which validates
+      // them with the fips-pub-domains binaries; actions over the control sockets, which trust whoever can open them.
+      if (sub === '/pubdom/zone') {
+        const { file, content, base } = body as { file?: unknown; content?: unknown; base?: unknown };
+        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be a plain <name>.yaml');
+        if (typeof content !== 'string' || !content.trim()) throw new BodyError(400, 'content (non-empty string) required');
+        if (typeof base !== 'string' || !/^([0-9a-f]{64}|none)$/.test(base)) throw new BodyError(400, 'base (sha256 or none) required');
+        await requirePubdomHelper();
+        // The directory the running server follows goes along: the helper refuses to write anywhere else.
+        const result = await helperJson<Record<string, unknown>>(['pubdom-zone-apply', file, '--base', base, '--dir', await liveZonesDir()], content.endsWith('\n') ? content : content + '\n');
+        sendJson(res, result.ok ? 200 : 422, result); return true;
+      }
+      if (sub === '/pubdom/zone/delete') {
+        const file = body.file;
+        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be a plain <name>.yaml');
+        await requirePubdomHelper();
+        sendJson(res, 200, await helperJson<Record<string, unknown>>(['pubdom-zone-delete', file, '--dir', await liveZonesDir()])); return true;
+      }
+      if (sub === '/pubdom/config') {
+        const { side, yaml, base, restart } = body as { side?: unknown; yaml?: unknown; base?: unknown; restart?: unknown };
+        if (typeof side !== 'string' || !isPubdomSide(side)) throw new BodyError(400, 'side must be server or resolver');
+        if (typeof yaml !== 'string' || !yaml.trim()) throw new BodyError(400, 'yaml (non-empty string) required');
+        if (typeof base !== 'string' || !/^([0-9a-f]{64}|none)$/.test(base)) throw new BodyError(400, 'base (sha256 or none) required');
+        await requirePubdomHelper();
+        const result = await helperJson<Record<string, unknown>>(['pubdom-config-apply', side, ...(restart === false ? ['--no-restart'] : []), '--base', base], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT);
+        sendJson(res, result.ok ? 200 : 422, result); return true;
+      }
+      if (sub === '/pubdom/action') {
+        const { side, command, domain } = body as { side?: unknown; command?: unknown; domain?: unknown };
+        if (typeof side !== 'string' || !isPubdomSide(side)) throw new BodyError(400, 'side must be server or resolver');
+        if (typeof command !== 'string' || !PUBDOM_WRITE[side].has(command)) throw new BodyError(400, `command must be one of ${[...PUBDOM_WRITE[side]].join(', ')}`);
+        if (domain !== undefined && (typeof domain !== 'string' || !DOMAIN_RE.test(domain))) throw new BodyError(400, 'domain must be a domain name');
+        if ((command === 'check-dns' || command === 'forget') && domain === undefined) throw new BodyError(400, 'domain required');
+        sendJson(res, 200, { ok: true, result: await pubdomQuery(side, command, domain === undefined ? undefined : { domain }) }); return true;
+      }
       if (sub === '/service') {
         const { unit, action } = body as { unit?: unknown; action?: unknown };
-        if (typeof unit !== 'string' || !/^(fips|fips-firewall|fips-dns|fips-gateway)(\.service)?$/.test(unit)) throw new BodyError(400, 'unit must be fips, fips-firewall, fips-dns or fips-gateway');
+        if (typeof unit !== 'string' || !/^(fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server)(\.service)?$/.test(unit)) throw new BodyError(400, 'unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom or fips-pubdom-server');
         if (typeof action !== 'string' || !['start', 'stop', 'restart', 'reload', 'enable', 'disable'].includes(action)) throw new BodyError(400, 'invalid action');
         sendJson(res, 200, await serviceAction(unit, action)); return true;
       }
