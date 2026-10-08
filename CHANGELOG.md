@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A **Public domains** page, shown when the node runs
+  [fips-pub-domains](https://github.com/fr34aky/fips-pub-domains)' domain server
+  or resolver (their control sockets, or their configuration on disk): the
+  domains served over fips with their names, relays, publication state and the
+  DNS record to add; the resolver's state and the domains it has verified; each
+  process's last log lines. Read-only; editing and the actions come with the
+  next helper version ([docs/public-domains.md](docs/public-domains.md)).
+
 ## [0.9.0] - 2026-10-04
 
 ### Added

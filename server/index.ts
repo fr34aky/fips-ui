@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
+import { detect as detectPubdom, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, pubdomQuery } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -358,6 +359,13 @@ async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
   return ALLOW_SERVICE_CONTROL ? 'direct' : null;
 }
 
+/** The query string as command params: everything but the token; the named keys as numbers. */
+function queryParams(url: URL, numeric: string[] = []): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  for (const [k, v] of url.searchParams) if (k !== 'token') params[k] = numeric.includes(k) ? Number(v) : v;
+  return params;
+}
+
 async function route(req: Req, res: Res) {
   if (principalOf(req) === NOBODY) return json(res, 403, { error: 'no identity for this request' }, true);
   const via: 'local' | 'mesh' = principalOf(req).kind;
@@ -379,7 +387,7 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -408,12 +416,22 @@ async function route(req: Req, res: Res) {
   if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 
+  // Public domain names (server/pubdom.ts): /api/pubdom/state says what is installed and running right now;
+  // /api/pubdom/<resolver|server>/<command> proxies the read-only commands, for every role.
+  if (p === '/api/pubdom/state') { if (method !== 'GET') throw new HttpError(405, 'GET only'); return json(res, 200, detectPubdom()); }
+  if (p.startsWith('/api/pubdom/')) {
+    if (method !== 'GET') throw new HttpError(405, 'GET only');
+    const [side, cmd, ...rest] = p.slice('/api/pubdom/'.length).split('/');
+    if (!side || !cmd || rest.length || !isPubdomSide(side)) throw new HttpError(404, 'unknown public-domains endpoint');
+    if (!PUBDOM_READ[side].has(cmd)) throw new HttpError(404, `'${cmd}' is not a read-only ${side} command`);
+    return json(res, 200, await pubdomQuery(side, cmd, queryParams(url, ['n'])));
+  }
+
   // Generic read-only proxy: /api/q/show_peers, /api/q/show_stats_history?metric=bytes_in&window=1h
   if (p.startsWith('/api/q/')) {
     if (method !== 'GET') throw new HttpError(405, 'GET only');
     const cmd = p.slice('/api/q/'.length);
-    const params: Record<string, unknown> = {};
-    for (const [k, v] of url.searchParams) if (k !== 'token') params[k] = v;
+    const params = queryParams(url);
     if (typeof params.peer === 'string' && params.peer) params.peer = (await resolvePeer(params.peer)).npub;
     if (READ_ONLY_COMMANDS.has(cmd)) return json(res, 200, await query(cmd, params));
     if (GATEWAY_COMMANDS.has(cmd)) return json(res, 200, await query(cmd, params, { socketPath: GATEWAY_SOCKET_PATH }));
