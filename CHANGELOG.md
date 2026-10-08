@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The zone editor on a server still running from `--zone` flags (no
+  `server.yaml`) says what to do — run `fips-pubdom-server init` and
+  restart — instead of "did not report its zones directory".
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

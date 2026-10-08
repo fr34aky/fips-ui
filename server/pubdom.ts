@@ -83,7 +83,9 @@ export function zoneFileWithin(dir: string, file: string): boolean {
 /** The directory the running server follows, which the helper must agree with before it writes there. */
 export async function liveZonesDir(): Promise<string> {
   const st = await pubdomQuery<{ zones_dir?: string }>('server', 'status');
-  if (!st.zones_dir) throw new Error('the server did not report its zones directory');
+  // A server started with --zone flags (no /etc/fips-pubdom/server.yaml) follows no directory: there is nowhere
+  // a saved file would be picked up from.
+  if (!st.zones_dir) throw new Error('the server runs from --zone flags, not a zones directory: run `sudo fips-pubdom-server init` to write /etc/fips-pubdom/server.yaml from the existing zone files, then restart fips-pubdom-server');
   return st.zones_dir;
 }
 
