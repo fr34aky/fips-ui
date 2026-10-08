@@ -8,16 +8,18 @@ const paths = {
 };
 
 test('a side is installed by its socket or its files, running only by its socket', () => {
-  const none = detect(paths, () => false);
+  const none = detect(paths, () => false, () => false);
   assert.deepEqual(none.resolver, { socket: '/run/r.sock', running: false, installed: false });
   assert.deepEqual(none.server, { socket: '/run/s.sock', running: false, installed: false });
-  const stopped = detect(paths, (p) => p === '/etc/zones');
+  const stopped = detect(paths, (p) => p === '/etc/zones', () => false);
   assert.equal(stopped.server.installed, true);
   assert.equal(stopped.server.running, false);
   assert.equal(stopped.resolver.installed, false);
-  const up = detect(paths, (p) => p === '/run/r.sock');
+  const up = detect(paths, () => false, (p) => p === '/run/r.sock');
   assert.equal(up.resolver.running, true);
   assert.equal(up.resolver.installed, true);
+  // The socket is judged like control.ts judges fips's own: a host:port override is reachable, a path must exist.
+  assert.equal(detect({ ...paths, resolver: { ...paths.resolver, socket: '127.0.0.1:21212' } }, () => false).resolver.running, true);
 });
 
 test('only read-only commands are proxied', () => {

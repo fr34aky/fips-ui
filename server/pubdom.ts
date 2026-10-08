@@ -4,7 +4,7 @@
 // either is on the node and proxies the read-only commands; writes (the helper's zone and config
 // edits, publish, forget, flush) are a later phase.
 import fs from 'node:fs';
-import { query } from './control.ts';
+import { ControlError, endpointExists, query } from './control.ts';
 
 export type PubdomSide = 'resolver' | 'server';
 
@@ -21,10 +21,13 @@ export const PATHS: Record<PubdomSide, SidePaths> = {
 export interface SideState { socket: string; running: boolean; installed: boolean }
 export type PubdomState = Record<PubdomSide, SideState>;
 
-/** Installed: a socket that answers, or configuration on disk (a stopped unit still shows its page). */
-export function detect(paths: Record<PubdomSide, SidePaths> = PATHS, exists: (p: string) => boolean = (p) => fs.existsSync(p)): PubdomState {
+/**
+ * Installed: a socket that answers, or configuration on disk (a stopped unit still shows its page). The socket is
+ * judged as control.ts does, so a host:port override counts as reachable.
+ */
+export function detect(paths: Record<PubdomSide, SidePaths> = PATHS, exists: (p: string) => boolean = (p) => fs.existsSync(p), socketUp: (ep: string) => boolean = endpointExists): PubdomState {
   const side = (p: SidePaths): SideState => {
-    const running = exists(p.socket);
+    const running = socketUp(p.socket);
     return { socket: p.socket, running, installed: running || p.files.some(exists) };
   };
   return { resolver: side(paths.resolver), server: side(paths.server) };
@@ -38,6 +41,14 @@ export const READ_COMMANDS: Record<PubdomSide, Set<string>> = {
 
 export function isSide(s: string): s is PubdomSide { return s === 'resolver' || s === 'server'; }
 
-export function pubdomQuery<T = unknown>(side: PubdomSide, command: string, params?: Record<string, unknown>): Promise<T> {
-  return query<T>(command, params, { socketPath: PATHS[side].socket, timeoutMs: 15000 });
+export const UNIT: Record<PubdomSide, string> = { resolver: 'fips-pubdomd', server: 'fips-pubdom-server' };
+
+/** The query, with the transport errors' "is the fips daemon running?" hint naming the right process. */
+export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string, params?: Record<string, unknown>): Promise<T> {
+  try {
+    return await query<T>(command, params, { socketPath: PATHS[side].socket, timeoutMs: 15000 });
+  } catch (e) {
+    if (e instanceof ControlError && e.kind === 'transport') throw new ControlError(e.message.replace('the fips daemon', UNIT[side]), 'transport');
+    throw e;
+  }
 }

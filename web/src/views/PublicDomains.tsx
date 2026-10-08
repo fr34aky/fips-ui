@@ -1,11 +1,10 @@
 import { useState } from 'react';
 import { RefreshCw } from 'lucide-react';
-import type { Health, PubdomPin, PubdomResolverStatus, PubdomServerStatus, PubdomSide, PubdomZones } from '../lib/types';
+import type { Health, PubdomPin, PubdomResolverStatus, PubdomServerStatus, PubdomSide, PubdomState, PubdomZones } from '../lib/types';
 import { api, usePoll } from '../lib/api';
 import { Card, Chip, Copyable, Empty, ErrorNote, KV, Segmented, Skeleton } from '../components/ui';
 import { NpubInline } from '../components/PeerName';
 import { fmtAgo, fmtDuration, fmtTime, shortKey } from '../lib/format';
-import { useHostName } from '../lib/names';
 
 // Public domain names over fips (fr34aky/fips-pub-domains, docs/webui.md): what this node serves
 // (fips-pubdom-server) and what it resolves (fips-pubdomd), read from their control sockets. Read-only
@@ -14,7 +13,10 @@ import { useHostName } from '../lib/names';
 type Tab = 'server' | 'resolver';
 
 export function PublicDomains({ health }: { health: Health | null }) {
-  const pd = health?.pubdom;
+  // health's snapshot opens the page; what is running is re-read while it is open, so a unit started or
+  // stopped meanwhile shows as such without a reload.
+  const state = usePoll(() => api.get<PubdomState>('/api/pubdom/state'), [], 15000);
+  const pd = state.data ?? health?.pubdom;
   const tabs: { value: Tab; label: string }[] = [];
   if (pd?.server.installed) tabs.push({ value: 'server', label: 'Domain server' });
   if (pd?.resolver.installed) tabs.push({ value: 'resolver', label: 'Resolver' });
@@ -23,11 +25,13 @@ export function PublicDomains({ health }: { health: Health | null }) {
     return <Card title="Public domains"><Empty><div className="max-w-md"><p className="mb-2">Neither <code>fips-pubdom-server</code> nor <code>fips-pubdomd</code> is installed on this node.</p><p className="text-xs">Public domain names over fips let <code>www.example.org</code> resolve to a mesh node: fr34aky/fips-pub-domains.</p></div></Empty></Card>;
   }
   const current = tabs.some((t) => t.value === tab) ? tab : tabs[0].value;
+  const side = pd[current];
   return (
     <div className="grid gap-4 fade-in">
       {tabs.length > 1 && <Segmented value={current} onChange={setTab} options={tabs} />}
-      {current === 'server' ? <Server side={pd.server} /> : <Resolver side={pd.resolver} />}
-      <LogCard side={current} running={pd[current].running} />
+      {!side.running ? <NotRunning what={current === 'server' ? 'The domain server' : 'The resolver'} side={side} />
+        : current === 'server' ? <Server /> : <Resolver />}
+      {side.running && <LogCard key={current} side={current} />}
     </div>
   );
 }
@@ -39,11 +43,9 @@ function NotRunning({ what, side }: { what: string; side: PubdomSide }) {
 const ts = (t: number | null | undefined) => (t ? <span title={fmtTime(t * 1000, true)}>{fmtAgo(t * 1000)}</span> : <span className="text-ink-3">never</span>);
 const until = (t: number | null | undefined, past = 'expired') => (t ? <span title={fmtTime(t * 1000, true)}>{t * 1000 > Date.now() + 1500 ? `in ${fmtDuration((t * 1000 - Date.now()) / 1000)}` : past}</span> : <span className="text-ink-3">none</span>);
 
-function Server({ side }: { side: PubdomSide }) {
-  const status = usePoll(() => api.get<PubdomServerStatus>('/api/pubdom/server/status'), [side.running], 10000);
-  const zones = usePoll(() => api.get<PubdomZones>('/api/pubdom/server/zones'), [side.running], 10000);
-  const name = useHostName(status.data?.npub);
-  if (!side.running) return <NotRunning what="The domain server" side={side} />;
+function Server() {
+  const status = usePoll(() => api.get<PubdomServerStatus>('/api/pubdom/server/status'), [], 10000);
+  const zones = usePoll(() => api.get<PubdomZones>('/api/pubdom/server/zones'), [], 10000);
   if (status.error) return <ErrorNote>{status.error}</ErrorNote>;
   const s = status.data;
   return (
@@ -51,7 +53,7 @@ function Server({ side }: { side: PubdomSide }) {
       <Card title="This node" hint="What the TXT record and the claims name" actions={<button className="btn ghost icon sm" onClick={() => { status.refresh(); zones.refresh(); }} title="Refresh"><RefreshCw size={14} /></button>}>
         {!s ? <Skeleton className="h-20 w-full" /> : (
           <KV items={[
-            ['Server', <NpubInline npub={s.npub} name={name} />],
+            ['Server', <NpubInline npub={s.npub} />],
             ['Mesh address', <Copyable text={s.address} display={shortKey(s.address, 14, 8)} />],
             ['Listening', <span className="mono">{s.bind}</span>],
             ['Publishing', s.publishing ? <Chip tone="good">on</Chip> : <Chip tone="warn">off — no relays configured</Chip>],
@@ -74,7 +76,7 @@ function Server({ side }: { side: PubdomSide }) {
             <div>
               <div className="text-xs text-ink-3 mb-1">Names</div>
               <table className="data"><thead><tr><th>Name</th><th>Where</th></tr></thead><tbody>
-                {z.names.map((n) => <tr key={n.label}><td className="mono">{n.label === '*' ? '*' : n.label === '@' ? z.domain : `${n.label}.${z.domain}`}</td><td>{n.target === 'self' ? <Chip tone="accent" dot={false}>this node</Chip> : n.target === 'legacy' ? <Chip dot={false}>legacy (not over fips)</Chip> : <Target npub={n.target} />}</td></tr>)}
+                {z.names.map((n) => <tr key={n.label}><td className="mono">{n.label === '*' ? '*' : n.label === '@' ? z.domain : `${n.label}.${z.domain}`}</td><td>{n.target === 'self' ? <Chip tone="accent" dot={false}>this node</Chip> : n.target === 'legacy' ? <Chip dot={false}>legacy (not over fips)</Chip> : <NpubInline npub={n.target} />}</td></tr>)}
               </tbody></table>
             </div>
             <KV items={[
@@ -100,15 +102,9 @@ function Server({ side }: { side: PubdomSide }) {
   );
 }
 
-function Target({ npub }: { npub: string }) {
-  const name = useHostName(npub);
-  return <NpubInline npub={npub} name={name} />;
-}
-
-function Resolver({ side }: { side: PubdomSide }) {
-  const status = usePoll(() => api.get<PubdomResolverStatus>('/api/pubdom/resolver/status'), [side.running], 10000);
-  const pins = usePoll(() => api.get<PubdomPin[]>('/api/pubdom/resolver/pins'), [side.running], 10000);
-  if (!side.running) return <NotRunning what="The resolver" side={side} />;
+function Resolver() {
+  const status = usePoll(() => api.get<PubdomResolverStatus>('/api/pubdom/resolver/status'), [], 10000);
+  const pins = usePoll(() => api.get<PubdomPin[]>('/api/pubdom/resolver/pins'), [], 10000);
   if (status.error) return <ErrorNote>{status.error}</ErrorNote>;
   const s = status.data;
   return (
@@ -123,7 +119,7 @@ function Resolver({ side }: { side: PubdomSide }) {
             ['OS integration', s.backend ?? <span className="text-ink-3">not set up</span>],
             ['DNSSEC', s.dnssec ? 'on' : 'off'],
             ['Plain probe', s.plain_probe ? 'on' : 'off (every denial validated)'],
-            ['Witnesses', s.witnesses.length ? <span className="grid gap-1">{s.witnesses.map((w) => <Target key={w} npub={w} />)}</span> : <span className="text-ink-3">none</span>],
+            ['Witnesses', s.witnesses.length ? <span className="grid gap-1">{s.witnesses.map((w) => <NpubInline key={w} npub={w} />)}</span> : <span className="text-ink-3">none</span>],
             ['Attestation threshold', String(s.attestation_threshold)],
             ['Mesh relays', s.mesh_relays.length ? <span className="mono text-xs">{s.mesh_relays.join(', ')}</span> : <span className="text-ink-3">none</span>],
             ['Public relays', <span className="mono text-xs">{s.public_relays.join(', ')}</span>],
@@ -134,7 +130,7 @@ function Resolver({ side }: { side: PubdomSide }) {
       <Card title={`Verified domains${pins.data ? ` (${pins.data.length})` : ''}`} hint="Pinned bindings: domain → the node that serves it" pad={false}>
         {pins.error ? <div className="p-4"><ErrorNote>{pins.error}</ErrorNote></div> : !pins.data ? <div className="p-4"><Skeleton className="h-12 w-full" /></div> : pins.data.length === 0 ? <Empty>No domain verified yet: the first lookup of a bound domain pins it.</Empty> : (
           <div className="overflow-x-auto"><table className="data"><thead><tr><th>Domain</th><th>Server</th><th className="num">Port</th><th>Verified by</th><th>Verified</th></tr></thead><tbody>
-            {pins.data.map((p) => <tr key={`${p.domain}-${p.npub}`}><td className="mono">{p.domain}</td><td><Target npub={p.npub} /></td><td className="num">{p.port}</td><td><Chip dot={false} tone={p.method === 'dnssec' ? 'good' : p.method === 'dns' ? 'accent' : 'warn'}>{p.method}</Chip></td><td>{ts(p.verified_at)}</td></tr>)}
+            {pins.data.map((p) => <tr key={`${p.domain}-${p.npub}`}><td className="mono">{p.domain}</td><td><NpubInline npub={p.npub} /></td><td className="num">{p.port}</td><td><Chip dot={false} tone={p.method === 'dnssec' ? 'good' : p.method === 'dns' || p.method === 'attested' ? 'accent' : 'warn'}>{p.method}</Chip></td><td>{ts(p.verified_at)}</td></tr>)}
           </tbody></table></div>
         )}
       </Card>
@@ -142,9 +138,8 @@ function Resolver({ side }: { side: PubdomSide }) {
   );
 }
 
-function LogCard({ side, running }: { side: Tab; running: boolean }) {
-  const log = usePoll(() => api.get<string[]>(`/api/pubdom/${side}/log?n=200`), [side, running], 15000);
-  if (!running) return null;
+function LogCard({ side }: { side: Tab }) {
+  const log = usePoll(() => api.get<string[]>(`/api/pubdom/${side}/log?n=200`), [side], 15000);
   return (
     <Card title="Log" hint={`The last lines of ${side === 'server' ? 'fips-pubdom-server' : 'fips-pubdomd'}`} pad={false} actions={<button className="btn ghost icon sm" onClick={log.refresh} title="Refresh"><RefreshCw size={14} /></button>}>
       {log.error ? <div className="p-4"><ErrorNote>{log.error}</ErrorNote></div> : !log.data ? <div className="p-4"><Skeleton className="h-12 w-full" /></div> : log.data.length === 0 ? <Empty>Nothing logged yet.</Empty> : (
