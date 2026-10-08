@@ -6,7 +6,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { ControlError, endpointExists, query } from './control.ts';
+import { PLATFORM } from './platform.ts';
+import { fetchLatestRelease } from './github.ts';
 
 export type PubdomSide = 'resolver' | 'server';
 
@@ -22,6 +25,76 @@ export const PATHS: Record<PubdomSide, SidePaths> = {
 
 export interface SideState { socket: string; running: boolean; installed: boolean }
 export type PubdomState = Record<PubdomSide, SideState>;
+
+/** The page's full picture of a side: presence, the binary's version and the unit's state (systemd only). */
+export interface UnitState { loaded: boolean; active: string; sub: string; enabled: string }
+export interface SideFull extends SideState { version: string | null; unit: UnitState | null }
+export interface PubdomFull { resolver: SideFull; server: SideFull; /** Where the helper can install: systemd, as the packaging's units need. */ canInstall: boolean }
+/** The binaries and the systemd units, as the web view names them too. */
+export const BIN: Record<PubdomSide, string> = { resolver: 'fips-pubdomd', server: 'fips-pubdom-server' };
+export const UNIT: Record<PubdomSide, string> = { resolver: 'fips-pubdom', server: 'fips-pubdom-server' };
+/** Helper version with pubdom-install / pubdom-update. */
+export const INSTALL_HELPER_VERSION = 12;
+/** Fixed on purpose: the helper installs from here as root, and nothing a caller sets reaches it through sudo. */
+export const RELEASE_REPO = 'fr34aky/fips-pub-domains';
+
+function exec(cmd: string, args: string[], timeout = 5000): Promise<string> {
+  return new Promise((resolve, reject) => execFile(cmd, args, { timeout }, (err, out) => (err ? reject(err) : resolve(String(out)))));
+}
+
+/** "fips-pubdomd 0.2.8" → "0.2.8"; null when the binary is not there or says something else. */
+export function parseVersionLine(out: string | null): string | null {
+  const m = /^\S+\s+(\d+\.\d+\.\d+\S*)/.exec((out ?? '').trim());
+  return m ? m[1] : null;
+}
+export async function binaryVersion(bin: string, run = exec): Promise<string | null> {
+  return parseVersionLine(await run(bin, ['--version']).catch(() => null));
+}
+
+/** `systemctl show` output for a unit; null when it is not loaded at all. */
+export function parseUnitShow(out: string): UnitState | null {
+  const kv = new Map(out.split('\n').map((l) => { const i = l.indexOf('='); return i < 0 ? [l, ''] : [l.slice(0, i), l.slice(i + 1)]; }));
+  if (kv.get('LoadState') !== 'loaded') return null;
+  return { loaded: true, active: kv.get('ActiveState') ?? 'unknown', sub: kv.get('SubState') ?? '', enabled: kv.get('UnitFileState') ?? '' };
+}
+export async function unitState(unit: string, run = exec): Promise<UnitState | null> {
+  if (PLATFORM.serviceManager !== 'systemd') return null;
+  return parseUnitShow(await run('systemctl', ['show', `${unit}.service`, '-p', 'LoadState,ActiveState,SubState,UnitFileState']).catch(() => ''));
+}
+
+/** detect() plus what the install and service controls need; the versions come from the binaries themselves. */
+export async function fullState(): Promise<PubdomFull> {
+  const base = detect();
+  const side = async (k: PubdomSide): Promise<SideFull> => {
+    const [version, unit] = await Promise.all([binaryVersion(BIN[k]), unitState(UNIT[k])]);
+    return { ...base[k], version, unit };
+  };
+  const [resolver, server] = await Promise.all([side('resolver'), side('server')]);
+  return { resolver, server, canInstall: PLATFORM.serviceManager === 'systemd' };
+}
+
+export interface Release { tag: string; version: string; url: string; publishedAt: string }
+export interface Releases { repo: string; latest: Release | null; error?: string; checkedAt: number }
+let releases: Releases | null = null;
+let releasesPending: Promise<Releases> | null = null;
+const RELEASE_TTL_MS = 6 * 3600_000, RELEASE_ERROR_TTL_MS = 60_000;
+
+/** The newest fips-pub-domains release, checked at most every six hours (a minute after an error) unless forced. */
+export function latestRelease(force = false, fetchJson: (repo: string) => Promise<unknown> = fetchLatestRelease): Promise<Releases> {
+  const ttl = releases?.error ? RELEASE_ERROR_TTL_MS : RELEASE_TTL_MS;
+  if (!force && releases && Date.now() - releases.checkedAt < ttl) return Promise.resolve(releases);
+  releasesPending ??= (async () => {
+    try {
+      const j = await fetchJson(RELEASE_REPO) as { tag_name?: string; html_url?: string; published_at?: string };
+      if (!j.tag_name || !/^v\d+\.\d+\.\d+$/.test(j.tag_name)) throw new Error(`unexpected release tag ${JSON.stringify(j.tag_name)}`);
+      releases = { repo: RELEASE_REPO, latest: { tag: j.tag_name, version: j.tag_name.slice(1), url: j.html_url ?? `https://github.com/${RELEASE_REPO}/releases`, publishedAt: j.published_at ?? '' }, checkedAt: Date.now() };
+    } catch (e) {
+      releases = { repo: RELEASE_REPO, latest: releases?.latest ?? null, error: `could not check for a new fips-pub-domains release: ${(e as Error).message}`, checkedAt: Date.now() };
+    } finally { releasesPending = null; }
+    return releases!;
+  })();
+  return releasesPending;
+}
 
 /**
  * Installed: a socket that answers, or configuration on disk (a stopped unit still shows its page). The socket is
@@ -109,14 +182,12 @@ export async function readZoneFile(file: string): Promise<FileText> {
 
 export function isSide(s: string): s is PubdomSide { return s === 'resolver' || s === 'server'; }
 
-export const UNIT: Record<PubdomSide, string> = { resolver: 'fips-pubdomd', server: 'fips-pubdom-server' };
-
 /** The query, with the transport errors' "is the fips daemon running?" hint naming the right process. */
 export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string, params?: Record<string, unknown>): Promise<T> {
   try {
     return await query<T>(command, params, { socketPath: PATHS[side].socket, timeoutMs: 15000 });
   } catch (e) {
-    if (e instanceof ControlError && e.kind === 'transport') throw new ControlError(e.message.replace('the fips daemon', UNIT[side]), 'transport');
+    if (e instanceof ControlError && e.kind === 'transport') throw new ControlError(e.message.replace('the fips daemon', BIN[side]), 'transport');
     throw e;
   }
 }

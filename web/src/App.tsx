@@ -48,9 +48,10 @@ export default function App() {
   const ownName = useHostName(snap?.status?.npub);
   const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
   const gwBadge = snap?.gateway ? <Chip tone="good" className="ml-auto" dot={false}>on</Chip> : undefined;
-  // The public-domains page exists only where the node runs the resolver or the server (health says).
+  // The public-domains page exists where the node runs the resolver or the server (health says), and for an
+  // admin whose helper can install them.
   const pd = health?.pubdom;
-  const hidden: ViewId[] = pd && (pd.resolver.installed || pd.server.installed) ? [] : ['pubdom'];
+  const hidden: ViewId[] = (pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom'];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {

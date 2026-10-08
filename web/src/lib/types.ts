@@ -69,8 +69,11 @@ export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principa
 
 // Public domain names over fips (fr34aky/fips-pub-domains): what the node runs, and what the two
 // control sockets answer (that repository's docs/webui.md).
-export interface PubdomSide { socket: string; running: boolean; installed: boolean }
-export interface PubdomState { resolver: PubdomSide; server: PubdomSide }
+export interface PubdomUnit { loaded: boolean; active: string; sub: string; enabled: string }
+export interface PubdomSide { socket: string; running: boolean; installed: boolean; /** the binary's version (fullState) */ version?: string | null; /** the systemd unit's state, null elsewhere */ unit?: PubdomUnit | null }
+export interface PubdomState { resolver: PubdomSide; server: PubdomSide; /** the helper can install here (systemd) */ canInstall?: boolean }
+export interface PubdomRelease { tag: string; version: string; url: string; publishedAt: string }
+export interface PubdomReleases { repo: string; latest: PubdomRelease | null; error?: string; checkedAt: number }
 export interface PubdomAttestation { witness: string; servers: string[]; names_this_server: boolean; method: string; verified_at: number; created_at: number }
 export interface PubdomCheckDns { domain: string; verdict: string; detail: string | null; ttl: number | null; upstreams: string[]; txt_record: string }
 /** A file the editors show: its text and the hash the helper checks before replacing it ('none' when it does not exist). */

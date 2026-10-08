@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, isSide, liveZonesDir, readEditable, zoneFileWithin } from '../server/pubdom.ts';
+import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, binaryVersion, isSide, latestRelease, liveZonesDir, parseUnitShow, parseVersionLine, readEditable, zoneFileWithin } from '../server/pubdom.ts';
 
 const paths = {
   resolver: { socket: '/run/r.sock', files: ['/etc/r.yaml', '/var/r.json'] },
@@ -72,4 +72,27 @@ test('a server running from --zone flags is an operator state with the step to t
   await assert.rejects(liveZonesDir(async () => ({ zones_dir: null }), () => false), (e: Error) => e instanceof PubdomStateError && /fips-pubdom-server init/.test(e.message) && /systemctl restart fips-pubdom-server/.test(e.message));
   // The file is already there (written by hand or from the settings card without a restart): only the restart is missing.
   await assert.rejects(liveZonesDir(async () => ({}), () => true), (e: Error) => e instanceof PubdomStateError && !/init/.test(e.message) && /systemctl restart fips-pubdom-server/.test(e.message));
+});
+
+test('binary versions and unit states are read from the tools\' own output', async () => {
+  assert.equal(parseVersionLine('fips-pubdomd 0.2.8\n'), '0.2.8');
+  assert.equal(parseVersionLine('fips-pubdom-server 0.3.0-rc.1'), '0.3.0-rc.1');
+  assert.equal(parseVersionLine(''), null);
+  assert.equal(await binaryVersion('fips-pubdomd', async () => 'fips-pubdomd 0.2.8'), '0.2.8');
+  assert.equal(await binaryVersion('fips-pubdomd', async () => { throw new Error('ENOENT'); }), null);
+  assert.deepEqual(parseUnitShow('LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\n'), { loaded: true, active: 'active', sub: 'running', enabled: 'enabled' });
+  assert.equal(parseUnitShow('LoadState=not-found\nActiveState=inactive\nSubState=dead\nUnitFileState=\n'), null);
+  assert.equal(parseUnitShow(''), null);
+});
+
+test('the newest release is read from GitHub and an error keeps the last answer', async () => {
+  const r = await latestRelease(true, async () => ({ tag_name: 'v0.2.8', html_url: 'https://example/r', published_at: '2026-10-08T00:00:00Z' }));
+  assert.deepEqual(r.latest, { tag: 'v0.2.8', version: '0.2.8', url: 'https://example/r', publishedAt: '2026-10-08T00:00:00Z' });
+  const cached = await latestRelease(false, async () => { throw new Error('must not be called'); });
+  assert.equal(cached.latest?.version, '0.2.8');
+  const failed = await latestRelease(true, async () => { throw new Error('GitHub answered 403'); });
+  assert.match(failed.error ?? '', /403/);
+  assert.equal(failed.latest?.version, '0.2.8');
+  const odd = await latestRelease(true, async () => ({ tag_name: 'nightly' }));
+  assert.match(odd.error ?? '', /unexpected release tag/);
 });

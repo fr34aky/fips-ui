@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Public domains**: install the resolver or the domain server from
+  fips-pub-domains' GitHub releases (helper v12: the archive verified
+  against its `SHA256SUMS`, binaries, unit, `fips-pubdomd setup` or the
+  server's zones directory, firewall drop-in and `server.yaml`), update
+  both when a newer release is out, and start, stop, restart, enable or
+  disable their units from a service card. Admins with such a helper see
+  the page before anything is installed.
+
 ## [0.10.1] - 2026-10-08
 
 ### Fixed

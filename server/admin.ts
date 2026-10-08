@@ -6,7 +6,7 @@
 // paths, so nothing can be swapped between validation and install.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, PubdomStateError, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
+import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, INSTALL_HELPER_VERSION as PUBDOM_INSTALL_HELPER_VERSION, PubdomStateError, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -264,10 +264,10 @@ export function createAdminHandler(opts: AdminOptions) {
   }
 
   /** The public-domains verbs came with helper v11; an older helper gets a precise message, not a usage error. */
-  async function requirePubdomHelper(): Promise<void> {
+  async function requirePubdomHelper(need = PUBDOM_HELPER_VERSION, what = 'editing public domains'): Promise<void> {
     const h = await helperInfo();
     if (!h.managementCapable) throw new Error(h.error ?? 'the privileged helper is not available');
-    if ((h.version ?? 0) < PUBDOM_HELPER_VERSION) throw new Error(`editing public domains needs helper v${PUBDOM_HELPER_VERSION} (installed: v${h.version}); run sudo ./deploy/setup-local.sh`);
+    if ((h.version ?? 0) < need) throw new Error(`${what} needs helper v${need} (installed: v${h.version}); run sudo ./deploy/setup-local.sh`);
   }
 
   async function helperJson<T>(args: string[], input?: string, timeoutMs?: number): Promise<T> {
@@ -415,6 +415,18 @@ export function createAdminHandler(opts: AdminOptions) {
         if (typeof base !== 'string' || !/^([0-9a-f]{64}|none)$/.test(base)) throw new BodyError(400, 'base (sha256 or none) required');
         await requirePubdomHelper();
         const result = await helperJson<Record<string, unknown>>(['pubdom-config-apply', side, ...(restart === false ? ['--no-restart'] : []), '--base', base], yaml.endsWith('\n') ? yaml : yaml + '\n', HELPER_RESTART_TIMEOUT);
+        sendJson(res, result.ok ? 200 : 422, result); return true;
+      }
+      // Install or update fips-pub-domains from its GitHub release: minutes, one at a time, never during an upgrade.
+      if (sub === '/pubdom/install' || sub === '/pubdom/update') {
+        const { side, tag } = body as { side?: unknown; tag?: unknown };
+        if (sub === '/pubdom/install' && (typeof side !== 'string' || !isPubdomSide(side))) throw new BodyError(400, 'side must be server or resolver');
+        if (tag !== undefined && (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag))) throw new BodyError(400, 'tag must be vX.Y.Z');
+        const busy = opts.busy();
+        if (busy) throw new BodyError(409, busy);
+        await requirePubdomHelper(PUBDOM_INSTALL_HELPER_VERSION, 'installing fips-pub-domains');
+        const args = sub === '/pubdom/install' ? ['pubdom-install', side as string] : ['pubdom-update'];
+        const result = await helperJson<Record<string, unknown>>([...args, ...(tag ? [tag] : [])], undefined, 10 * 60_000);
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/pubdom/action') {
