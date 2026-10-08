@@ -26,7 +26,6 @@ export function PublicDomains({ health }: { health: Health | null }) {
   const pd = state.data ?? health?.pubdom;
   const admin = !!health && !health.readOnly;
   const helper = usePoll(() => (admin ? adminApi.status().then((r) => r.helper) : Promise.resolve(null)), [admin], 60000);
-  const can: Can = { admin, edit: admin && !!helper.data && helper.data.managementCapable && (helper.data.version ?? 0) >= PUBDOM_HELPER_VERSION, serviceControl: !!health?.serviceControl };
   const tabs: { value: Tab; label: string }[] = [];
   if (pd?.server.installed) tabs.push({ value: 'server', label: 'Domain server' });
   if (pd?.resolver.installed) tabs.push({ value: 'resolver', label: 'Resolver' });
@@ -36,10 +35,18 @@ export function PublicDomains({ health }: { health: Health | null }) {
   }
   const current = tabs.some((t) => t.value === tab) ? tab : tabs[0].value;
   const side = pd[current];
+  const h = helper.data;
+  // Editing needs the helper with the public-domains verbs and, as root sees it, the side's binary for the
+  // validation; starting a unit needs a helper that drives this service manager (the direct mode has no root).
+  const can: Can = {
+    admin,
+    edit: admin && !!h && h.managementCapable && (h.version ?? 0) >= PUBDOM_HELPER_VERSION && (h.pubdom ? h.pubdom[current] : true),
+    serviceControl: !!health?.serviceControl && !!h?.features?.services,
+  };
   return (
     <div className="grid gap-4 fade-in">
       {tabs.length > 1 && <Segmented value={current} onChange={setTab} options={tabs} />}
-      {admin && helper.data && !can.edit && <HelperNote helper={helper.data} />}
+      {admin && h && !can.edit && <HelperNote helper={h} side={current} />}
       {!side.running ? <NotRunning tab={current} side={side} can={can} onChanged={state.refresh} />
         : current === 'server' ? <Server can={can} /> : <Resolver can={can} />}
       {side.running && <LogCard key={current} side={current} />}
@@ -47,7 +54,11 @@ export function PublicDomains({ health }: { health: Health | null }) {
   );
 }
 
-function HelperNote({ helper }: { helper: HelperInfo }) {
+function HelperNote({ helper, side }: { helper: HelperInfo; side: Tab }) {
+  const bin = side === 'server' ? 'fips-pubdom-server' : 'fips-pubdomd';
+  if (helper.managementCapable && (helper.version ?? 0) >= PUBDOM_HELPER_VERSION) {
+    return <Card><div className="text-sm text-ink-2">Editing needs <code>{bin}</code> on root's PATH (the helper checks every file with its <code>validate</code> command), and the helper did not find it: install it under <code>/usr/bin</code> (fips-pub-domains, docs/install.md). The actions over the control socket work without it.</div></Card>;
+  }
   const why = !helper.managementCapable ? (helper.error ?? 'the privileged helper is not available') : `helper v${helper.version} is installed; the public-domains verbs came with v${PUBDOM_HELPER_VERSION}`;
   return <Card><div className="text-sm text-ink-2">Editing zone files and the configuration needs the privileged helper, version {PUBDOM_HELPER_VERSION} or newer: {why}. The actions over the control sockets work without it.<div className="mt-2"><Copyable text="sudo ./deploy/setup-local.sh" className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit" /></div></div></Card>;
 }
@@ -96,7 +107,7 @@ function Server({ can }: { can: Can }) {
   const zones = usePoll(() => api.get<PubdomZones>('/api/pubdom/server/zones'), [], 10000);
   const refresh = () => { status.refresh(); zones.refresh(); };
   const { busy, run } = useAction(refresh);
-  const [editor, setEditor] = useState<{ zone: PubdomZone | null } | null>(null);
+  const [editor, setEditor] = useState<{ zone: PubdomZone | null; file?: string } | null>(null);
   const [confirm, setConfirm] = useState<PubdomZone | null>(null);
   if (status.error) return <ErrorNote>{status.error}</ErrorNote>;
   const s = status.data;
@@ -135,13 +146,13 @@ function Server({ can }: { can: Can }) {
           )}
           {zones.data.skipped.length > 0 && (
             <Card title="Skipped files" hint="Zone files the server could not load; the log below says why">
-              <ul className="text-xs mono">{zones.data.skipped.map((f) => <li key={f.file}>{f.file}</li>)}</ul>
+              <ul className="text-xs mono grid gap-1">{zones.data.skipped.map((f) => <li key={f.file} className="flex items-center gap-2">{f.file}{can.edit && <button className="btn sm ghost" onClick={() => setEditor({ zone: null, file: f.file })}><Pencil size={13} />Repair</button>}</li>)}</ul>
             </Card>
           )}
         </>
       )}
       {can.admin && <ConfigCard side="server" title="Publishing and server settings" hint="/etc/fips-pubdom/server.yaml: relays, DNSSEC proof, resolvers, port, TTL; a change restarts the server" can={can} onSaved={refresh} />}
-      {editor && <ZoneEditor zone={editor.zone} defaultPort={s?.port ?? 5355} taken={zones.data?.zones.map((z) => z.domain) ?? []} onClose={() => setEditor(null)} onSaved={() => { setEditor(null); refresh(); }} />}
+      {editor && <ZoneEditor zone={editor.zone} file={editor.file} defaultPort={s?.port ?? 5355} taken={zones.data?.zones.map((z) => z.domain) ?? []} onClose={() => setEditor(null)} onSaved={() => { setEditor(null); refresh(); }} />}
       <ConfirmDialog open={!!confirm} onClose={() => setConfirm(null)} danger busy={busy} title={`Remove ${confirm?.domain}?`} confirmLabel="Remove"
         body={<p>The zone file <code>{confirm?.file}</code> is removed (a backup is kept) and the server stops answering for the domain within a second. The claim already published on the relays stays until it expires.</p>}
         onConfirm={async () => { if (!confirm) return; const r = await run(() => adminApi.pubdomZoneDelete(basename(confirm.file)), `${confirm.domain} removed`); if (r?.ok) setConfirm(null); }} />
@@ -226,56 +237,66 @@ export function renderZoneYaml(domain: string, port: string, rows: Row[]): strin
   return lines.join('\n') + '\n';
 }
 
-function ZoneEditor({ zone, defaultPort, taken, onClose, onSaved }: { zone: PubdomZone | null; defaultPort: number; taken: string[]; onClose: () => void; onSaved: () => void }) {
+function ZoneEditor({ zone, file: skipped, defaultPort, taken, onClose, onSaved }: { zone: PubdomZone | null; file?: string; defaultPort: number; taken: string[]; onClose: () => void; onSaved: () => void }) {
   const toast = useToast();
+  const existing = zone?.file ?? skipped ?? null;
   const [domain, setDomain] = useState(zone?.domain ?? '');
   const [port, setPort] = useState(zone && zone.port !== defaultPort ? String(zone.port) : '');
   const [rows, setRows] = useState<Row[]>(zone ? zone.names.map((n) => ({ label: n.label, kind: n.target === 'self' ? 'self' : n.target === 'legacy' ? 'legacy' : 'node', npub: n.target === 'self' || n.target === 'legacy' ? '' : n.target })) : [{ label: 'www', kind: 'self', npub: '' }]);
-  const [mode, setMode] = useState<'table' | 'yaml'>('table');
+  // A skipped file has no table (the server could not parse it): it opens as text.
+  const [mode, setMode] = useState<'table' | 'yaml'>(skipped ? 'yaml' : 'table');
+  // The File view's text once the operator typed in it; until then it mirrors the table.
   const [yaml, setYaml] = useState<string | null>(null);
-  const [file, setFile] = useState<PubdomFileText | null>(zone ? null : { path: '', text: '', base: 'none' });
+  const [file, setFile] = useState<PubdomFileText | null>(existing ? null : { path: '', text: '', base: 'none' });
   const [loadError, setLoadError] = useState<string | null>(null);
   const [result, setResult] = useState<PubdomResult | null>(null);
   const [busy, setBusy] = useState(false);
   // An existing file is read for its hash (the helper refuses a save over a file that changed meanwhile) and
-  // for the raw view; the table is filled from what the server loaded.
-  useEffect(() => {
-    if (!zone) return;
-    api.get<PubdomFileText>(`/api/pubdom/server/zone-file?file=${encodeURIComponent(zone.file)}`).then(setFile).catch((e: Error) => setLoadError(e.message));
-  }, [zone]);
+  // for the File view; the table is filled from what the server loaded.
+  const load = () => {
+    if (!existing) return;
+    api.get<PubdomFileText>(`/api/pubdom/server/zone-file?file=${encodeURIComponent(existing)}`).then((f) => { setFile(f); setLoadError(null); if (skipped) setYaml((y) => y ?? f.text); }).catch((e: Error) => setLoadError(e.message));
+  };
+  useEffect(load, [existing, skipped]);
   const generated = renderZoneYaml(domain, port, rows);
-  const text = mode === 'yaml' ? (yaml ?? generated) : generated;
+  // What is saved: the File view's text once edited there, else the table.
+  const edited = yaml !== null;
+  const text = edited ? yaml : generated;
   const wildcard = rows.some((r) => r.label.trim() === '*');
   const problems: string[] = [];
-  if (!zone && !/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$/.test(domain.trim().toLowerCase())) problems.push('the domain must be a registered name like example.org');
-  if (!zone && taken.includes(domain.trim().toLowerCase())) problems.push('this domain already has a zone file; edit that one');
+  if (!zone && !skipped && !/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$/.test(domain.trim().toLowerCase())) problems.push('the domain must be a registered name like example.org');
+  if (!zone && !skipped && taken.includes(domain.trim().toLowerCase())) problems.push('this domain already has a zone file; edit that one');
   if (port.trim() && !/^\d{1,5}$/.test(port.trim())) problems.push('the port must be a number');
-  if (mode === 'table') {
+  if (!edited) {
     if (!rows.some((r) => r.label.trim())) problems.push('at least one name is needed');
     for (const r of rows) if (r.kind === 'node' && !/^npub1[02-9ac-hj-np-z]{58}$/.test(r.npub.trim())) problems.push(`${r.label.trim() || 'a row'}: the other node's npub is needed`);
-  }
+  } else if (!text.trim()) problems.push('the file is empty');
+  const fileName = existing ? basename(existing) : `${domain.trim().toLowerCase()}.yaml`;
   const save = async () => {
     if (!file) return;
     setBusy(true); setResult(null);
     try {
-      const r = await withResult(adminApi.pubdomZone(zone ? basename(zone.file) : `${domain.trim().toLowerCase()}.yaml`, text, file.base));
+      const r = await withResult(adminApi.pubdomZone(fileName, text, file.base));
       setResult(r);
-      if (r.ok) { toast('ok', r.changed ? `${zone?.domain ?? domain.trim()} saved; the server picks it up within a second` : 'No changes'); onSaved(); }
-      else toast('err', r.error ?? 'Refused');
-    } catch (e) { toast('err', (e as Error).message); }
+      if (r.ok) { toast('ok', r.changed ? `${fileName} saved; the server picks it up within a second` : 'No changes'); onSaved(); }
+      else { toast('err', r.error ?? 'Refused'); load(); }   // a stale base is refreshed; the draft stays
+    } catch (e) { toast('err', (e as Error).message); load(); }
     finally { setBusy(false); }
   };
   return (
-    <Modal open onClose={onClose} title={zone ? `Edit ${zone.domain}` : 'Add a domain'} width="max-w-3xl">
+    <Modal open onClose={onClose} title={zone ? `Edit ${zone.domain}` : skipped ? `Repair ${basename(skipped)}` : 'Add a domain'} width="max-w-3xl">
       <div className="grid gap-3">
         {loadError && <ErrorNote>{loadError}</ErrorNote>}
-        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_8rem]">
-          <label className="field">Domain<input className="input mono" value={domain} disabled={!!zone} onChange={(e) => setDomain(e.target.value)} placeholder="example.org" /></label>
-          <label className="field">Port<input className="input mono" value={port} onChange={(e) => setPort(e.target.value)} placeholder={String(defaultPort)} title="Must match the TXT record; empty for the server's port" /></label>
-        </div>
-        <Segmented value={mode} onChange={(m) => { if (m === 'yaml' && yaml === null) setYaml(file?.text && zone ? file.text : generated); setMode(m); }} options={[{ value: 'table', label: 'Names' }, { value: 'yaml', label: 'File' }]} />
+        {!skipped && (
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_8rem]">
+            <label className="field">Domain<input className="input mono" value={domain} disabled={!!zone} onChange={(e) => setDomain(e.target.value)} placeholder="example.org" /></label>
+            <label className="field">Port<input className="input mono" value={port} onChange={(e) => setPort(e.target.value)} placeholder={String(defaultPort)} title="Must match the TXT record; empty for the server's port" /></label>
+          </div>
+        )}
+        {!skipped && <Segmented value={mode} onChange={setMode} options={[{ value: 'table', label: 'Names' }, { value: 'yaml', label: 'File' }]} />}
         {mode === 'table' ? (
           <div className="grid gap-2">
+            {edited && <div className="text-xs text-warn">The File view was edited; that text is what gets saved. <button type="button" className="underline" onClick={() => setYaml(null)}>Drop those edits</button> to save from this table instead.</div>}
             <div className="text-xs text-ink-3">Each name under the domain and where it points: this node, another fips node (its npub), or <em>legacy</em> for a name that stays on the ordinary Internet even under a wildcard. <code>@</code> is the domain itself, <code>*</code> every other name.</div>
             {rows.map((r, i) => (
               <div key={i} className="grid gap-2 sm:grid-cols-[10rem_9rem_minmax(0,1fr)_2rem] items-center">
@@ -291,13 +312,16 @@ function ZoneEditor({ zone, defaultPort, taken, onClose, onSaved }: { zone: Pubd
             {wildcard && <div className="text-xs text-warn">A wildcard claims every name under the domain for the mesh: a browser on the mesh will not reach any name you forgot to mark <em>legacy</em>. Use it only if everything under the domain really is on the mesh.</div>}
           </div>
         ) : (
-          <label className="field">The zone file as it will be written (checked by the server's own parser on save)<textarea className="input mono h-56 py-2 resize-y" spellCheck={false} value={text} onChange={(e) => setYaml(e.target.value)} /></label>
+          <div className="grid gap-2">
+            <label className="field">{skipped ? 'The file as it is on disk; the log says why the server skipped it' : edited ? 'The file as it will be written' : 'The file as the table renders it; edit it here to write exactly this text'}<textarea className="input mono h-56 py-2 resize-y" spellCheck={false} value={text} onChange={(e) => setYaml(e.target.value)} /></label>
+            {zone && file && file.text !== text && <div className="text-xs text-ink-3">Comments and ordering of the file on disk are not kept by the table. <button type="button" className="underline" onClick={() => setYaml(file.text)}>Start from the file on disk</button> to keep them.</div>}
+          </div>
         )}
         {problems.length > 0 && <div className="text-xs text-warn">{problems.join('; ')}</div>}
         {result && !result.ok && <ErrorNote><div>{result.error}</div>{result.detail && <pre className="mt-1 text-xs whitespace-pre-wrap">{result.detail}</pre>}</ErrorNote>}
         <div className="flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
-          <button type="button" className="btn primary" disabled={busy || !file || problems.length > 0} onClick={save}>{zone ? 'Save' : 'Add'}</button>
+          <button type="button" className="btn primary" disabled={busy || !file || problems.length > 0} onClick={save}>{zone || skipped ? 'Save' : 'Add'}</button>
         </div>
       </div>
     </Modal>
@@ -331,8 +355,8 @@ function ConfigCard({ side, title, hint, can, onSaved }: { side: Tab; title: str
       const r = await withResult(adminApi.pubdomConfig(side, text, file.data.base, restart));
       setResult(r);
       if (r.ok) { toast('ok', r.changed ? (r.restarted ? `${file.data.path} saved and ${UNIT[side]} restarted` : `${file.data.path} saved`) : 'No changes'); setDraft(null); file.refresh(); onSaved(); }
-      else toast('err', r.error ?? 'Refused');
-    } catch (e) { toast('err', (e as Error).message); }
+      else { toast('err', r.error ?? 'Refused'); file.refresh(); }   // a stale base is refreshed; the draft stays
+    } catch (e) { toast('err', (e as Error).message); file.refresh(); }
     finally { setBusy(false); setConfirm(false); }
   };
   return (

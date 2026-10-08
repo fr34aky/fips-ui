@@ -6,7 +6,7 @@
 // paths, so nothing can be swapped between validation and install.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, isSide as isPubdomSide, pubdomQuery } from './pubdom.ts';
+import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -394,18 +394,19 @@ export function createAdminHandler(opts: AdminOptions) {
       // them with the fips-pub-domains binaries; actions over the control sockets, which trust whoever can open them.
       if (sub === '/pubdom/zone') {
         const { file, content, base } = body as { file?: unknown; content?: unknown; base?: unknown };
-        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be <domain>.yaml');
+        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be a plain <name>.yaml');
         if (typeof content !== 'string' || !content.trim()) throw new BodyError(400, 'content (non-empty string) required');
         if (typeof base !== 'string' || !/^([0-9a-f]{64}|none)$/.test(base)) throw new BodyError(400, 'base (sha256 or none) required');
         await requirePubdomHelper();
-        const result = await helperJson<Record<string, unknown>>(['pubdom-zone-apply', file, '--base', base], content.endsWith('\n') ? content : content + '\n');
+        // The directory the running server follows goes along: the helper refuses to write anywhere else.
+        const result = await helperJson<Record<string, unknown>>(['pubdom-zone-apply', file, '--base', base, '--dir', await liveZonesDir()], content.endsWith('\n') ? content : content + '\n');
         sendJson(res, result.ok ? 200 : 422, result); return true;
       }
       if (sub === '/pubdom/zone/delete') {
         const file = body.file;
-        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be <domain>.yaml');
+        if (typeof file !== 'string' || !ZONE_FILE_RE.test(file) || file.includes('..')) throw new BodyError(400, 'file must be a plain <name>.yaml');
         await requirePubdomHelper();
-        sendJson(res, 200, await helperJson<Record<string, unknown>>(['pubdom-zone-delete', file])); return true;
+        sendJson(res, 200, await helperJson<Record<string, unknown>>(['pubdom-zone-delete', file, '--dir', await liveZonesDir()])); return true;
       }
       if (sub === '/pubdom/config') {
         const { side, yaml, base, restart } = body as { side?: unknown; yaml?: unknown; base?: unknown; restart?: unknown };

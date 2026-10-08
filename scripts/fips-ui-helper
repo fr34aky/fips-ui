@@ -39,12 +39,14 @@
 #   hosts-apply --base <sha256|none> <- new /etc/fips/hosts on stdin (hostname npub lines, comments); refused
 #                                     if the file changed since it was read; backed up and replaced
 #                                     atomically, root:root 0644 (the daemon reloads it on the next query)
-#   pubdom-zone-apply <file> --base <sha256|none>
+#   pubdom-zone-apply <file> --base <sha256|none> [--dir <zones-dir>]
 #                                  <- (v11) a zone file for fips-pubdom-server on stdin, checked with the server's
 #                                     own `validate zone`, refused if the file changed since it was read, written
 #                                     atomically into the zones directory (server.yaml's `zones:`, else
-#                                     /etc/fips-pubdom/zones); the server follows the directory, no restart
-#   pubdom-zone-delete <file>      -> (v11) remove a zone file (a backup is kept)
+#                                     /etc/fips-pubdom/zones); the server follows the directory, no restart.
+#                                     --dir is the directory the running server reports: refused if it is not
+#                                     the one the helper would write to
+#   pubdom-zone-delete <file> [--dir <zones-dir>] -> (v11) remove a zone file (a backup is kept)
 #   pubdom-config-apply <server|resolver> [--no-restart] --base <sha256|none>
 #                                  <- (v11) /etc/fips-pubdom/server.yaml or config.yaml on stdin, checked with the
 #                                     binary's own `validate config`, written atomically, the unit restarted if
@@ -1009,14 +1011,19 @@ pubdom_zones_dir() {
   [[ "$d" == /* ]] || die "zones: in server.yaml must be an absolute path"
   printf '%s' "$d"
 }
-# A zone file is named for its domain; the name is the only path component the caller chooses.
-valid_zone_file() { [[ "$1" =~ ^[a-z0-9][a-z0-9.-]{0,120}\.yaml$ && "$1" != *..* ]] || die "invalid zone file name (<domain>.yaml)"; }
+# A zone file is any plain *.yaml name the server would load; the name is the only path component the caller chooses.
+valid_zone_file() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.yaml$ && "$1" != *..* ]] || die "invalid zone file name (<name>.yaml)"; }
+# The running server reports the directory it follows; a helper writing elsewhere would succeed into the void.
+pubdom_same_dir() { # <helper's dir> <reported dir or empty>
+  [[ -z "$2" || "${2%/}" == "${1%/}" ]] || die "the running server follows $2, this helper writes to $1 (zones: in $PUBDOM_ETC/server.yaml); make them agree"
+}
 pubdom_bin() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed (fips-pub-domains)"; }
 pubdom_backup() { # <file> <tag>: a copy under the config backups, the newest 20 per tag kept
   [[ -f "$1" ]] || return 0
   mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
-  cp -p "$1" "$CONFIG_BACKUPS_DIR/pubdom-$2-$(date +%Y%m%d-%H%M%S)"
-  keep_newest 20 "$CONFIG_BACKUPS_DIR"/pubdom-"$2"-*
+  # '@' cannot occur in a domain or a side name, so one tag's pruning never counts another's backups.
+  cp -p "$1" "$CONFIG_BACKUPS_DIR/pubdom-$2@$(date +%Y%m%d-%H%M%S)"
+  keep_newest 20 "$CONFIG_BACKUPS_DIR"/pubdom-"$2"@*
 }
 pubdom_check_base() { # <file> <sha256|none>: the caller edited what is there now
   local cur=none; [[ -f "$1" ]] && cur=$(sha256_stdin < "$1")
@@ -1608,10 +1615,19 @@ case "$cmd" in
 
   pubdom-zone-apply)
     take_lock
-    file=${2:-}; valid_zone_file "$file"
-    [[ "${3:-}" == --base && "${4:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "usage: pubdom-zone-apply <file> --base <sha256|none>"
-    base=$4; pubdom_bin fips-pubdom-server
-    dir=$(pubdom_zones_dir); dest="$dir/$file"
+    file=${2:-}; valid_zone_file "$file"; shift 2
+    base=""; live=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --base) [[ "${2:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "--base needs a sha256 or none"; base=$2; shift ;;
+        --dir) [[ "${2:-}" == /* ]] || die "--dir needs an absolute path"; live=$2; shift ;;
+        *) die "usage: pubdom-zone-apply <file> --base <sha256|none> [--dir <zones-dir>]" ;;
+      esac
+      shift
+    done
+    [[ -n "$base" ]] || die "--base is required"
+    pubdom_bin fips-pubdom-server
+    dir=$(pubdom_zones_dir); pubdom_same_dir "$dir" "$live"; dest="$dir/$file"
     tmp=$(mktemp); errf=$(mktemp); trap 'rm -f "$tmp" "$errf"' EXIT
     read_stdin_limited "$tmp" "$MAX_ZONE_BYTES"
     # The server's own parser decides, on the exact bytes that will be installed.
@@ -1628,7 +1644,8 @@ case "$cmd" in
   pubdom-zone-delete)
     take_lock
     file=${2:-}; valid_zone_file "$file"
-    dest="$(pubdom_zones_dir)/$file"
+    live=""; if [[ "${3:-}" == --dir ]]; then [[ "${4:-}" == /* ]] || die "--dir needs an absolute path"; live=$4; fi
+    dir=$(pubdom_zones_dir); pubdom_same_dir "$dir" "$live"; dest="$dir/$file"
     [[ -f "$dest" ]] || die "$dest not found"
     pubdom_backup "$dest" "zone-${file%.yaml}"
     rm -f -- "$dest"

@@ -35,13 +35,16 @@ Viewers see all of it. Admins also get the buttons:
 | **Start** | On a side that is installed but not running, starts its unit (with service control enabled). |
 
 The actions go over the control sockets, which trust whoever can open them, so they need no helper. The
-files go through the privileged helper (version 11 or newer, `sudo ./deploy/setup-local.sh`): each is
+files are read by the backend for admins only (a `server.yaml` whose `key:` holds the key itself rather
+than a path is not shown at all) and written through the privileged helper (version 11 or newer, `sudo ./deploy/setup-local.sh`): each is
 checked with the binary's own parser before it is written — `fips-pubdom-server validate zone`,
 `fips-pubdom-server validate config`, `fips-pubdomd validate config` — refused if the file changed since
 the editor read it, backed up, and replaced atomically as `root:root 0644`. A zone file is picked up by
-the server within a second; a configuration change restarts the unit if it was running (the checkbox in
-the confirmation turns that off). Comments in a hand-written zone file do not survive a save from the
-table; edit the file under **File** to keep them.
+the server within a second — into the directory the running server reports, which the helper checks
+against its own; a configuration change restarts the unit if it was running (the checkbox in the
+confirmation turns that off). Comments in a hand-written zone file do not survive a save from the
+table; the **File** view offers to start from the file on disk to keep them. A file the server skipped
+(it would not parse) opens as text under **Repair**.
 
 A side that is installed but whose unit is not running shows the page with a note instead of data. The
 UI's user must be in group `fips` (the sockets are group-readable and -writable), as it already is for

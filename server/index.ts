@@ -423,7 +423,11 @@ async function route(req: Req, res: Res) {
     if (method !== 'GET') throw new HttpError(405, 'GET only');
     const [side, cmd, ...rest] = p.slice('/api/pubdom/'.length).split('/');
     if (!side || !cmd || rest.length || !isPubdomSide(side)) throw new HttpError(404, 'unknown public-domains endpoint');
-    // The files the editors show: the side's configuration, or a zone file the zones listing named.
+    // The files the editors show: the side's configuration, or a zone file the zones listing named. Admins
+    // only: unlike the socket's answers, a file is whatever the operator wrote in it.
+    if (cmd === 'config-file' || cmd === 'zone-file') {
+      if (principalOf(req).role !== 'admin') throw new HttpError(403, 'admin role required');
+    }
     if (cmd === 'config-file') return json(res, 200, readEditable(PUBDOM_CONFIG_FILE[side]));
     if (cmd === 'zone-file' && side === 'server') {
       const file = url.searchParams.get('file') ?? '';
