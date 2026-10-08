@@ -65,7 +65,19 @@ export interface Snapshot {
 export interface LogLine { ts: number; level: 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'unknown'; target?: string; message: string; raw: string; cursor?: string }
 
 export type Principal = { kind: 'local'; role: 'admin' } | { kind: 'mesh'; role: 'viewer' | 'admin'; npub: string; label?: string; address: string };
-export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string }
+export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string; pubdom?: PubdomState }
+
+// Public domain names over fips (fr34aky/fips-pub-domains): what the node runs, and what the two
+// control sockets answer (that repository's docs/webui.md).
+export interface PubdomSide { socket: string; running: boolean; installed: boolean }
+export interface PubdomState { resolver: PubdomSide; server: PubdomSide }
+export interface PubdomRelay { url: string; accepted_at: number | null; last_error: string | null }
+export interface PubdomServerStatus { version: string; npub: string; address: string; bind: string; port: number; zones_dir: string | null; publishing: boolean; relays: PubdomRelay[] }
+export interface PubdomName { label: string; target: string }
+export interface PubdomZone { domain: string; file: string; port: number; names: PubdomName[]; txt_record: string; claim_published_at: number | null; zone_published_at: number | null; dnssec_proof_until: number | null; next_publish_at: number | null; last_error: string | null }
+export interface PubdomZones { zones: PubdomZone[]; skipped: { file: string }[] }
+export interface PubdomResolverStatus { version: string; online: boolean; upstreams: string[]; listen: string[]; upstreams_from: string | null; backend: string | null; pins: string; dnssec: boolean; plain_probe: boolean; witnesses: string[]; attestation_threshold: number; mesh_relays: string[]; public_relays: string[] }
+export interface PubdomPin { domain: string; npub: string; port: number; method: string; verified_at: number }
 
 export interface MetricDef { name: string; scope: 'node' | 'peer'; unit: string }
 export interface Series { metric: string; unit: string; granularity_seconds: number; values: (number | null)[] }

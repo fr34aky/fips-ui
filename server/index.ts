@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
+import { detect as detectPubdom, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, pubdomQuery } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -379,7 +380,7 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, pubdom: detectPubdom(), serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -407,6 +408,17 @@ async function route(req: Req, res: Res) {
   // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
   if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
+
+  // Public domain names (server/pubdom.ts): /api/pubdom/<resolver|server>/<command>, read-only, for every role.
+  if (p.startsWith('/api/pubdom/')) {
+    if (method !== 'GET') throw new HttpError(405, 'GET only');
+    const [side, cmd, ...rest] = p.slice('/api/pubdom/'.length).split('/');
+    if (!side || !cmd || rest.length || !isPubdomSide(side)) throw new HttpError(404, 'unknown public-domains endpoint');
+    if (!PUBDOM_READ[side].has(cmd)) throw new HttpError(404, `'${cmd}' is not a read-only ${side} command`);
+    const params: Record<string, unknown> = {};
+    for (const [k, v] of url.searchParams) if (k !== 'token') params[k] = k === 'n' ? Number(v) : v;
+    return json(res, 200, await pubdomQuery(side, cmd, params));
+  }
 
   // Generic read-only proxy: /api/q/show_peers, /api/q/show_stats_history?metric=bytes_in&window=1h
   if (p.startsWith('/api/q/')) {

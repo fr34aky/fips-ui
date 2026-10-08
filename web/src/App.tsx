@@ -16,6 +16,7 @@ import { Gateway } from './views/Gateway';
 import { Upgrade } from './views/Upgrade';
 const Config = lazy(() => import('./views/Config'));
 import { Firewall } from './views/Firewall';
+import { PublicDomains } from './views/PublicDomains';
 import { shortKey } from './lib/format';
 import { useHostName } from './lib/names';
 
@@ -47,6 +48,9 @@ export default function App() {
   const ownName = useHostName(snap?.status?.npub);
   const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
   const gwBadge = snap?.gateway ? <Chip tone="good" className="ml-auto" dot={false}>on</Chip> : undefined;
+  // The public-domains page exists only where the node runs the resolver or the server (health says).
+  const pd = health?.pubdom;
+  const hidden: ViewId[] = pd && (pd.resolver.installed || pd.server.installed) ? [] : ['pubdom'];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
@@ -65,6 +69,7 @@ export default function App() {
       case 'diagnostics': body = <Diagnostics initialPeer={route.params.get('peer')} snap={snap} readOnly={!!health?.readOnly} />; break;
       case 'access': body = <Access snap={snap} onProbe={probe} readOnly={!!health?.readOnly} prefillNpub={route.params.get('name')} />; break;
       case 'gateway': body = <Gateway snap={snap} />; break;
+      case 'pubdom': body = <PublicDomains health={health} />; break;
       case 'upgrade': body = <Upgrade />; break;
       case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;
       case 'firewall': { const port = route.params.get('port'); body = <Firewall snap={snap} readOnly={!!health?.readOnly} prefill={port ? { port, proto: route.params.get('proto') === 'udp' ? 'udp' : 'tcp', comment: route.params.get('note') ?? undefined } : null} />; break; }
@@ -74,7 +79,7 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} uiVersion={health?.uiVersion} principal={health?.principal} badge={gwBadge}>
+      <Shell view={route.view} onNav={nav} conn={live.conn} nodeName={nodeName} version={snap?.status?.version} uiVersion={health?.uiVersion} principal={health?.principal} badge={gwBadge} hidden={hidden}>
         {body}
       </Shell>
       <TokenDialog open={authNeeded} />
