@@ -67,7 +67,7 @@ What works beyond the read-only pages:
 | fips.yaml template merge after daemon upgrades | where the helper applies the configuration (skipped elsewhere) |
 | Daemon upgrade | all of the above except NixOS, where the flake updates fips (tested on Linux) |
 | Fresh fips install | Debian/Ubuntu (.deb), other Linux with systemd (tarball), FreeBSD, macOS; pfSense once upstream publishes its package |
-| Public domains (install, update, units) | where systemd runs (fips-pub-domains ships systemd units); the pages read their sockets everywhere |
+| Public domains (install, update, units) | Linux with systemd (fips-pub-domains ships systemd units), not NixOS (its configuration installs them); the page reads their sockets everywhere |
 | fips-ui self-update | everywhere from a git checkout; restarts itself under the services `setup-local.sh` installs; on NixOS through the flake |
 
 `deploy/setup-local.sh` installs the helper and a service on Linux with systemd, FreeBSD, pfSense and macOS; NixOS uses the flake's module; installation per system, including OpenRC, OpenWrt and Windows, is in [docs/install.md](docs/install.md).
@@ -147,7 +147,7 @@ npubs ([docs/mesh-access.md](docs/mesh-access.md)). Updates of fips-ui itself ar
 ## Security model
 
 - The backend only ever speaks the documented [control-socket protocol](https://github.com/jmcorgan/fips/blob/master/docs/reference/control-socket.md) and shells out to `journalctl`/`systemctl`. It runs unprivileged.
-- Read queries are proxied through an allow-list; only `connect`, `disconnect` and the probe triplet are mutating, plus service control, node management, upgrades and public-domain changes through the helper when it is installed.
+- Read queries are proxied through an allow-list. What changes state: `connect`, `disconnect` and the probe triplet on the daemon; the hosts file, hosts-sync settings, the followers list, the mesh-access settings and fips-ui's own update; public-domain actions over their control sockets; and, through the helper when it is installed, service control, node management, upgrades and public-domain installs and files. The API section lists every endpoint.
 - The web UI never asks for a sudo password. The only root-capable path is the helper, installed by an administrator from a shell with a single-command sudoers rule ([docs/upgrade.md](docs/upgrade.md#privilege-model)). With it, the UI can upgrade the node and manage its configuration, firewall and services ([docs/node-management.md](docs/node-management.md)); on a host shared with other users, set `FIPS_UI_TOKEN`.
 - Bind to loopback (default) or set `FIPS_UI_TOKEN`.
 - Over the mesh there is no password: FIPS authenticates each connection's source address, a kernel guard stops spoofed mesh addresses from the LAN, and only allowed npubs get in, as viewers or admins ([docs/mesh-access.md](docs/mesh-access.md)).
@@ -156,8 +156,11 @@ npubs ([docs/mesh-access.md](docs/mesh-access.md)). Updates of fips-ui itself ar
 ## API
 
 The frontend uses a small JSON API you can script against as well. Changes, and reads marked *(admin)*, need the
-admin role: loopback (with `FIPS_UI_TOKEN` when set) or an admin npub over the mesh; `FIPS_UI_READ_ONLY=1` refuses
-every change. Everything under `/api/admin/` and `/api/upgrade/` is admin-only.
+admin role. **Every client of the main listener is an admin** (it is the local operator: loopback by default, or
+whatever `FIPS_UI_HOST` exposes, so set `FIPS_UI_TOKEN` before binding elsewhere); over the mesh only npubs allowed
+as admins are. Everything under `/api/admin/` and `/api/upgrade/` is admin-only. `FIPS_UI_READ_ONLY=1` refuses
+every change and also the admin reads that come with one (sync settings, followers, a pending config proposal, the
+update state).
 
 **Node state**
 
@@ -184,7 +187,7 @@ GET  /api/hosts/sync                  sync settings, status and this node's role
 POST /api/hosts/sync/run              sync now
 GET  /api/hosts/followers             the nodes that sync from this one, with their subtrees (admin);  POST /api/hosts/followers/forget {npub}
 GET  /api/access                      Web UI over the mesh: settings and status (admin), who you are;  POST saves them
-GET  /api/ui-update                   newest fips-ui release; for admins also the update state;  POST /api/ui-update/install {tag}
+GET  /api/ui-update                   newest fips-ui release; for admins (not read-only) also the update state;  POST /api/ui-update/install {tag}
 ```
 
 **Node management** (through the privileged helper, [docs/node-management.md](docs/node-management.md))
@@ -196,7 +199,7 @@ GET  /api/admin/config/backup?id=     one backup;  POST /api/admin/config/restor
 GET  /api/admin/config/proposal       a fips.yaml template merge waiting for review;  POST …/proposal/dismiss
 GET  /api/admin/firewall              firewall state, managed rules, drop-ins
 POST /api/admin/firewall/rules        {rules};  POST /api/admin/firewall/dropin {name, content};  POST …/dropin/delete {name}
-POST /api/admin/service               {unit, action}: start|stop|restart|reload|enable|disable
+POST /api/admin/service               {unit, action}: start|stop|restart|reload|enable|disable (no enable/disable on NixOS)
 GET  /api/admin/address?npub=         the npub's fips0 address
 POST /api/admin/log-access            let the UI read the daemon's log file (FreeBSD, macOS)
 ```
@@ -209,7 +212,7 @@ POST /api/upgrade/jobs                {source: release|master, ref?, restart?, d
 GET  /api/upgrade/jobs/current        the current job and its log (?since=<seq>);  GET …/current/events (SSE);  POST …/current/cancel
 POST /api/upgrade/rollback            {id}: restore a binaries backup;  GET /api/upgrade/backups
 POST /api/upgrade/restart             restart the daemon
-POST /api/upgrade/install-daemon      {tag?, peers: ["npub1…@udp/host:port"]}: install fips on a machine without it
+POST /api/upgrade/install-daemon      {tag?, peers?: ["npub1…@udp/host:port"], at most 16}: install fips on a machine without it
 GET  /api/upgrade/toolchain/plan      what a source build needs and how to install it
 ```
 
@@ -220,8 +223,10 @@ GET  /api/pubdom/state                what is installed and running, per side (r
 GET  /api/pubdom/<side>/<command>     read-only socket commands: resolver status|pins|log, server status|zones|txt|attestations|log
 GET  /api/pubdom/<side>/config-file   the side's configuration file (admin);  GET /api/pubdom/server/zone-file?file= a zone file (admin)
 GET  /api/pubdom/releases             newest fips-pub-domains release (admin)
-POST /api/admin/pubdom/zone           a zone file;  POST …/zone/delete;  POST /api/admin/pubdom/config  a configuration
-POST /api/admin/pubdom/install        {side};  POST /api/admin/pubdom/update;  POST /api/admin/pubdom/action  socket commands that change something
+POST /api/admin/pubdom/zone           {file, content, base}: a zone file (helper);  POST …/zone/delete {file}
+POST /api/admin/pubdom/config         {side, yaml, base, restart?}: a side's configuration (helper)
+POST /api/admin/pubdom/install        {side, tag?};  POST /api/admin/pubdom/update {tag?}  (helper, systemd, not NixOS)
+POST /api/admin/pubdom/action         socket commands that change something, over the control sockets
 ```
 
 `peer` accepts an npub, a name from the hosts file, or the display name of a known peer.

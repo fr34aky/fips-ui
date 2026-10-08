@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On NixOS the helper refuses to install or update fips-pub-domains with a clear
+  message, instead of failing on the read-only system paths.
+
 ## [0.11.0] - 2026-10-08
 
 ### Added

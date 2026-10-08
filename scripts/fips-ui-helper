@@ -1748,6 +1748,7 @@ case "$cmd" in
     ;;
 
   pubdom-install)
+    $NIXOS && die "on NixOS, install fips-pub-domains through the NixOS configuration (units and /usr/bin are not writable here)"
     take_lock
     side=${2:-}; tag=${3:-}
     case "$side" in server|resolver) ;; *) die "usage: pubdom-install <server|resolver> [vX.Y.Z]" ;; esac
@@ -1789,6 +1790,7 @@ case "$cmd" in
     ;;
 
   pubdom-update)
+    $NIXOS && die "on NixOS, fips-pub-domains is updated through the NixOS configuration"
     take_lock
     tag=${2:-}
     pubdom_fetch "$tag"
