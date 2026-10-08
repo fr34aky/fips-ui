@@ -25,7 +25,8 @@
 #   dropin-apply <name>            <- nftables drop-in on stdin; validated with `nft -c` against the
 #                                     full baseline before /etc/fips/fips.d/<name>.nft is written
 #   dropin-delete <name>
-#   service <action> <unit>        -> start|stop|restart|reload|enable|disable for fips units (systemd)
+#   service <action> <unit>        -> start|stop|restart|reload|enable|disable for the fips units, and (v11)
+#                                     fips-pubdom and fips-pubdom-server
 #   mesh-guard <ports|off|status> [tun] [canary] -> load, remove or inspect table inet fips_ui_guard: TCP from fd00::/8 to the
 #                                     web UI's ports is dropped unless it arrives on lo or the FIPS TUN, so
 #                                     a mesh source address can be trusted as the npub it derives from
@@ -38,6 +39,16 @@
 #   hosts-apply --base <sha256|none> <- new /etc/fips/hosts on stdin (hostname npub lines, comments); refused
 #                                     if the file changed since it was read; backed up and replaced
 #                                     atomically, root:root 0644 (the daemon reloads it on the next query)
+#   pubdom-zone-apply <file> --base <sha256|none>
+#                                  <- (v11) a zone file for fips-pubdom-server on stdin, checked with the server's
+#                                     own `validate zone`, refused if the file changed since it was read, written
+#                                     atomically into the zones directory (server.yaml's `zones:`, else
+#                                     /etc/fips-pubdom/zones); the server follows the directory, no restart
+#   pubdom-zone-delete <file>      -> (v11) remove a zone file (a backup is kept)
+#   pubdom-config-apply <server|resolver> [--no-restart] --base <sha256|none>
+#                                  <- (v11) /etc/fips-pubdom/server.yaml or config.yaml on stdin, checked with the
+#                                     binary's own `validate config`, written atomically, the unit restarted if
+#                                     it was running
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -49,7 +60,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=10
+HELPER_VERSION=11
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -194,7 +205,7 @@ svc_enabled() {
 # The native service name for a fips unit id (fips, fips-dns, fips-gateway, fips-firewall), or nothing.
 svc_native() {
   case "$SM:$1" in
-    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall) echo "$1.service" ;;
+    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall|systemd:fips-pubdom|systemd:fips-pubdom-server) echo "$1.service" ;;
     rc:fips|rc:fips-dns|rc:fips-gateway) echo "${1//-/_}" ;;
     pfsense:fips) echo fips ;;
     launchd:fips) echo "$SERVICE" ;;
@@ -309,6 +320,10 @@ LOCK_FILE=/var/run/fips-ui-helper.lock
 MAX_CONFIG_BYTES=262144
 MAX_DROPIN_BYTES=65536
 MAX_HOSTS_BYTES=65536
+MAX_ZONE_BYTES=65536
+# fips-pub-domains (fr34aky/fips-pub-domains): the domain server's and the resolver's files, edited from the UI's
+# Public domains page. The override serves the test suite; sudoers does not forward it.
+PUBDOM_ETC=${FIPS_PUBDOM_ETC:-/etc/fips-pubdom}
 # Keys whose values never leave this script, matched case-insensitively against the whole key.
 SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
 # Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
@@ -983,6 +998,36 @@ install_config_and_restart() {
 
 valid_dropin() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "invalid drop-in name (a-z, 0-9, _ and -, up to 41 characters)"; }
 
+# ---------------------------------------------------------------- public domains (fips-pub-domains)
+# The zones directory the server follows: server.yaml's `zones:` (a plain scalar), else the packaged default.
+pubdom_zones_dir() {
+  local d=""
+  if [[ -f "$PUBDOM_ETC/server.yaml" ]]; then
+    d=$(sed -n 's/^zones:[[:space:]]*//p' "$PUBDOM_ETC/server.yaml" | head -n 1 | sed "s/[[:space:]]*#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]*\$//")
+  fi
+  [[ -n "$d" ]] || d="$PUBDOM_ETC/zones"
+  [[ "$d" == /* ]] || die "zones: in server.yaml must be an absolute path"
+  printf '%s' "$d"
+}
+# A zone file is named for its domain; the name is the only path component the caller chooses.
+valid_zone_file() { [[ "$1" =~ ^[a-z0-9][a-z0-9.-]{0,120}\.yaml$ && "$1" != *..* ]] || die "invalid zone file name (<domain>.yaml)"; }
+pubdom_bin() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed (fips-pub-domains)"; }
+pubdom_backup() { # <file> <tag>: a copy under the config backups, the newest 20 per tag kept
+  [[ -f "$1" ]] || return 0
+  mkdir -p "$CONFIG_BACKUPS_DIR"; chmod 0700 "$CONFIG_BACKUPS_DIR"
+  cp -p "$1" "$CONFIG_BACKUPS_DIR/pubdom-$2-$(date +%Y%m%d-%H%M%S)"
+  keep_newest 20 "$CONFIG_BACKUPS_DIR"/pubdom-"$2"-*
+}
+pubdom_check_base() { # <file> <sha256|none>: the caller edited what is there now
+  local cur=none; [[ -f "$1" ]] && cur=$(sha256_stdin < "$1")
+  [[ "$cur" == "$2" ]] || die "$1 changed since it was read; reload and make the change again"
+}
+pubdom_install() { # <tmp> <dest>: atomically, root:root 0644 (the units' users read them)
+  mkdir -p "$(dirname "$2")"
+  local own=(-o 0 -g 0); [[ $(id -u) -eq 0 ]] || own=()   # the test mode runs unprivileged
+  install -m 0644 "${own[@]}" "$1" "$2.fips-ui.new" && mv -f "$2.fips-ui.new" "$2"
+}
+
 # A drop-in is included inside the `inbound` chain, so it may only hold rule statements: no include/define
 # (which could read other files), no table or chain commands, no `;`, and braces balanced on every line
 # (so it cannot close the chain and act on the rest of the host's ruleset).
@@ -1328,10 +1373,13 @@ case "$cmd" in
     managed=false; ( require_managed ) >/dev/null 2>&1 && managed=true
     fw=$(fw_backend); guard=$(guard_backend)
     if [[ "$fw" == pf ]]; then fw_dir=$PF_DROPIN_DIR; fw_ext=.pf; else fw_dir=$DROPIN_DIR; fw_ext=.nft; fi
-    printf '{"ok":true,"version":%s,"managed_by":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s}}\n' \
+    pd_server=false; command -v fips-pubdom-server >/dev/null 2>&1 && pd_server=true
+    pd_resolver=false; command -v fips-pubdomd >/dev/null 2>&1 && pd_resolver=true
+    printf '{"ok":true,"version":%s,"managed_by":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s},"pubdom":{"server":%s,"resolver":%s,"etc":%s}}\n' \
       "$HELPER_VERSION" "$($NIXOS && echo '"nix"' || echo null)" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
       "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")" \
-      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")"
+      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")" \
+      "$pd_server" "$pd_resolver" "$(json_escape "$PUBDOM_ETC")"
     ;;
 
   install)
@@ -1535,7 +1583,7 @@ case "$cmd" in
     trap '' INT TERM HUP
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
-    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway) ;; *) die "unit must be fips, fips-firewall, fips-dns or fips-gateway" ;; esac
+    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server) ;; *) die "unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom or fips-pubdom-server" ;; esac
     # With pf the fips firewall is not a service but the fips-ui anchor: its buttons act on pf.
     if [[ "$unit" == fips-firewall && "$(fw_backend)" == pf ]]; then
       pf_fw_action "$action"
@@ -1556,6 +1604,74 @@ case "$cmd" in
     esac
     a=false; svc_active "$native" && a=true
     printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$native")" "$a" "$(json_escape "$(svc_enabled "$native")")"
+    ;;
+
+  pubdom-zone-apply)
+    take_lock
+    file=${2:-}; valid_zone_file "$file"
+    [[ "${3:-}" == --base && "${4:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "usage: pubdom-zone-apply <file> --base <sha256|none>"
+    base=$4; pubdom_bin fips-pubdom-server
+    dir=$(pubdom_zones_dir); dest="$dir/$file"
+    tmp=$(mktemp); errf=$(mktemp); trap 'rm -f "$tmp" "$errf"' EXIT
+    read_stdin_limited "$tmp" "$MAX_ZONE_BYTES"
+    # The server's own parser decides, on the exact bytes that will be installed.
+    if ! fips-pubdom-server validate zone < "$tmp" >/dev/null 2>"$errf"; then
+      printf '{"ok":false,"error":"fips-pubdom-server rejects this zone file","detail":%s}\n' "$(json_escape "$(head -c 2000 "$errf")")"; exit 0
+    fi
+    pubdom_check_base "$dest" "$base"
+    if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then printf '{"ok":true,"changed":false,"file":%s}\n' "$(json_escape "$dest")"; exit 0; fi
+    pubdom_backup "$dest" "zone-${file%.yaml}"
+    pubdom_install "$tmp" "$dest"
+    printf '{"ok":true,"changed":true,"file":%s}\n' "$(json_escape "$dest")"
+    ;;
+
+  pubdom-zone-delete)
+    take_lock
+    file=${2:-}; valid_zone_file "$file"
+    dest="$(pubdom_zones_dir)/$file"
+    [[ -f "$dest" ]] || die "$dest not found"
+    pubdom_backup "$dest" "zone-${file%.yaml}"
+    rm -f -- "$dest"
+    printf '{"ok":true,"file":%s}\n' "$(json_escape "$dest")"
+    ;;
+
+  pubdom-config-apply)
+    take_lock
+    side=${2:-}
+    case "$side" in
+      server)   bin=fips-pubdom-server; unit=fips-pubdom-server; dest="$PUBDOM_ETC/server.yaml" ;;
+      resolver) bin=fips-pubdomd;       unit=fips-pubdom;        dest="$PUBDOM_ETC/config.yaml" ;;
+      *) die "usage: pubdom-config-apply <server|resolver> [--no-restart] --base <sha256|none>" ;;
+    esac
+    shift 2; restart=true; base=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --no-restart) restart=false ;;
+        --base) [[ "${2:-}" =~ ^([0-9a-f]{64}|none)$ ]] || die "--base needs a sha256 or none"; base=$2; shift ;;
+        *) die "unknown option $1" ;;
+      esac
+      shift
+    done
+    [[ -n "$base" ]] || die "--base is required"
+    pubdom_bin "$bin"
+    tmp=$(mktemp); errf=$(mktemp); trap 'rm -f "$tmp" "$errf"' EXIT
+    read_stdin_limited "$tmp" "$MAX_CONFIG_BYTES"
+    if ! "$bin" validate config < "$tmp" >/dev/null 2>"$errf"; then
+      printf '{"ok":false,"error":%s,"detail":%s}\n' "$(json_escape "$bin rejects this configuration")" "$(json_escape "$(head -c 2000 "$errf")")"; exit 0
+    fi
+    pubdom_check_base "$dest" "$base"
+    if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then printf '{"ok":true,"changed":false,"restarted":false}\n'; exit 0; fi
+    pubdom_backup "$dest" "$side"
+    pubdom_install "$tmp" "$dest"
+    # The server reads server.yaml at start; the daemon re-reads most of its file but not the listeners. A unit
+    # that is not running is left alone (the operator may be preparing the file before the first start), as is
+    # a service manager the helper does not drive: the file is still written.
+    restarted=false
+    if $restart; then
+      native=$(svc_native "$unit")
+      if [[ -n "$native" ]] && svc_exists "$native" && svc_active "$native"; then trap '' INT TERM HUP; svc_restart "$native" || true; restarted=true; fi
+    fi
+    printf '{"ok":true,"changed":true,"restarted":%s}\n' "$restarted"
     ;;
 
   mesh-guard)

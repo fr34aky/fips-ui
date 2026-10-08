@@ -4,6 +4,8 @@
 // either is on the node and proxies the read-only commands; writes (the helper's zone and config
 // edits, publish, forget, flush) are a later phase.
 import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { ControlError, endpointExists, query } from './control.ts';
 
 export type PubdomSide = 'resolver' | 'server';
@@ -33,11 +35,52 @@ export function detect(paths: Record<PubdomSide, SidePaths> = PATHS, exists: (p:
   return { resolver: side(paths.resolver), server: side(paths.server) };
 }
 
-/** Read-only commands per side; anything else over the socket waits for the editing phase. */
+/** Read-only commands per side, proxied for every role. `attestations` asks the relays, so it is on request. */
 export const READ_COMMANDS: Record<PubdomSide, Set<string>> = {
   resolver: new Set(['status', 'pins', 'log']),
-  server: new Set(['status', 'zones', 'txt', 'log']),
+  server: new Set(['status', 'zones', 'txt', 'attestations', 'log']),
 };
+/** Commands that change something, for admins (server/admin.ts): they go over the socket, not the helper. */
+export const WRITE_COMMANDS: Record<PubdomSide, Set<string>> = {
+  resolver: new Set(['forget', 'flush']),
+  server: new Set(['publish', 'check-dns']),
+};
+export const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$/;
+/** A zone file is named for its domain: the one path component a caller may choose (the helper checks it too). */
+export const ZONE_FILE_RE = /^[a-z0-9][a-z0-9.-]{0,120}\.yaml$/;
+
+/** The configuration file the helper's `pubdom-config-apply <side>` writes. */
+export const CONFIG_FILE: Record<PubdomSide, string> = { resolver: '/etc/fips-pubdom/config.yaml', server: '/etc/fips-pubdom/server.yaml' };
+
+export interface FileText { path: string; text: string; /** sha256 of the bytes, or 'none' when the file does not exist: the helper's --base. */ base: string }
+
+const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+
+/** A file the editor shows and the helper later replaces, with the hash the helper checks against. */
+export function readEditable(file: string): FileText {
+  try {
+    const b = fs.readFileSync(file);
+    return { path: file, text: b.toString('utf8'), base: sha256(b) };
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') return { path: file, text: '', base: 'none' };
+    if (err.code === 'EACCES') throw new Error(`cannot read ${file}: permission denied (the file should be root:root 0644)`);
+    throw new Error(`cannot read ${file}: ${err.message}`);
+  }
+}
+
+/** True when `file` is `<dir>/<name>.yaml` with a plain name: what the zones listing reports and nothing else. */
+export function zoneFileWithin(dir: string, file: string): boolean {
+  const base = path.basename(file);
+  return ZONE_FILE_RE.test(base) && !base.includes('..') && path.resolve(file) === path.join(path.resolve(dir), base);
+}
+
+/** A zone file as it is on disk, for the raw view; the path must be inside the server's zones directory. */
+export async function readZoneFile(file: string): Promise<FileText> {
+  const st = await pubdomQuery<{ zones_dir?: string }>('server', 'status');
+  if (!st.zones_dir || !zoneFileWithin(st.zones_dir, file)) throw new Error('not a file in the zones directory');
+  return readEditable(file);
+}
 
 export function isSide(s: string): s is PubdomSide { return s === 'resolver' || s === 'server'; }
 

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
-import { detect as detectPubdom, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, pubdomQuery } from './pubdom.ts';
+import { detect as detectPubdom, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, pubdomQuery, readEditable, readZoneFile } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -423,6 +423,13 @@ async function route(req: Req, res: Res) {
     if (method !== 'GET') throw new HttpError(405, 'GET only');
     const [side, cmd, ...rest] = p.slice('/api/pubdom/'.length).split('/');
     if (!side || !cmd || rest.length || !isPubdomSide(side)) throw new HttpError(404, 'unknown public-domains endpoint');
+    // The files the editors show: the side's configuration, or a zone file the zones listing named.
+    if (cmd === 'config-file') return json(res, 200, readEditable(PUBDOM_CONFIG_FILE[side]));
+    if (cmd === 'zone-file' && side === 'server') {
+      const file = url.searchParams.get('file') ?? '';
+      if (!file.startsWith('/')) throw new HttpError(400, 'file (absolute path from the zones listing) required');
+      return json(res, 200, await readZoneFile(file));
+    }
     if (!PUBDOM_READ[side].has(cmd)) throw new HttpError(404, `'${cmd}' is not a read-only ${side} command`);
     return json(res, 200, await pubdomQuery(side, cmd, queryParams(url, ['n'])));
   }
