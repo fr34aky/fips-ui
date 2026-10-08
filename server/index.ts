@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
-import { detect as detectPubdom, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile } from './pubdom.ts';
+import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -418,7 +418,13 @@ async function route(req: Req, res: Res) {
 
   // Public domain names (server/pubdom.ts): /api/pubdom/state says what is installed and running right now;
   // /api/pubdom/<resolver|server>/<command> proxies the read-only commands, for every role.
-  if (p === '/api/pubdom/state') { if (method !== 'GET') throw new HttpError(405, 'GET only'); return json(res, 200, detectPubdom()); }
+  if (p === '/api/pubdom/state') { if (method !== 'GET') throw new HttpError(405, 'GET only'); return json(res, 200, await pubdomFullState()); }
+  // The newest release on GitHub, for the install and update buttons (admins: it is a request to a third party).
+  if (p === '/api/pubdom/releases') {
+    if (method !== 'GET') throw new HttpError(405, 'GET only');
+    if (principalOf(req).role !== 'admin') throw new HttpError(403, 'admin role required');
+    return json(res, 200, await pubdomLatestRelease(url.searchParams.get('refresh') === '1'));
+  }
   if (p.startsWith('/api/pubdom/')) {
     if (method !== 'GET') throw new HttpError(405, 'GET only');
     const [side, cmd, ...rest] = p.slice('/api/pubdom/'.length).split('/');

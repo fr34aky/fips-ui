@@ -51,6 +51,27 @@ UI's user must be in group `fips` (the sockets are group-readable and -writable)
 fips's own socket. `FIPS_PUBDOM_SOCKET` and `FIPS_PUBDOM_SERVER_SOCKET` override the socket paths for a
 daemon or server run by hand.
 
+## Installing, updating, starting and stopping
+
+Where the node runs systemd (what fips-pub-domains' packaging ships units for) and the helper is version 12
+or newer, an admin sees the page even before anything is installed, with an **Install** card per side:
+
+- **Resolver**: the release archive is downloaded from GitHub and verified against its `SHA256SUMS`, the
+  three binaries go to `/usr/bin` and `fips-pubdom.service` to `/etc/systemd/system`; `fips-pubdomd setup`
+  points the OS resolver at the daemon (systemd-resolved, NetworkManager, dnsmasq or a plain resolv.conf) and
+  writes `/etc/fips-pubdom/config.yaml`, unless that file already exists; the unit is enabled and started.
+- **Domain server**: the same fetch; `fips-pubdom-server.service`, an empty `/etc/fips-pubdom/zones`,
+  the firewall drop-in where `/etc/fips/fips.d` exists (fips's baseline firewall drops inbound on `fips0`
+  otherwise), and `server.yaml` from `fips-pubdom-server init`; the unit is enabled and started, serving
+  nothing until a domain is added on the page.
+
+Each installed side has a **service** card: the unit's state, whether it starts at boot, the installed
+version and the newest release on GitHub (checked every six hours, `FIPS_UI_GITHUB_TOKEN` honoured), with
+**Start**, **Stop**, **Restart**, **Enable/Disable at boot** (service control through the helper), and
+**Update** when a newer release is out: the archive is fetched and verified the same way, the binaries and
+every installed unit are replaced, and the units that were running are restarted. Configuration and zone
+files are never touched by an update. `FIPS_UI_PUBDOM_REPO` overrides the GitHub repository.
+
 A server upgraded from before 0.2.7 may still run from `--zone` flags: it reports no zones directory, and
 the Domain server tab says so instead of offering the editing buttons. `sudo fips-pubdom-server init`
 writes `/etc/fips-pubdom/server.yaml` from the existing zone files and `server.env` (skip it if the file

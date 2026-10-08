@@ -51,6 +51,15 @@
 #                                  <- (v11) /etc/fips-pubdom/server.yaml or config.yaml on stdin, checked with the
 #                                     binary's own `validate config`, written atomically, the unit restarted if
 #                                     it was running
+#   pubdom-install <server|resolver> [vX.Y.Z]
+#                                  -> (v12) download the newest (or the given) fips-pub-domains release, verify it
+#                                     against its SHA256SUMS, install the three binaries to /usr/bin and the side's
+#                                     unit; the resolver gets `fips-pubdomd setup` (the OS resolver pointed at it)
+#                                     when it has no configuration yet, the server its zones directory, the
+#                                     firewall drop-in where fips's firewall is set up, and `init`'s server.yaml;
+#                                     the unit is enabled and started. systemd only (the packaging's units)
+#   pubdom-update [vX.Y.Z]         -> (v12) the same release fetch; binaries and every installed unit replaced,
+#                                     the units that were running restarted
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -62,7 +71,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=11
+HELPER_VERSION=12
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -326,6 +335,9 @@ MAX_ZONE_BYTES=65536
 # fips-pub-domains (fr34aky/fips-pub-domains): the domain server's and the resolver's files, edited from the UI's
 # Public domains page. The override serves the test suite; sudoers does not forward it.
 PUBDOM_ETC=${FIPS_PUBDOM_ETC:-/etc/fips-pubdom}
+# The binaries go where the packaged units expect them (/usr/bin/fips-pubdomd); the override serves the test suite.
+PUBDOM_BIN=${FIPS_PUBDOM_BIN:-/usr/bin}
+PUBDOM_RELEASE_REPO=${FIPS_UI_PUBDOM_REPO:-fr34aky/fips-pub-domains}
 # Keys whose values never leave this script, matched case-insensitively against the whole key.
 SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
 # Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
@@ -1034,6 +1046,50 @@ pubdom_install() { # <tmp> <dest>: atomically, root:root 0644 (the units' users 
   local own=(-o 0 -g 0); [[ $(id -u) -eq 0 ]] || own=()   # the test mode runs unprivileged
   install -m 0644 "${own[@]}" "$1" "$2.fips-ui.new" && mv -f "$2.fips-ui.new" "$2"
 }
+# A fips-pub-domains release — the newest, or <tag> — downloaded, verified against its SHA256SUMS and unpacked.
+# Sets PF_DIR (the unpacked directory) and PF_TAG; the work directory is removed at exit.
+pubdom_fetch() { # <tag|"">
+  local tag=$1 target ver file sums want got base
+  [[ -z "$tag" || "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid tag (use vX.Y.Z)"
+  [[ "$PUBDOM_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid FIPS_UI_PUBDOM_REPO"
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu ;;
+    Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
+    Darwin:x86_64) target=x86_64-apple-darwin ;;
+    Darwin:arm64) target=aarch64-apple-darwin ;;
+    *) die "no fips-pub-domains release for $(uname -s) $(uname -m)" ;;
+  esac
+  PF_WORK=$(mktemp -d); trap 'rm -rf "$PF_WORK"' EXIT
+  base="https://github.com/$PUBDOM_RELEASE_REPO/releases"
+  # The newest release: github.com redirects releases/latest to releases/tag/<tag> (no API call, no rate limit).
+  if [[ -z "$tag" ]]; then
+    command -v curl >/dev/null 2>&1 || die "curl is needed to find the newest release"
+    tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$base/latest" 9>&- | sed -n 's|.*/releases/tag/\(v[^/]*\)$|\1|p')
+  fi
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot find the newest release of $PUBDOM_RELEASE_REPO"
+  ver=${tag#v}; file="fips-pub-domains-$ver-$target.tar.gz"; sums=SHA256SUMS
+  download "$base/download/$tag/$sums" "$PF_WORK/$sums" || die "release $tag publishes no $sums (or it cannot be downloaded)"
+  download "$base/download/$tag/$file" "$PF_WORK/$file" || die "download of $file failed"
+  want=$(awk -v f="$file" '$2 == f || $2 == "*" f {print $1}' "$PF_WORK/$sums" | head -n 1)
+  [[ -n "$want" ]] || die "$sums has no checksum for $file"
+  got=$(sha256_file "$PF_WORK/$file")
+  [[ "$got" == "$want" ]] || die "checksum mismatch for $file (expected $want, got $got)"
+  log "fips-pub-domains $tag: $file, sha256 ok"
+  tar xzf "$PF_WORK/$file" -C "$PF_WORK"
+  PF_DIR="$PF_WORK/fips-pub-domains-$ver-$target"; PF_TAG=$tag
+  [[ -x "$PF_DIR/fips-pubdomd" && -x "$PF_DIR/fips-pubdom-server" && -x "$PF_DIR/fips-pubdom" ]] || die "the archive has no binaries where expected"
+}
+pubdom_put_binaries() { # <unpacked dir>: the three binaries, replaced atomically
+  local own=(-o 0 -g 0) b; [[ $(id -u) -eq 0 ]] || own=()
+  mkdir -p "$PUBDOM_BIN"
+  for b in fips-pubdom fips-pubdomd fips-pubdom-server; do
+    install -m 0755 "${own[@]}" "$1/$b" "$PUBDOM_BIN/$b.fips-ui.new" && mv -f "$PUBDOM_BIN/$b.fips-ui.new" "$PUBDOM_BIN/$b"
+  done
+}
+pubdom_put_unit() { # <unpacked dir> <unit>
+  install -m 0644 -o 0 -g 0 "$1/packaging/systemd/$2.service" "/etc/systemd/system/$2.service.fips-ui.new" && mv -f "/etc/systemd/system/$2.service.fips-ui.new" "/etc/systemd/system/$2.service"
+}
+pubdom_version() { "$PUBDOM_BIN/$1" --version 2>/dev/null | awk '{print $2}'; }
 
 # A drop-in is included inside the `inbound` chain, so it may only hold rule statements: no include/define
 # (which could read other files), no table or chain commands, no `;`, and braces balanced on every line
@@ -1689,6 +1745,59 @@ case "$cmd" in
       if [[ -n "$native" ]] && svc_exists "$native" && svc_active "$native"; then trap '' INT TERM HUP; svc_restart "$native" || true; restarted=true; fi
     fi
     printf '{"ok":true,"changed":true,"restarted":%s}\n' "$restarted"
+    ;;
+
+  pubdom-install)
+    take_lock
+    side=${2:-}; tag=${3:-}
+    case "$side" in server|resolver) ;; *) die "usage: pubdom-install <server|resolver> [vX.Y.Z]" ;; esac
+    [[ "$SM" == systemd ]] || die "installing fips-pub-domains from here needs systemd (its packaging ships systemd units); this system runs $SM: install by hand (fips-pub-domains, docs/install.md)"
+    pubdom_fetch "$tag"
+    pubdom_put_binaries "$PF_DIR"
+    trap '' INT TERM HUP
+    setup=""
+    if [[ "$side" == resolver ]]; then
+      unit=fips-pubdom
+      pubdom_put_unit "$PF_DIR" "$unit"; systemctl daemon-reload
+      # The OS resolver is pointed at the daemon and its configuration written once; a later install (a
+      # reinstall over an existing configuration) leaves the operator's file alone.
+      if [[ ! -f "$PUBDOM_ETC/config.yaml" ]]; then
+        if ! setup=$("$PUBDOM_BIN/fips-pubdomd" setup 2>&1 9>&-); then
+          printf '{"ok":false,"error":"fips-pubdomd setup failed (the binaries and the unit are installed; run it by hand)","detail":%s}\n' "$(json_escape "$setup")"; exit 0
+        fi
+      fi
+    else
+      unit=fips-pubdom-server
+      pubdom_put_unit "$PF_DIR" "$unit"; systemctl daemon-reload
+      mkdir -p "$PUBDOM_ETC/zones"
+      # fips's baseline firewall drops inbound on fips0 unless a drop-in allows it.
+      if [[ -d /etc/fips/fips.d && -f "$PF_DIR/packaging/common/fips-pubdom.nft" && ! -f /etc/fips/fips.d/fips-pubdom.nft ]]; then
+        install -m 0644 -o 0 -g 0 "$PF_DIR/packaging/common/fips-pubdom.nft" /etc/fips/fips.d/fips-pubdom.nft
+        systemctl try-reload-or-restart fips-firewall.service >&2 9>&- || true
+      fi
+      # server.yaml so the unit runs `serve --config` and follows the directory; the page adds the domains.
+      [[ -f "$PUBDOM_ETC/server.yaml" ]] || "$PUBDOM_BIN/fips-pubdom-server" init --zones "$PUBDOM_ETC/zones" --env "$PUBDOM_ETC/server.env" --out "$PUBDOM_ETC/server.yaml" >&2 9>&-
+    fi
+    systemctl enable "$unit.service" >&2 9>&-; systemctl restart "$unit.service" >&2 9>&-
+    a=false; svc_active "$unit.service" && a=true
+    printf '{"ok":true,"side":%s,"version":%s,"unit":%s,"active":%s,"setup":%s}\n' "$(json_escape "$side")" "$(json_escape "${PF_TAG#v}")" "$(json_escape "$unit.service")" "$a" "$(json_escape "$setup")"
+    ;;
+
+  pubdom-update)
+    take_lock
+    tag=${2:-}
+    pubdom_fetch "$tag"
+    pubdom_put_binaries "$PF_DIR"
+    trap '' INT TERM HUP
+    restarted=""
+    if [[ "$SM" == systemd ]]; then
+      for u in fips-pubdom fips-pubdom-server; do [[ -f "/etc/systemd/system/$u.service" ]] && pubdom_put_unit "$PF_DIR" "$u"; done
+      systemctl daemon-reload
+      for u in fips-pubdom fips-pubdom-server; do
+        if svc_exists "$u.service" && svc_active "$u.service"; then systemctl restart "$u.service" >&2 9>&-; restarted="$restarted${restarted:+,}$(json_escape "$u.service")"; fi
+      done
+    fi
+    printf '{"ok":true,"version":%s,"restarted":[%s]}\n' "$(json_escape "${PF_TAG#v}")" "$restarted"
     ;;
 
   mesh-guard)

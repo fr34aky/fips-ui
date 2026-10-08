@@ -5,6 +5,9 @@ export interface HelperFeatures { config: boolean; hosts: boolean; services: boo
 export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string; pubdom?: { server: boolean; resolver: boolean } }
 /** Helper version with the public-domains verbs (server/admin.ts). */
 export const PUBDOM_HELPER_VERSION = 11;
+/** Helper version that installs and updates fips-pub-domains from its releases. */
+export const PUBDOM_INSTALL_HELPER_VERSION = 12;
+export interface PubdomInstallResult { ok: boolean; side?: string; version?: string; unit?: string; active?: boolean; setup?: string; restarted?: string[]; error?: string; detail?: string }
 export interface PubdomResult { ok: boolean; changed?: boolean; restarted?: boolean; file?: string; error?: string; detail?: string }
 export interface ConfigBackup { id: string; size: number; mtime: number }
 export interface ApplyResult { ok: boolean; changed?: boolean; restarted?: boolean; backup_id?: string; rolled_back?: boolean; restored_healthy?: boolean; error?: string; journal?: string }
@@ -37,6 +40,8 @@ export const adminApi = {
   pubdomZone: (file: string, content: string, base: string) => api.post<PubdomResult>('/api/admin/pubdom/zone', { file, content, base }),
   pubdomZoneDelete: (file: string) => api.post<PubdomResult>('/api/admin/pubdom/zone/delete', { file }),
   pubdomConfig: (side: 'server' | 'resolver', yaml: string, base: string, restart: boolean) => api.post<PubdomResult>('/api/admin/pubdom/config', { side, yaml, base, restart }),
+  pubdomInstall: (side: 'server' | 'resolver', tag?: string) => api.post<PubdomInstallResult>('/api/admin/pubdom/install', { side, ...(tag ? { tag } : {}) }),
+  pubdomUpdate: (tag?: string) => api.post<PubdomInstallResult>('/api/admin/pubdom/update', tag ? { tag } : {}),
   pubdomAction: <T = unknown>(side: 'server' | 'resolver', command: 'publish' | 'check-dns' | 'forget' | 'flush', domain?: string) => api.post<{ ok: boolean; result: T }>('/api/admin/pubdom/action', { side, command, ...(domain ? { domain } : {}) }),
 };
 

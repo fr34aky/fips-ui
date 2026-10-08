@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { parseDocument } from 'yaml';
-import type { Health, PubdomAttestation, PubdomCheckDns, PubdomFileText, PubdomPin, PubdomResolverStatus, PubdomServerStatus, PubdomSide, PubdomState, PubdomZone, PubdomZones } from '../lib/types';
+import type { Health, PubdomAttestation, PubdomCheckDns, PubdomFileText, PubdomPin, PubdomReleases, PubdomResolverStatus, PubdomServerStatus, PubdomSide, PubdomState, PubdomZone, PubdomZones } from '../lib/types';
 import { api, usePoll } from '../lib/api';
 import { Card, Chip, ConfirmDialog, Copyable, Empty, ErrorNote, KV, Modal, Segmented, Skeleton, useToast } from '../components/ui';
 import { NpubInline } from '../components/PeerName';
-import { adminApi, withResult, PUBDOM_HELPER_VERSION, type HelperInfo, type PubdomResult } from '../lib/admin';
+import { adminApi, withResult, PUBDOM_HELPER_VERSION, PUBDOM_INSTALL_HELPER_VERSION, type HelperInfo, type PubdomInstallResult, type PubdomResult } from '../lib/admin';
 import { fmtAgo, fmtDuration, fmtTime, shortKey } from '../lib/format';
 
 // Public domain names over fips (fr34aky/fips-pub-domains, docs/webui.md): what this node serves
@@ -15,9 +15,13 @@ import { fmtAgo, fmtDuration, fmtTime, shortKey } from '../lib/format';
 
 type Tab = 'server' | 'resolver';
 const UNIT: Record<Tab, string> = { server: 'fips-pubdom-server', resolver: 'fips-pubdom' };
+const BIN: Record<Tab, string> = { server: 'fips-pubdom-server', resolver: 'fips-pubdomd' };
+const LABEL: Record<Tab, string> = { server: 'Domain server', resolver: 'Resolver' };
 
-/** What the viewer may do: socket actions need the admin role, file edits the helper with the public-domains verbs. */
-interface Can { admin: boolean; edit: boolean; serviceControl: boolean }
+/** What the viewer may do: socket actions need the admin role, file edits and installs the helper with the verbs. */
+interface Can { admin: boolean; edit: boolean; serviceControl: boolean; install: boolean }
+
+const cmpVersion = (a: string, b: string) => { const x = a.split(/[.-]/), y = b.split(/[.-]/); for (let i = 0; i < 3; i++) { const d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d; } return 0; };
 
 export function PublicDomains({ health }: { health: Health | null }) {
   // health's snapshot opens the page; what is running is re-read while it is open, so a unit started or
@@ -26,31 +30,128 @@ export function PublicDomains({ health }: { health: Health | null }) {
   const pd = state.data ?? health?.pubdom;
   const admin = !!health && !health.readOnly;
   const helper = usePoll(() => (admin ? adminApi.status().then((r) => r.helper) : Promise.resolve(null)), [admin], 60000);
+  const releases = usePoll(() => (admin ? api.get<PubdomReleases>('/api/pubdom/releases') : Promise.resolve(null)), [admin], 600000);
+  const h = helper.data;
+  const helperOk = !!h && h.managementCapable;
+  // Installing needs the helper with the install verbs on a node where the packaging's units fit (systemd).
+  const install = admin && helperOk && (h.version ?? 0) >= PUBDOM_INSTALL_HELPER_VERSION && !!pd?.canInstall;
   const tabs: { value: Tab; label: string }[] = [];
-  if (pd?.server.installed) tabs.push({ value: 'server', label: 'Domain server' });
-  if (pd?.resolver.installed) tabs.push({ value: 'resolver', label: 'Resolver' });
+  for (const t of ['server', 'resolver'] as Tab[]) if (pd?.[t].installed || install) tabs.push({ value: t, label: LABEL[t] });
   const [tab, setTab] = useState<Tab>(tabs[0]?.value ?? 'server');
   if (!pd || tabs.length === 0) {
-    return <Card title="Public domains"><Empty><div className="max-w-md"><p className="mb-2">Neither <code>fips-pubdom-server</code> nor <code>fips-pubdomd</code> is installed on this node.</p><p className="text-xs">Public domain names over fips let <code>www.example.org</code> resolve to a mesh node: fr34aky/fips-pub-domains.</p></div></Empty></Card>;
+    return <Card title="Public domains"><Empty><div className="max-w-md"><p className="mb-2">Neither <code>fips-pubdom-server</code> nor <code>fips-pubdomd</code> is installed on this node.</p><p className="text-xs">Public domain names over fips let <code>www.example.org</code> resolve to a mesh node: fr34aky/fips-pub-domains.{admin && (!helperOk ? ' Installing from here needs the privileged helper (sudo ./deploy/setup-local.sh).' : (h.version ?? 0) < PUBDOM_INSTALL_HELPER_VERSION ? ` Installing from here needs helper v${PUBDOM_INSTALL_HELPER_VERSION} (sudo ./deploy/setup-local.sh).` : pd && !pd.canInstall ? ' Installing from here needs systemd; see fips-pub-domains docs/install.md for this system.' : '')}</p></div></Empty></Card>;
   }
   const current = tabs.some((t) => t.value === tab) ? tab : tabs[0].value;
   const side = pd[current];
-  const h = helper.data;
   // Editing needs the helper with the public-domains verbs and, as root sees it, the side's binary for the
   // validation; starting a unit needs a helper that drives this service manager (the direct mode has no root).
   const can: Can = {
     admin,
-    edit: admin && !!h && h.managementCapable && (h.version ?? 0) >= PUBDOM_HELPER_VERSION && (h.pubdom ? h.pubdom[current] : true),
+    edit: admin && helperOk && (h.version ?? 0) >= PUBDOM_HELPER_VERSION && (h.pubdom ? h.pubdom[current] : true),
     serviceControl: !!health?.serviceControl && !!h?.features?.services,
+    install,
   };
   return (
     <div className="grid gap-4 fade-in">
       {tabs.length > 1 && <Segmented value={current} onChange={setTab} options={tabs} />}
-      {admin && h && !can.edit && <HelperNote helper={h} side={current} />}
-      {!side.running ? <NotRunning tab={current} side={side} can={can} onChanged={state.refresh} />
-        : current === 'server' ? <Server can={can} /> : <Resolver can={can} />}
-      {side.running && <LogCard key={current} side={current} />}
+      {!side.installed ? <InstallCard key={current} tab={current} releases={releases.data} onDone={() => { state.refresh(); releases.refresh(); }} /> : (
+        <>
+          <UnitCard key={`unit-${current}`} tab={current} side={side} releases={releases.data} can={can} onChanged={state.refresh} />
+          {admin && h && !can.edit && <HelperNote helper={h} side={current} />}
+          {!side.running ? <NotRunning tab={current} side={side} />
+            : current === 'server' ? <Server can={can} /> : <Resolver can={can} />}
+          {side.running && <LogCard key={current} side={current} />}
+        </>
+      )}
     </div>
+  );
+}
+
+/** The unit's state and version, the service buttons, and the update when a newer release is out. */
+function UnitCard({ tab, side, releases, can, onChanged }: { tab: Tab; side: PubdomSide; releases: PubdomReleases | null; can: Can; onChanged: () => void }) {
+  const toast = useToast();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState(false);
+  const [result, setResult] = useState<PubdomInstallResult | null>(null);
+  const u = side.unit;
+  const latest = releases?.latest ?? null;
+  const newer = !!latest && !!side.version && cmpVersion(latest.version, side.version) > 0;
+  const act = async (action: 'start' | 'stop' | 'restart' | 'enable' | 'disable') => {
+    setBusy(action);
+    try { const r = await adminApi.service(UNIT[tab], action); toast('ok', `${UNIT[tab]}: ${action === 'enable' || action === 'disable' ? r.enabled : r.active ? 'running' : 'stopped'}`); setTimeout(onChanged, 1200); }
+    catch (e) { toast('err', (e as Error).message); }
+    finally { setBusy(null); }
+  };
+  const update = async () => {
+    setBusy('update'); setResult(null);
+    try {
+      const r = await withResult(adminApi.pubdomUpdate(latest?.tag));
+      setResult(r);
+      if (r.ok) { toast('ok', `fips-pub-domains ${r.version} installed${r.restarted?.length ? `, ${r.restarted.join(' and ')} restarted` : ''}`); onChanged(); }
+      else toast('err', r.error ?? 'Update failed');
+    } catch (e) { toast('err', (e as Error).message); }
+    finally { setBusy(null); setConfirm(false); }
+  };
+  const tone = !u ? 'neutral' : u.active === 'active' ? 'good' : u.active === 'failed' ? 'crit' : 'warn';
+  return (
+    <Card title={`${LABEL[tab]} service`} hint={`${UNIT[tab]}.service and the ${BIN[tab]} binary`} actions={can.serviceControl && u && <div className="flex gap-2 flex-wrap justify-end">
+      {u.active !== 'active' && <button className="btn sm primary" disabled={!!busy} onClick={() => act('start')}>Start</button>}
+      {u.active === 'active' && <button className="btn sm" disabled={!!busy} onClick={() => act('restart')}>Restart</button>}
+      {u.active === 'active' && <button className="btn sm" disabled={!!busy} onClick={() => act('stop')}>Stop</button>}
+      {u.enabled === 'enabled' ? <button className="btn sm ghost" disabled={!!busy} onClick={() => act('disable')} title="Do not start at boot">Disable at boot</button> : <button className="btn sm ghost" disabled={!!busy} onClick={() => act('enable')} title="Start at boot">Enable at boot</button>}
+    </div>}>
+      <KV items={[
+        ['Unit', u ? <span className="flex items-center gap-2"><Chip tone={tone}>{u.active === 'active' ? 'running' : u.active}{u.sub && u.sub !== 'running' && u.sub !== 'dead' ? ` (${u.sub})` : ''}</Chip><span className="text-xs text-ink-3">{u.enabled === 'enabled' ? 'starts at boot' : u.enabled ? `${u.enabled} at boot` : ''}</span></span> : <span className="text-ink-3">no systemd unit found{side.running ? ' (running by hand)' : ''}</span>],
+        ['Installed', side.version ? <span className="mono">{side.version}</span> : <span className="text-ink-3">{BIN[tab]} not found on this node's PATH</span>],
+        ['Newest release', latest ? <span className="flex items-center gap-2 flex-wrap"><a className="mono underline" href={latest.url} target="_blank" rel="noreferrer">{latest.version}</a>{newer ? <Chip tone="accent" dot={false}>newer</Chip> : side.version ? <span className="text-xs text-ink-3">up to date</span> : null}{newer && can.install && <button className="btn sm primary" disabled={!!busy} onClick={() => setConfirm(true)}>{busy === 'update' ? 'Updating…' : `Update to ${latest.version}`}</button>}</span> : releases?.error ? <span className="text-xs text-warn">{releases.error}</span> : can.admin ? <Skeleton className="h-4 w-24" /> : <span className="text-ink-3">—</span>],
+      ]} />
+      {result && !result.ok && <div className="mt-2"><ErrorNote><div>{result.error}</div>{result.detail && <pre className="mt-1 text-xs whitespace-pre-wrap">{result.detail}</pre>}</ErrorNote></div>}
+      <ConfirmDialog open={confirm} onClose={() => setConfirm(false)} busy={busy === 'update'} title={`Update fips-pub-domains to ${latest?.version}?`} confirmLabel="Update"
+        body={<p>The release archive is downloaded from GitHub ({releases?.repo}), verified against its SHA256SUMS, and the three binaries and every installed unit replaced; units that are running are restarted. Configuration and zone files are not touched.</p>}
+        onConfirm={update} />
+    </Card>
+  );
+}
+
+/** A side that is not on the node: what installing it does, and the button. */
+function InstallCard({ tab, releases, onDone }: { tab: Tab; releases: PubdomReleases | null; onDone: () => void }) {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [result, setResult] = useState<PubdomInstallResult | null>(null);
+  const latest = releases?.latest ?? null;
+  const run = async () => {
+    setBusy(true); setResult(null);
+    try {
+      const r = await withResult(adminApi.pubdomInstall(tab, latest?.tag));
+      setResult(r);
+      if (r.ok) { toast('ok', `${UNIT[tab]} ${r.version} installed${r.active ? ' and running' : ''}`); onDone(); }
+      else toast('err', r.error ?? 'Install failed');
+    } catch (e) { toast('err', (e as Error).message); }
+    finally { setBusy(false); setConfirm(false); }
+  };
+  return (
+    <Card title={`Install the ${LABEL[tab].toLowerCase()}`} hint={`fips-pub-domains ${latest ? latest.version : ''} from GitHub (${releases?.repo ?? 'fr34aky/fips-pub-domains'})`} actions={<button className="btn sm primary" disabled={busy || !latest} onClick={() => setConfirm(true)}>{busy ? 'Installing…' : `Install${latest ? ` ${latest.version}` : ''}`}</button>}>
+      <div className="text-sm text-ink-2 grid gap-2 max-w-3xl">
+        {tab === 'resolver' ? (
+          <>
+            <p><code>fips-pubdomd</code> becomes this node's DNS resolver: public domain names bound to mesh nodes resolve over fips, everything else is forwarded to the resolvers the node had before. Needs fips running here.</p>
+            <p className="text-xs">What happens: the release archive is downloaded and verified against its SHA256SUMS; the binaries go to <code>/usr/bin</code> and the unit to <code>/etc/systemd/system</code>; <code>fips-pubdomd setup</code> detects systemd-resolved, NetworkManager, dnsmasq or a plain resolv.conf and points the OS at the daemon (undone by <code>fips-pubdomd teardown</code>); the unit is enabled and started.</p>
+          </>
+        ) : (
+          <>
+            <p><code>fips-pubdom-server</code> answers the mesh's DNS queries for the domains in its zone files and publishes their claims to Nostr relays, so <code>www.example.org</code> reaches this node without the Internet. Needs fips running here and a domain whose <code>_fips-dns</code> TXT record you can set.</p>
+            <p className="text-xs">What happens: the release archive is downloaded and verified against its SHA256SUMS; the binaries go to <code>/usr/bin</code> and the unit to <code>/etc/systemd/system</code>; an empty zones directory and a <code>server.yaml</code> are written, and the firewall drop-in where fips's firewall is set up; the unit is enabled and started, serving nothing until you add a domain here.</p>
+          </>
+        )}
+        {releases?.error && <ErrorNote>{releases.error}</ErrorNote>}
+        {result && !result.ok && <ErrorNote><div>{result.error}</div>{result.detail && <pre className="mt-1 text-xs whitespace-pre-wrap">{result.detail}</pre>}</ErrorNote>}
+        {result?.ok && result.setup && <pre className="rounded-lg bg-surface-2 p-3 text-xs whitespace-pre-wrap">{result.setup}</pre>}
+      </div>
+      <ConfirmDialog open={confirm} onClose={() => setConfirm(false)} busy={busy} title={`Install ${UNIT[tab]} ${latest?.version ?? ''}?`} confirmLabel="Install"
+        body={tab === 'resolver' ? <p>This changes how the node resolves every name: the OS resolver is pointed at <code>fips-pubdomd</code>. It takes a minute, and <code>sudo fips-pubdomd teardown</code> restores the previous setup.</p> : <p>The server starts with no domains; add one on this page afterwards and set its TXT record at the hoster. It takes a minute.</p>}
+        onConfirm={run} />
+    </Card>
   );
 }
 
@@ -63,19 +164,11 @@ function HelperNote({ helper, side }: { helper: HelperInfo; side: Tab }) {
   return <Card><div className="text-sm text-ink-2">Editing zone files and the configuration needs the privileged helper, version {PUBDOM_HELPER_VERSION} or newer: {why}. The actions over the control sockets work without it.<div className="mt-2"><Copyable text="sudo ./deploy/setup-local.sh" className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit" /></div></div></Card>;
 }
 
-function NotRunning({ tab, side, can, onChanged }: { tab: Tab; side: PubdomSide; can: Can; onChanged: () => void }) {
-  const toast = useToast();
-  const [busy, setBusy] = useState(false);
+function NotRunning({ tab, side }: { tab: Tab; side: PubdomSide }) {
   const what = tab === 'server' ? 'The domain server' : 'The resolver';
-  const start = async () => {
-    setBusy(true);
-    try { await adminApi.service(UNIT[tab], 'start'); toast('ok', `${UNIT[tab]} started`); setTimeout(onChanged, 1500); }
-    catch (e) { toast('err', (e as Error).message); }
-    finally { setBusy(false); }
-  };
   return (
-    <Card title={what} actions={can.serviceControl && <button className="btn sm primary" disabled={busy} onClick={start}>Start {UNIT[tab]}</button>}>
-      <Empty><div className="max-w-md"><p className="mb-2">{what} is installed but its control socket <code>{side.socket}</code> does not answer.</p><p className="text-xs">Start the unit, or point its configuration's <code>control:</code> at a directory that exists.</p></div></Empty>
+    <Card title={what}>
+      <Empty><div className="max-w-md"><p className="mb-2">{what} is installed but its control socket <code>{side.socket}</code> does not answer.</p><p className="text-xs">Start the unit above, or point its configuration's <code>control:</code> at a directory that exists{side.version && cmpVersion(side.version, '0.2.7') < 0 ? `; ${BIN[tab]} ${side.version} has no control socket yet (0.2.7 or newer has), so update it above` : ''}.</p></div></Empty>
     </Card>
   );
 }
