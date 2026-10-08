@@ -52,8 +52,9 @@ fips's own socket. `FIPS_PUBDOM_SOCKET` and `FIPS_PUBDOM_SERVER_SOCKET` override
 daemon or server run by hand.
 
 A server upgraded from before 0.2.7 may still run from `--zone` flags: it reports no zones directory, and
-the zone editor says so. `sudo fips-pubdom-server init` writes `/etc/fips-pubdom/server.yaml` from the
-existing zone files and `server.env`; after a restart the unit uses it and the editor works.
+the Domain server tab says so instead of offering the editing buttons. `sudo fips-pubdom-server init`
+writes `/etc/fips-pubdom/server.yaml` from the existing zone files and `server.env` (skip it if the file
+is already there), then `sudo systemctl restart fips-pubdom-server` makes the unit use it.
 
 Over the mesh the page is subject to the same access list as the rest of the dashboard
 ([mesh-access.md](mesh-access.md)).

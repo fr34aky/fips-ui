@@ -6,7 +6,7 @@
 // paths, so nothing can be swapped between validation and install.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
+import { DOMAIN_RE, WRITE_COMMANDS as PUBDOM_WRITE, ZONE_FILE_RE, PubdomStateError, isSide as isPubdomSide, liveZonesDir, pubdomQuery } from './pubdom.ts';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -434,7 +434,7 @@ export function createAdminHandler(opts: AdminOptions) {
         sendJson(res, 404, { error: 'not found' }); return true;
       });
     } catch (e) {
-      if (e instanceof Conflict) sendJson(res, 409, { error: e.message });
+      if (e instanceof Conflict || e instanceof PubdomStateError) sendJson(res, 409, { error: e.message });
       else if (e instanceof BodyError) sendJson(res, e.status, { error: e.message }, e.status === 413);
       else sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
       return true;

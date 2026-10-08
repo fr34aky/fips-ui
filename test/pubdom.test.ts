@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, isSide, readEditable, zoneFileWithin } from '../server/pubdom.ts';
+import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, isSide, liveZonesDir, readEditable, zoneFileWithin } from '../server/pubdom.ts';
 
 const paths = {
   resolver: { socket: '/run/r.sock', files: ['/etc/r.yaml', '/var/r.json'] },
@@ -65,4 +65,11 @@ test('an editable file comes with the hash the helper checks; a missing one with
   fs.writeFileSync(f, 'key: /etc/fips/fips.key\n');
   assert.equal(readEditable(f).text, 'key: /etc/fips/fips.key\n');
   fs.rmSync(dir, { recursive: true });
+});
+
+test('a server running from --zone flags is an operator state with the step to take, not a fault', async () => {
+  assert.equal(await liveZonesDir(async () => ({ zones_dir: '/etc/fips-pubdom/zones' }), () => true), '/etc/fips-pubdom/zones');
+  await assert.rejects(liveZonesDir(async () => ({ zones_dir: null }), () => false), (e: Error) => e instanceof PubdomStateError && /fips-pubdom-server init/.test(e.message) && /systemctl restart fips-pubdom-server/.test(e.message));
+  // The file is already there (written by hand or from the settings card without a restart): only the restart is missing.
+  await assert.rejects(liveZonesDir(async () => ({}), () => true), (e: Error) => e instanceof PubdomStateError && !/init/.test(e.message) && /systemctl restart fips-pubdom-server/.test(e.message));
 });

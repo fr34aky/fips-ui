@@ -80,12 +80,24 @@ export function zoneFileWithin(dir: string, file: string): boolean {
   return ZONE_FILE_RE.test(base) && !base.includes('..') && path.resolve(file) === path.join(path.resolve(dir), base);
 }
 
-/** The directory the running server follows, which the helper must agree with before it writes there. */
-export async function liveZonesDir(): Promise<string> {
-  const st = await pubdomQuery<{ zones_dir?: string }>('server', 'status');
-  // A server started with --zone flags (no /etc/fips-pubdom/server.yaml) follows no directory: there is nowhere
-  // a saved file would be picked up from.
-  if (!st.zones_dir) throw new Error('the server runs from --zone flags, not a zones directory: run `sudo fips-pubdom-server init` to write /etc/fips-pubdom/server.yaml from the existing zone files, then restart fips-pubdom-server');
+/** An expected state of the node that the operator must change, not a fault: answered 409, not 500. */
+export class PubdomStateError extends Error {}
+
+/** What a server running from --zone flags needs: `init` writes the file, or only a restart if it already exists. */
+export function noZonesDirMessage(configExists: boolean): string {
+  return configExists
+    ? `the server runs from --zone flags although ${CONFIG_FILE.server} exists; run \`sudo systemctl restart ${UNIT.server}\` so the unit uses the file`
+    : `the server runs from --zone flags, not a zones directory: run \`sudo ${UNIT.server} init\` to write ${CONFIG_FILE.server} from the existing zone files, then \`sudo systemctl restart ${UNIT.server}\``;
+}
+
+/**
+ * The directory the running server follows, which the helper must agree with before it writes there. A server
+ * started with --zone flags (a unit from before server.yaml existed, or one not restarted since the file was
+ * written) follows no directory: a new file in it would not be picked up.
+ */
+export async function liveZonesDir(status: () => Promise<{ zones_dir?: string | null }> = () => pubdomQuery('server', 'status'), configExists: () => boolean = () => fs.existsSync(CONFIG_FILE.server)): Promise<string> {
+  const st = await status();
+  if (!st.zones_dir) throw new PubdomStateError(noZonesDirMessage(configExists()));
   return st.zones_dir;
 }
 

@@ -112,8 +112,13 @@ function Server({ can }: { can: Can }) {
   if (status.error) return <ErrorNote>{status.error}</ErrorNote>;
   const s = status.data;
   const publishing = !!s?.publishing;
+  // A server running from --zone flags follows no directory: nothing saved into one would be picked up, so the
+  // editing buttons wait until the operator has switched it to server.yaml (the note says how).
+  const flags = !!s && !s.zones_dir;
+  const edit: Can = flags ? { ...can, edit: false } : can;
   return (
     <>
+      {flags && can.edit && <Card><div className="text-sm text-ink-2">The server runs from the unit's <code>--zone</code> flags, not from <code>/etc/fips-pubdom/server.yaml</code>, so there is no zones directory to write into. On the node: <code>sudo fips-pubdom-server init</code> writes the file from the existing zone files (skip it if the file is already there), then <code>sudo systemctl restart fips-pubdom-server</code>. Editing appears here afterwards.</div></Card>}
       <Card title="This node" hint="What the TXT record and the claims name" actions={<button className="btn ghost icon sm" onClick={refresh} title="Refresh"><RefreshCw size={14} /></button>}>
         {!s ? <Skeleton className="h-20 w-full" /> : (
           <KV items={[
@@ -126,7 +131,7 @@ function Server({ can }: { can: Can }) {
         )}
       </Card>
       <Card title="Relays" hint="Where the claims and zone records go" actions={can.admin && publishing && <button className="btn sm" disabled={busy} onClick={() => run(() => adminApi.pubdomAction('server', 'publish'), 'Publishing every domain now')}>Publish all now</button>}>
-        {!s ? <Skeleton className="h-12 w-full" /> : s.relays.length === 0 ? <Empty>No relays: the claims are not published.{can.edit && <> Add some under Publishing below.</>}</Empty> : (
+        {!s ? <Skeleton className="h-12 w-full" /> : s.relays.length === 0 ? <Empty>No relays: the claims are not published.{edit.edit && <> Add some under Publishing below.</>}</Empty> : (
           <div className="overflow-x-auto"><table className="data"><thead><tr><th>Relay</th><th>Last accepted</th><th>Last error</th></tr></thead><tbody>
             {s.relays.map((r) => <tr key={r.url}><td className="mono text-xs">{r.url}</td><td>{ts(r.accepted_at)}</td><td className="text-xs">{r.last_error ? <span className="text-crit">{r.last_error}</span> : <span className="text-ink-3">—</span>}</td></tr>)}
           </tbody></table></div>
@@ -135,18 +140,18 @@ function Server({ can }: { can: Can }) {
       {zones.error ? <ErrorNote>{zones.error}</ErrorNote> : !zones.data ? <Skeleton className="h-24 w-full" /> : (
         <>
           {zones.data.zones.length === 0 ? (
-            <Card title="Domains" actions={can.edit && <button className="btn sm primary" onClick={() => setEditor({ zone: null })}><Plus size={14} />Add domain</button>}>
-              <Empty><div className="max-w-md"><p className="mb-2">No zone file yet.</p><p className="text-xs">{can.edit ? 'Add a domain here, or drop' : 'Drop'} a <code>domain.yaml</code> into the zones directory: it is served within a second (fips-pub-domains, docs/operators.md).</p></div></Empty>
+            <Card title="Domains" actions={edit.edit && <button className="btn sm primary" onClick={() => setEditor({ zone: null })}><Plus size={14} />Add domain</button>}>
+              <Empty><div className="max-w-md"><p className="mb-2">No zone file yet.</p><p className="text-xs">{edit.edit ? 'Add a domain here, or drop' : 'Drop'} a <code>domain.yaml</code> into the zones directory: it is served within a second (fips-pub-domains, docs/operators.md).</p></div></Empty>
             </Card>
           ) : (
             <>
-              {can.edit && <div className="flex justify-end -mb-2"><button className="btn sm primary" onClick={() => setEditor({ zone: null })}><Plus size={14} />Add domain</button></div>}
-              {zones.data.zones.map((z) => <ZoneCard key={z.domain} z={z} can={can} publishing={publishing} busy={busy} run={run} onEdit={() => setEditor({ zone: z })} onDelete={() => setConfirm(z)} />)}
+              {edit.edit && <div className="flex justify-end -mb-2"><button className="btn sm primary" onClick={() => setEditor({ zone: null })}><Plus size={14} />Add domain</button></div>}
+              {zones.data.zones.map((z) => <ZoneCard key={z.domain} z={z} can={edit} publishing={publishing} busy={busy} run={run} onEdit={() => setEditor({ zone: z })} onDelete={() => setConfirm(z)} />)}
             </>
           )}
           {zones.data.skipped.length > 0 && (
             <Card title="Skipped files" hint="Zone files the server could not load; the log below says why">
-              <ul className="text-xs mono grid gap-1">{zones.data.skipped.map((f) => <li key={f.file} className="flex items-center gap-2">{f.file}{can.edit && <button className="btn sm ghost" onClick={() => setEditor({ zone: null, file: f.file })}><Pencil size={13} />Repair</button>}</li>)}</ul>
+              <ul className="text-xs mono grid gap-1">{zones.data.skipped.map((f) => <li key={f.file} className="flex items-center gap-2">{f.file}{edit.edit && <button className="btn sm ghost" onClick={() => setEditor({ zone: null, file: f.file })}><Pencil size={13} />Repair</button>}</li>)}</ul>
             </Card>
           )}
         </>
