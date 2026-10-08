@@ -7,6 +7,7 @@ import { cpSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFi
 import path from 'node:path';
 import { RELEASE_MARKER } from './version.ts';
 
+import { fetchLatestRelease } from './github.ts';
 const REPO = process.env.FIPS_UI_REPO ?? 'fr34aky/fips-ui';
 const CHECK_MS = 6 * 60 * 60_000;
 const TAG_RE = /^v\d+\.\d+\.\d+$/;
@@ -70,11 +71,7 @@ export class SelfUpdate {
     if (!force && Date.now() - this.checkedAt < CHECK_MS) return Promise.resolve();
     this.checking ??= (async () => {
       try {
-        const headers: Record<string, string> = { 'user-agent': 'fips-ui', accept: 'application/vnd.github+json' };
-        if (process.env.FIPS_UI_GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.FIPS_UI_GITHUB_TOKEN}`;
-        const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers, signal: AbortSignal.timeout(15_000) });
-        if (!r.ok) throw new Error(`GitHub answered ${r.status}${r.status === 403 ? ' (rate limit? set FIPS_UI_GITHUB_TOKEN)' : ''}`);
-        const j = await r.json() as { tag_name?: string; html_url?: string; published_at?: string; body?: string };
+        const j = await fetchLatestRelease(REPO);
         if (!j.tag_name || !TAG_RE.test(j.tag_name)) throw new Error(`unexpected release tag ${JSON.stringify(j.tag_name)}`);
         this.latest = { tag: j.tag_name, version: j.tag_name.slice(1), url: j.html_url ?? `https://github.com/${REPO}/releases`, publishedAt: j.published_at ?? '', notes: (j.body ?? '').slice(0, 20_000) };
         this.checkError = undefined;

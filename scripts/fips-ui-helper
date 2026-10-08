@@ -337,7 +337,8 @@ MAX_ZONE_BYTES=65536
 PUBDOM_ETC=${FIPS_PUBDOM_ETC:-/etc/fips-pubdom}
 # The binaries go where the packaged units expect them (/usr/bin/fips-pubdomd); the override serves the test suite.
 PUBDOM_BIN=${FIPS_PUBDOM_BIN:-/usr/bin}
-PUBDOM_RELEASE_REPO=${FIPS_UI_PUBDOM_REPO:-fr34aky/fips-pub-domains}
+# Fixed: nothing a caller sets reaches the helper through sudo, and the page offers this repository's releases.
+PUBDOM_RELEASE_REPO=fr34aky/fips-pub-domains
 # Keys whose values never leave this script, matched case-insensitively against the whole key.
 SECRET_KEYS='nsec|control_auth|secret|secret_key|private_key|password|passphrase|token|api_key|auth_token|psk|preshared_key|mnemonic|seed'
 # Test mode only (FIPS_UI_HELPER_TEST=1 is never forwarded by sudo, see deploy/sudoers.d/fips-ui): point the
@@ -1051,7 +1052,6 @@ pubdom_install() { # <tmp> <dest>: atomically, root:root 0644 (the units' users 
 pubdom_fetch() { # <tag|"">
   local tag=$1 target ver file sums want got base
   [[ -z "$tag" || "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid tag (use vX.Y.Z)"
-  [[ "$PUBDOM_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid FIPS_UI_PUBDOM_REPO"
   case "$(uname -s):$(uname -m)" in
     Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu ;;
     Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
@@ -1083,13 +1083,13 @@ pubdom_put_binaries() { # <unpacked dir>: the three binaries, replaced atomicall
   local own=(-o 0 -g 0) b; [[ $(id -u) -eq 0 ]] || own=()
   mkdir -p "$PUBDOM_BIN"
   for b in fips-pubdom fips-pubdomd fips-pubdom-server; do
-    install -m 0755 "${own[@]}" "$1/$b" "$PUBDOM_BIN/$b.fips-ui.new" && mv -f "$PUBDOM_BIN/$b.fips-ui.new" "$PUBDOM_BIN/$b"
+    { install -m 0755 "${own[@]}" "$1/$b" "$PUBDOM_BIN/$b.fips-ui.new" && mv -f "$PUBDOM_BIN/$b.fips-ui.new" "$PUBDOM_BIN/$b"; } || die "cannot install $PUBDOM_BIN/$b"
   done
 }
 pubdom_put_unit() { # <unpacked dir> <unit>
   install -m 0644 -o 0 -g 0 "$1/packaging/systemd/$2.service" "/etc/systemd/system/$2.service.fips-ui.new" && mv -f "/etc/systemd/system/$2.service.fips-ui.new" "/etc/systemd/system/$2.service"
 }
-pubdom_version() { "$PUBDOM_BIN/$1" --version 2>/dev/null | awk '{print $2}'; }
+
 
 # A drop-in is included inside the `inbound` chain, so it may only hold rule statements: no include/define
 # (which could read other files), no table or chain commands, no `;`, and braces balanced on every line
@@ -1778,7 +1778,12 @@ case "$cmd" in
       # server.yaml so the unit runs `serve --config` and follows the directory; the page adds the domains.
       [[ -f "$PUBDOM_ETC/server.yaml" ]] || "$PUBDOM_BIN/fips-pubdom-server" init --zones "$PUBDOM_ETC/zones" --env "$PUBDOM_ETC/server.env" --out "$PUBDOM_ETC/server.yaml" >&2 9>&-
     fi
-    systemctl enable "$unit.service" >&2 9>&-; systemctl restart "$unit.service" >&2 9>&-
+    systemctl enable "$unit.service" >&2 9>&- || true
+    # A resolver whose OS integration is in place but whose unit does not start leaves the node without DNS: say so.
+    if ! systemctl restart "$unit.service" >&2 9>&-; then
+      hint=""; [[ "$side" == resolver && -n "$setup" ]] && hint=" The OS resolver already points at the daemon: run \`sudo fips-pubdomd teardown\` to restore name resolution until it starts."
+      printf '{"ok":false,"error":%s,"detail":%s}\n' "$(json_escape "$unit.service did not start (binaries and unit are installed).$hint")" "$(json_escape "$(journalctl -u "$unit.service" -n 12 --no-pager 2>/dev/null | tail -c 2000)")"; exit 0
+    fi
     a=false; svc_active "$unit.service" && a=true
     printf '{"ok":true,"side":%s,"version":%s,"unit":%s,"active":%s,"setup":%s}\n' "$(json_escape "$side")" "$(json_escape "${PF_TAG#v}")" "$(json_escape "$unit.service")" "$a" "$(json_escape "$setup")"
     ;;

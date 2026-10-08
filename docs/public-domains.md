@@ -70,7 +70,7 @@ version and the newest release on GitHub (checked every six hours, `FIPS_UI_GITH
 **Start**, **Stop**, **Restart**, **Enable/Disable at boot** (service control through the helper), and
 **Update** when a newer release is out: the archive is fetched and verified the same way, the binaries and
 every installed unit are replaced, and the units that were running are restarted. Configuration and zone
-files are never touched by an update. `FIPS_UI_PUBDOM_REPO` overrides the GitHub repository.
+files are never touched by an update.
 
 A server upgraded from before 0.2.7 may still run from `--zone` flags: it reports no zones directory, and
 the Domain server tab says so instead of offering the editing buttons. `sudo fips-pubdom-server init`

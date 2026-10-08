@@ -38,8 +38,10 @@ export function PublicDomains({ health }: { health: Health | null }) {
   const tabs: { value: Tab; label: string }[] = [];
   for (const t of ['server', 'resolver'] as Tab[]) if (pd?.[t].installed || install) tabs.push({ value: t, label: LABEL[t] });
   const [tab, setTab] = useState<Tab>(tabs[0]?.value ?? 'server');
+  // Whether the helper can install here comes with the state poll; until it answers that is unknown, not no.
+  const installUnknown = admin && helperOk && (h.version ?? 0) >= PUBDOM_INSTALL_HELPER_VERSION && pd?.canInstall === undefined && !state.error;
   if (!pd || tabs.length === 0) {
-    return <Card title="Public domains"><Empty><div className="max-w-md"><p className="mb-2">Neither <code>fips-pubdom-server</code> nor <code>fips-pubdomd</code> is installed on this node.</p><p className="text-xs">Public domain names over fips let <code>www.example.org</code> resolve to a mesh node: fr34aky/fips-pub-domains.{admin && (!helperOk ? ' Installing from here needs the privileged helper (sudo ./deploy/setup-local.sh).' : (h.version ?? 0) < PUBDOM_INSTALL_HELPER_VERSION ? ` Installing from here needs helper v${PUBDOM_INSTALL_HELPER_VERSION} (sudo ./deploy/setup-local.sh).` : pd && !pd.canInstall ? ' Installing from here needs systemd; see fips-pub-domains docs/install.md for this system.' : '')}</p></div></Empty></Card>;
+    return <Card title="Public domains">{installUnknown ? <Skeleton className="h-16 w-full" /> : <Empty><div className="max-w-md"><p className="mb-2">Neither <code>fips-pubdom-server</code> nor <code>fips-pubdomd</code> is installed on this node.</p><p className="text-xs">Public domain names over fips let <code>www.example.org</code> resolve to a mesh node: fr34aky/fips-pub-domains.{admin && (!helperOk ? ' Installing from here needs the privileged helper (sudo ./deploy/setup-local.sh).' : (h.version ?? 0) < PUBDOM_INSTALL_HELPER_VERSION ? ` Installing from here needs helper v${PUBDOM_INSTALL_HELPER_VERSION} (sudo ./deploy/setup-local.sh).` : state.error ? ` The node's state could not be read: ${state.error}` : pd?.canInstall === false ? ' Installing from here needs systemd; see fips-pub-domains docs/install.md for this system.' : '')}</p></div></Empty>}</Card>;
   }
   const current = tabs.some((t) => t.value === tab) ? tab : tabs[0].value;
   const side = pd[current];
@@ -54,9 +56,9 @@ export function PublicDomains({ health }: { health: Health | null }) {
   return (
     <div className="grid gap-4 fade-in">
       {tabs.length > 1 && <Segmented value={current} onChange={setTab} options={tabs} />}
-      {!side.installed ? <InstallCard key={current} tab={current} releases={releases.data} onDone={() => { state.refresh(); releases.refresh(); }} /> : (
+      {!side.installed ? <InstallCard key={current} tab={current} releases={releases.data} onDone={() => { state.refresh(); releases.refresh(); void adminApi.status(true).then(() => helper.refresh()); }} /> : (
         <>
-          <UnitCard key={`unit-${current}`} tab={current} side={side} releases={releases.data} can={can} onChanged={state.refresh} />
+          <UnitCard key={`unit-${current}`} tab={current} side={side} releases={releases.data} can={can} onChanged={() => { state.refresh(); void adminApi.status(true).then(() => helper.refresh()); }} />
           {admin && h && !can.edit && <HelperNote helper={h} side={current} />}
           {!side.running ? <NotRunning tab={current} side={side} />
             : current === 'server' ? <Server can={can} /> : <Resolver can={can} />}
@@ -125,11 +127,19 @@ function InstallCard({ tab, releases, onDone }: { tab: Tab; releases: PubdomRele
     try {
       const r = await withResult(adminApi.pubdomInstall(tab, latest?.tag));
       setResult(r);
-      if (r.ok) { toast('ok', `${UNIT[tab]} ${r.version} installed${r.active ? ' and running' : ''}`); onDone(); }
+      if (r.ok) { toast('ok', `${UNIT[tab]} ${r.version} installed${r.active ? ' and running' : ''}`); if (!r.setup) onDone(); }   // setup's notes stay until read
       else toast('err', r.error ?? 'Install failed');
     } catch (e) { toast('err', (e as Error).message); }
     finally { setBusy(false); setConfirm(false); }
   };
+  if (result?.ok && result.setup) {
+    return (
+      <Card title={`${UNIT[tab]} ${result.version} installed`} hint="What fips-pubdomd setup did to this node's resolver" actions={<button className="btn sm primary" onClick={onDone}>Continue</button>}>
+        <pre className="rounded-lg bg-surface-2 p-3 text-xs whitespace-pre-wrap">{result.setup}</pre>
+        <div className="text-xs text-ink-3 mt-2"><code>sudo fips-pubdomd teardown</code> undoes it.</div>
+      </Card>
+    );
+  }
   return (
     <Card title={`Install the ${LABEL[tab].toLowerCase()}`} hint={`fips-pub-domains ${latest ? latest.version : ''} from GitHub (${releases?.repo ?? 'fr34aky/fips-pub-domains'})`} actions={<button className="btn sm primary" disabled={busy || !latest} onClick={() => setConfirm(true)}>{busy ? 'Installing…' : `Install${latest ? ` ${latest.version}` : ''}`}</button>}>
       <div className="text-sm text-ink-2 grid gap-2 max-w-3xl">
@@ -146,7 +156,6 @@ function InstallCard({ tab, releases, onDone }: { tab: Tab; releases: PubdomRele
         )}
         {releases?.error && <ErrorNote>{releases.error}</ErrorNote>}
         {result && !result.ok && <ErrorNote><div>{result.error}</div>{result.detail && <pre className="mt-1 text-xs whitespace-pre-wrap">{result.detail}</pre>}</ErrorNote>}
-        {result?.ok && result.setup && <pre className="rounded-lg bg-surface-2 p-3 text-xs whitespace-pre-wrap">{result.setup}</pre>}
       </div>
       <ConfirmDialog open={confirm} onClose={() => setConfirm(false)} busy={busy} title={`Install ${UNIT[tab]} ${latest?.version ?? ''}?`} confirmLabel="Install"
         body={tab === 'resolver' ? <p>This changes how the node resolves every name: the OS resolver is pointed at <code>fips-pubdomd</code>. It takes a minute, and <code>sudo fips-pubdomd teardown</code> restores the previous setup.</p> : <p>The server starts with no domains; add one on this page afterwards and set its TXT record at the hoster. It takes a minute.</p>}

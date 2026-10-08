@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { ControlError, endpointExists, query } from './control.ts';
 import { PLATFORM } from './platform.ts';
+import { fetchLatestRelease } from './github.ts';
 
 export type PubdomSide = 'resolver' | 'server';
 
@@ -29,11 +30,13 @@ export type PubdomState = Record<PubdomSide, SideState>;
 export interface UnitState { loaded: boolean; active: string; sub: string; enabled: string }
 export interface SideFull extends SideState { version: string | null; unit: UnitState | null }
 export interface PubdomFull { resolver: SideFull; server: SideFull; /** Where the helper can install: systemd, as the packaging's units need. */ canInstall: boolean }
-export const UNIT: Record<PubdomSide, string> = { resolver: 'fips-pubdomd', server: 'fips-pubdom-server' };
-export const SERVICE: Record<PubdomSide, string> = { resolver: 'fips-pubdom', server: 'fips-pubdom-server' };
+/** The binaries and the systemd units, as the web view names them too. */
+export const BIN: Record<PubdomSide, string> = { resolver: 'fips-pubdomd', server: 'fips-pubdom-server' };
+export const UNIT: Record<PubdomSide, string> = { resolver: 'fips-pubdom', server: 'fips-pubdom-server' };
 /** Helper version with pubdom-install / pubdom-update. */
 export const INSTALL_HELPER_VERSION = 12;
-export const RELEASE_REPO = process.env.FIPS_UI_PUBDOM_REPO ?? 'fr34aky/fips-pub-domains';
+/** Fixed on purpose: the helper installs from here as root, and nothing a caller sets reaches it through sudo. */
+export const RELEASE_REPO = 'fr34aky/fips-pub-domains';
 
 function exec(cmd: string, args: string[], timeout = 5000): Promise<string> {
   return new Promise((resolve, reject) => execFile(cmd, args, { timeout }, (err, out) => (err ? reject(err) : resolve(String(out)))));
@@ -62,8 +65,12 @@ export async function unitState(unit: string, run = exec): Promise<UnitState | n
 /** detect() plus what the install and service controls need; the versions come from the binaries themselves. */
 export async function fullState(): Promise<PubdomFull> {
   const base = detect();
-  const side = async (k: PubdomSide): Promise<SideFull> => ({ ...base[k], version: await binaryVersion(UNIT[k]), unit: await unitState(SERVICE[k]) });
-  return { resolver: await side('resolver'), server: await side('server'), canInstall: PLATFORM.serviceManager === 'systemd' };
+  const side = async (k: PubdomSide): Promise<SideFull> => {
+    const [version, unit] = await Promise.all([binaryVersion(BIN[k]), unitState(UNIT[k])]);
+    return { ...base[k], version, unit };
+  };
+  const [resolver, server] = await Promise.all([side('resolver'), side('server')]);
+  return { resolver, server, canInstall: PLATFORM.serviceManager === 'systemd' };
 }
 
 export interface Release { tag: string; version: string; url: string; publishedAt: string }
@@ -73,12 +80,12 @@ let releasesPending: Promise<Releases> | null = null;
 const RELEASE_TTL_MS = 6 * 3600_000, RELEASE_ERROR_TTL_MS = 60_000;
 
 /** The newest fips-pub-domains release, checked at most every six hours (a minute after an error) unless forced. */
-export function latestRelease(force = false, fetchJson: (url: string) => Promise<unknown> = ghJson): Promise<Releases> {
+export function latestRelease(force = false, fetchJson: (repo: string) => Promise<unknown> = fetchLatestRelease): Promise<Releases> {
   const ttl = releases?.error ? RELEASE_ERROR_TTL_MS : RELEASE_TTL_MS;
   if (!force && releases && Date.now() - releases.checkedAt < ttl) return Promise.resolve(releases);
   releasesPending ??= (async () => {
     try {
-      const j = await fetchJson(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`) as { tag_name?: string; html_url?: string; published_at?: string };
+      const j = await fetchJson(RELEASE_REPO) as { tag_name?: string; html_url?: string; published_at?: string };
       if (!j.tag_name || !/^v\d+\.\d+\.\d+$/.test(j.tag_name)) throw new Error(`unexpected release tag ${JSON.stringify(j.tag_name)}`);
       releases = { repo: RELEASE_REPO, latest: { tag: j.tag_name, version: j.tag_name.slice(1), url: j.html_url ?? `https://github.com/${RELEASE_REPO}/releases`, publishedAt: j.published_at ?? '' }, checkedAt: Date.now() };
     } catch (e) {
@@ -87,13 +94,6 @@ export function latestRelease(force = false, fetchJson: (url: string) => Promise
     return releases!;
   })();
   return releasesPending;
-}
-async function ghJson(url: string): Promise<unknown> {
-  const headers: Record<string, string> = { 'user-agent': 'fips-ui', accept: 'application/vnd.github+json' };
-  if (process.env.FIPS_UI_GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.FIPS_UI_GITHUB_TOKEN}`;
-  const r = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
-  if (!r.ok) throw new Error(`GitHub answered ${r.status}${r.status === 403 ? ' (rate limit? set FIPS_UI_GITHUB_TOKEN)' : ''}`);
-  return r.json();
 }
 
 /**
@@ -187,7 +187,7 @@ export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string
   try {
     return await query<T>(command, params, { socketPath: PATHS[side].socket, timeoutMs: 15000 });
   } catch (e) {
-    if (e instanceof ControlError && e.kind === 'transport') throw new ControlError(e.message.replace('the fips daemon', UNIT[side]), 'transport');
+    if (e instanceof ControlError && e.kind === 'transport') throw new ControlError(e.message.replace('the fips daemon', BIN[side]), 'transport');
     throw e;
   }
 }
