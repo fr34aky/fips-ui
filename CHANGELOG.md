@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-08
+
 ### Fixed
 
 - The zone editor on a server still running from `--zone` flags (no
   `server.yaml`) says what to do — run `fips-pubdom-server init` and
   restart — instead of "did not report its zones directory".
+
+### Changed
+
+- Build dependency `source-map-js` 1.2.2 (advisory GHSA for 1.2.1; build-time only).
 
 ## [0.10.0] - 2026-10-08
 
@@ -542,7 +548,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/fr34aky/fips-ui/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/fr34aky/fips-ui/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/fr34aky/fips-ui/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/fr34aky/fips-ui/compare/v0.7.1...v0.8.0
