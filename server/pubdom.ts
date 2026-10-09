@@ -194,7 +194,7 @@ export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string
 
 // ---- Names this node serves (fips-ui reached under a public domain) -------------------------------------------
 // A browser that reaches this dashboard under a public domain sends that name as Host. Only the names this node's
-// own domain server answers with this node (target "self") may be accepted, and only for zones whose claim is
+// own domain server answers with this node (target "self", or this node's own npub written out) may be accepted, and only for zones whose claim is
 // published without an error: a visitor's fips-pubdomd binds a domain to a node only when that node published a
 // valid claim, so nobody else can point such a name here (the same reason any <name>.fips is safe). A name the zone
 // gives to another node, or leaves to ordinary DNS ("legacy"), is not ours, even with a "*" entry.
@@ -207,8 +207,12 @@ export type ServedNames = Map<string, { labels: Map<string, string>; wildcard: s
 // Zone labels are single hostname labels ("@", "www", "*"), as fips-pub-domains validates them.
 const ZONE_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
-/** The served zones from a `zones` answer, keyed by domain. */
-export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNames {
+/**
+ * The served zones from a `zones` answer, keyed by domain. A target that is this node's own npub (bech32 in any
+ * case) is recorded as "self": the domain server answers both with this node.
+ */
+export function selfHostnames(answer: ZonesAnswer | null | undefined, ownNpub?: string): ServedNames {
+  const own = ownNpub?.toLowerCase();
   const out: ServedNames = new Map();
   for (const z of answer?.zones ?? []) {
     const domain = String(z.domain ?? '').toLowerCase().replace(/\.$/, '');
@@ -217,7 +221,9 @@ export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNam
     if (!z.claim_published_at || z.last_error) continue;
     const labels = new Map<string, string>(); let wildcard: string | null = null;
     for (const n of z.names ?? []) {
-      const label = String(n?.label ?? '').toLowerCase(), target = String(n?.target ?? '');
+      const label = String(n?.label ?? '').toLowerCase();
+      const raw = String(n?.target ?? '').trim();
+      const target = own && raw.toLowerCase() === own ? 'self' : raw;
       if (label === '*') wildcard = target;
       else if (label === '@' || ZONE_LABEL_RE.test(label)) labels.set(label, target);
     }
@@ -229,9 +235,9 @@ export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNam
 /**
  * Whether the domain server answers `hostname` with this node, by its own lookup rule: the part before the domain
  * ("@" for the domain itself) matches a label exactly, or else the `*` entry decides (at any depth, and for the
- * domain itself when there is no "@"). This node is the target "self", or its own npub written out.
+ * domain itself when there is no "@"). Targets naming this node by its npub are "self" already (selfHostnames).
  */
-export function hostMatches(hostname: string, names: ServedNames, ownNpub?: string): boolean {
+export function hostMatches(hostname: string, names: ServedNames): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
   let best: string | null = null;
   for (const d of names.keys()) if ((h === d || h.endsWith(`.${d}`)) && (!best || d.length > best.length)) best = d;
@@ -239,7 +245,7 @@ export function hostMatches(hostname: string, names: ServedNames, ownNpub?: stri
   const zone = names.get(best)!;
   const part = h === best ? '@' : h.slice(0, -(best.length + 1));
   const target = zone.labels.has(part) ? zone.labels.get(part) : zone.wildcard;
-  return target === 'self' || (!!ownNpub && target === ownNpub);
+  return target === 'self';
 }
 
 const NO_NAMES: ServedNames = new Map();
@@ -254,11 +260,11 @@ export function servedHostnames(): ServedNames { return served; }
  * the last answer (a busy server must not lock visitors out mid-session); a stopped server serves none. Answers
  * that arrive out of order are dropped.
  */
-export function watchServedHostnames(intervalMs = 15_000): void {
+export function watchServedHostnames(ownNpub: () => string | undefined, intervalMs = 15_000): void {
   const refresh = () => {
     if (!detect().server.running) { served = NO_NAMES; return; }
     const seq = ++refreshSeq;
-    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) served = selfHostnames(z); }, () => { /* keep the last answer */ });
+    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) served = selfHostnames(z, ownNpub()); }, () => { /* keep the last answer */ });
   };
   refresh();
   setInterval(refresh, intervalMs).unref();
