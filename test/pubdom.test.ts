@@ -113,3 +113,20 @@ test('only the names the domain server answers with this node are this node\'s',
     'unclaimed.org', 'failing.org', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
   assert.equal(selfHostnames(null).size, 0);
 });
+
+test('a zone may name this node by its own npub instead of self', () => {
+  const own = 'npub1k3aerhf3f4ed9mrlu2zcusx3yruvzqyeut0kz5we5xd023jfgl0s8wcl6n';
+  const other = 'npub12yu4dny6chzwghtq68ygmkyj7ugz93e403skz3y075mykjsheg7sp0yyzz';
+  const zone = (names: { label: string; target: string }[]) => ({ zones: [{ domain: 'unkn0wn.ch', claim_published_at: 1, last_error: null, names }] });
+  // home's own zone: home -> its own npub, pixel -> another node.
+  const names = selfHostnames(zone([{ label: 'home', target: own }, { label: 'pixel', target: other }]), own);
+  assert.ok(hostMatches('home.unkn0wn.ch', names));
+  assert.ok(!hostMatches('pixel.unkn0wn.ch', names));
+  assert.ok(!hostMatches('home.unkn0wn.ch', selfHostnames(zone([{ label: 'home', target: own }]))), 'without its own npub only "self" counts');
+  // Upper-case bech32 and stray whitespace are the same npub.
+  assert.ok(hostMatches('home.unkn0wn.ch', selfHostnames(zone([{ label: 'home', target: ` ${own.toUpperCase()} ` }]), own)));
+  // "@" and "*" by npub, and an exact label elsewhere still overriding the wildcard.
+  const wild = selfHostnames(zone([{ label: '@', target: own }, { label: '*', target: own }, { label: 'pixel', target: other }]), own);
+  for (const h of ['unkn0wn.ch', 'x.unkn0wn.ch', 'a.b.unkn0wn.ch']) assert.ok(hostMatches(h, wild), h);
+  assert.ok(!hostMatches('pixel.unkn0wn.ch', wild));
+});

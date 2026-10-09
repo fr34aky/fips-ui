@@ -692,7 +692,8 @@ async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
 const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
 // Under a public domain this node serves itself (fips-pub-domains): those names are this node's too.
 mesh.extraHostAllowed = (h) => hostMatches(h, servedHostnames());
-if (!SELFTEST) watchServedHostnames();
+// Zones may name this node by its npub: known from the mesh listener, else from the daemon's last status.
+if (!SELFTEST) watchServedHostnames(() => mesh.status().npub ?? (lastSnapshot?.status as { npub?: string } | undefined)?.npub);
 
 /**
  * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the

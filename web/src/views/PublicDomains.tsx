@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { parseDocument } from 'yaml';
 import type { Health, PubdomAttestation, PubdomCheckDns, PubdomFileText, PubdomPin, PubdomReleases, PubdomResolverStatus, PubdomServerStatus, PubdomSide, PubdomState, PubdomZone, PubdomZones } from '../lib/types';
-import { api, usePoll } from '../lib/api';
+import { api, usePoll, useLive } from '../lib/api';
 import { Card, Chip, ConfirmDialog, Copyable, Empty, ErrorNote, KV, Modal, Segmented, Skeleton, useToast } from '../components/ui';
 import { NpubInline } from '../components/PeerName';
 import { adminApi, withResult, PUBDOM_HELPER_VERSION, PUBDOM_INSTALL_HELPER_VERSION, type HelperInfo, type PubdomInstallResult, type PubdomResult } from '../lib/admin';
@@ -268,6 +268,9 @@ function Server({ can }: { can: Can }) {
 }
 
 function ZoneCard({ z, can, publishing, busy, run, onEdit, onDelete }: { z: PubdomZone; can: Can; publishing: boolean; busy: boolean; run: Run; onEdit: () => void; onDelete: () => void }) {
+  // A name may point at this node by its own npub instead of "self": the server answers both with this node.
+  const own = useLive().snapshot?.status?.npub?.toLowerCase();
+  const isSelf = (t: string) => t === 'self' || (!!own && t.trim().toLowerCase() === own);
   const [dns, setDns] = useState<PubdomCheckDns | null>(null);
   const [atts, setAtts] = useState<PubdomAttestation[] | 'loading' | { error: string } | null>(null);
   const checkDns = async () => { const r = await run(() => adminApi.pubdomAction<PubdomCheckDns>('server', 'check-dns', z.domain), (r) => `DNS: ${r.result.verdict}`); if (r) setDns(r.result); };
@@ -290,7 +293,7 @@ function ZoneCard({ z, can, publishing, busy, run, onEdit, onDelete }: { z: Pubd
         <div>
           <div className="text-xs text-ink-3 mb-1">Names</div>
           <table className="data"><thead><tr><th>Name</th><th>Where</th></tr></thead><tbody>
-            {z.names.map((n) => <tr key={n.label}><td className="mono">{n.label === '*' ? `*.${z.domain}` : n.label === '@' ? z.domain : `${n.label}.${z.domain}`}</td><td>{n.target === 'self' ? <Chip tone="accent" dot={false}>this node</Chip> : n.target === 'legacy' ? <Chip dot={false}>legacy (not over fips)</Chip> : <NpubInline npub={n.target} />}</td></tr>)}
+            {z.names.map((n) => <tr key={n.label}><td className="mono">{n.label === '*' ? `*.${z.domain}` : n.label === '@' ? z.domain : `${n.label}.${z.domain}`}</td><td>{isSelf(n.target) ? <Chip tone="accent" dot={false}>this node</Chip> : n.target === 'legacy' ? <Chip dot={false}>legacy (not over fips)</Chip> : <NpubInline npub={n.target} />}</td></tr>)}
           </tbody></table>
         </div>
         <KV items={[

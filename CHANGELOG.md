@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The dashboard under a public domain: a zone that names this node by its own
+  npub (rather than `self`) counts as this node's name too, so e.g.
+  `home.example.org` with `home: npub1…` (this node) is accepted.
+
 ## [0.12.0] - 2026-10-09
 
 ### Added
