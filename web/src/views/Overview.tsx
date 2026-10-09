@@ -181,5 +181,5 @@ export function Services({ units, health, now }: { units: UnitState[]; health: H
 /** This node's own hosts-file name, when it has one. */
 function OwnName({ npub }: { npub: string }) {
   const name = useHostName(npub);
-  return name ? <><dt>name</dt><dd><Copyable text={`${name}.fips`} display={<b>{name}</b>} mono={false} /></dd></> : null;
+  return name ? <><dt>name</dt><dd><Copyable text={npub} display={<b>{name}</b>} mono={false} /></dd></> : null;
 }
