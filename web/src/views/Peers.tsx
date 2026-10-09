@@ -7,7 +7,7 @@ import { TimeSeries } from '../components/TimeSeries';
 import { fmtBytes, fmtBits, fmtMs, fmtPct, fmtAgo, shortKey, fmtDuration } from '../lib/format';
 import { api, usePoll } from '../lib/api';
 import { HostNameLink } from '../components/PeerName';
-import { realName } from '../lib/names';
+import { useHostName } from '../lib/names';
 
 export function Peers({ snap, health, onProbe, selected, onSelect }: { snap: Snapshot; health: Health | null; onProbe: (npub: string) => void; selected: string | null; onSelect: (npub: string | null) => void }) {
   const peers = snap.peers?.peers ?? [];
@@ -80,6 +80,8 @@ function Role({ p }: { p: Peer }) {
 }
 
 function PeerDetail({ peer: p, snap, health, onClose, onProbe }: { peer: Peer; snap: Snapshot; health: Health | null; onClose: () => void; onProbe: (npub: string) => void }) {
+  // The name the .fips resolver knows: the hosts file's (the daemon's own label for a peer does not resolve).
+  const dnsHost = useHostName(p.npub);
   const toast = useToast();
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -131,7 +133,7 @@ function PeerDetail({ peer: p, snap, health, onClose, onProbe }: { peer: Peer; s
       </Section>
 
       <Section title="Identity">
-        <KV items={[['Name', <HostNameLink npub={p.npub} readOnly={!!health?.readOnly} />], ['npub', <Copyable text={p.npub} display={shortKey(p.npub, 16, 8)} />], ['node addr', <Copyable text={p.node_addr} />], ['IPv6', <Copyable text={p.ipv6_addr} />], ['DNS', <Copyable text={`${realName(p.display_name) || p.npub}.fips`} />]]} />
+        <KV items={[['Name', <HostNameLink npub={p.npub} readOnly={!!health?.readOnly} />], ['npub', <Copyable text={p.npub} display={shortKey(p.npub, 16, 8)} />], ['node addr', <Copyable text={p.node_addr} />], ['IPv6', <Copyable text={p.ipv6_addr} />], ['DNS', <Copyable text={`${dnsHost ?? p.npub}.fips`} />]]} />
       </Section>
 
       <Section title="Link">

@@ -44,20 +44,30 @@ export function StatusChip({ value, label }: { value: string | null | undefined;
  * still works from a click. As a last resort the value is shown to copy by hand.
  */
 export async function copyText(text: string): Promise<boolean> {
+  // With the Clipboard API a refusal is the user's (a denied permission): no fallback, no prompt.
   if (window.isSecureContext && navigator.clipboard) {
-    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back below */ }
+    try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
   }
+  // Synchronous from here, still within the click: the copy command needs the user's gesture.
   const active = document.activeElement as HTMLElement | null;
   const ta = document.createElement('textarea');
   ta.value = text;
-  ta.setAttribute('readonly', '');
-  Object.assign(ta.style, { position: 'fixed', top: '0', left: '0', width: '1px', height: '1px', opacity: '0' });
+  // Editable and selected through a Range as well: iOS Safari selects nothing in a readonly textarea. 16px keeps
+  // it from zooming in on focus.
+  ta.contentEditable = 'true';
+  Object.assign(ta.style, { position: 'fixed', top: '0', left: '0', width: '1px', height: '1px', opacity: '0', fontSize: '16px' });
   document.body.appendChild(ta);
+  const range = document.createRange();
+  range.selectNodeContents(ta);
+  const sel = window.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
   ta.select();
   ta.setSelectionRange(0, text.length);
   let ok = false;
   try { ok = document.execCommand('copy'); } catch { /* not supported */ }
   ta.remove();
+  sel?.removeAllRanges();
   active?.focus?.();
   if (!ok) window.prompt('Copy this value:', text);
   return ok;
