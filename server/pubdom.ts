@@ -250,10 +250,20 @@ export function hostMatches(hostname: string, names: ServedNames): boolean {
 
 const NO_NAMES: ServedNames = new Map();
 let served: ServedNames = NO_NAMES;
+let lastAnswer: ZonesAnswer | null = null;
+let servedFor: string | undefined;
 let refreshSeq = 0;
+let ownOf: () => string | undefined = () => undefined;
 
-/** The names this node serves right now (kept current by watchServedHostnames). */
-export function servedHostnames(): ServedNames { return served; }
+/**
+ * The names this node serves right now (kept current by watchServedHostnames). Rebuilt from the last answer as soon
+ * as this node's npub is known (the mesh listener learns it after start), so names given by npub count at once.
+ */
+export function servedHostnames(): ServedNames {
+  const own = ownOf();
+  if (lastAnswer && own !== servedFor) { servedFor = own; served = selfHostnames(lastAnswer, own); }
+  return served;
+}
 
 /**
  * Keep the served names current: read the zones at once and every 15 s. A query that fails keeps the names of
@@ -261,10 +271,11 @@ export function servedHostnames(): ServedNames { return served; }
  * that arrive out of order are dropped.
  */
 export function watchServedHostnames(ownNpub: () => string | undefined, intervalMs = 15_000): void {
+  ownOf = ownNpub;
   const refresh = () => {
-    if (!detect().server.running) { served = NO_NAMES; return; }
+    if (!detect().server.running) { served = NO_NAMES; lastAnswer = null; return; }
     const seq = ++refreshSeq;
-    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) served = selfHostnames(z, ownNpub()); }, () => { /* keep the last answer */ });
+    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) { lastAnswer = z; servedFor = ownNpub(); served = selfHostnames(z, servedFor); } }, () => { /* keep the last answer */ });
   };
   refresh();
   setInterval(refresh, intervalMs).unref();

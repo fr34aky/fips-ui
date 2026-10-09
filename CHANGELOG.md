@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Right after fips-ui starts, a public domain whose zone names this node by its
+  npub is accepted as soon as fips-ui knows its own npub, not up to 15 seconds
+  later.
+
+### Fixed
+
 - The dashboard under a public domain: a zone that names this node by its own
   npub (rather than `self`) counts as this node's name too, so e.g.
   `home.example.org` with `home: npub1…` (this node) is accepted.
