@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.12.1] - 2026-10-09
-
 ### Fixed
 
 - Right after fips-ui starts, a public domain whose zone names this node by its
   npub is accepted as soon as fips-ui knows its own npub, not up to 15 seconds
   later.
+
+## [0.12.1] - 2026-10-09
 
 ### Fixed
 
