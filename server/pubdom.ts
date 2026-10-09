@@ -191,3 +191,75 @@ export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string
     throw e;
   }
 }
+
+// ---- Names this node serves (fips-ui reached under a public domain) -------------------------------------------
+// A browser that reaches this dashboard under a public domain sends that name as Host. Only the names this node's
+// own domain server answers with this node (target "self") may be accepted, and only for zones whose claim is
+// published without an error: a visitor's fips-pubdomd binds a domain to a node only when that node published a
+// valid claim, so nobody else can point such a name here (the same reason any <name>.fips is safe). A name the zone
+// gives to another node, or leaves to ordinary DNS ("legacy"), is not ours, even with a "*" entry.
+
+/** The domain server's `zones` answer, as far as fips-ui reads it (web/src/lib/types.ts PubdomZone has all of it). */
+export interface ZonesAnswer { zones?: { domain?: string; names?: { label?: string; target?: string }[]; claim_published_at?: number | null; last_error?: string | null }[] }
+/** Per served domain (claim published, no error): what each label answers, and what `*` answers. */
+export type ServedNames = Map<string, { labels: Map<string, string>; wildcard: string | null }>;
+
+// Zone labels are single hostname labels ("@", "www", "*"), as fips-pub-domains validates them.
+const ZONE_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** The served zones from a `zones` answer, keyed by domain. */
+export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNames {
+  const out: ServedNames = new Map();
+  for (const z of answer?.zones ?? []) {
+    const domain = String(z.domain ?? '').toLowerCase().replace(/\.$/, '');
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
+    // An unpublished or failing claim: visitors do not bind the domain to this node, ordinary DNS answers instead.
+    if (!z.claim_published_at || z.last_error) continue;
+    const labels = new Map<string, string>(); let wildcard: string | null = null;
+    for (const n of z.names ?? []) {
+      const label = String(n?.label ?? '').toLowerCase(), target = String(n?.target ?? '');
+      if (label === '*') wildcard = target;
+      else if (label === '@' || ZONE_LABEL_RE.test(label)) labels.set(label, target);
+    }
+    out.set(domain, { labels, wildcard });
+  }
+  return out;
+}
+
+/**
+ * Whether the domain server answers `hostname` with this node, by its own lookup rule: the part before the domain
+ * ("@" for the domain itself) matches a label exactly, or else the `*` entry decides (at any depth, and for the
+ * domain itself when there is no "@").
+ */
+export function hostMatches(hostname: string, names: ServedNames): boolean {
+  const h = hostname.toLowerCase().replace(/\.$/, '');
+  let best: string | null = null;
+  for (const d of names.keys()) if ((h === d || h.endsWith(`.${d}`)) && (!best || d.length > best.length)) best = d;
+  if (!best) return false;
+  const zone = names.get(best)!;
+  const part = h === best ? '@' : h.slice(0, -(best.length + 1));
+  const target = zone.labels.has(part) ? zone.labels.get(part) : zone.wildcard;
+  return target === 'self';
+}
+
+const NO_NAMES: ServedNames = new Map();
+let served: ServedNames = NO_NAMES;
+let refreshSeq = 0;
+
+/** The names this node serves right now (kept current by watchServedHostnames). */
+export function servedHostnames(): ServedNames { return served; }
+
+/**
+ * Keep the served names current: read the zones at once and every 15 s. A query that fails keeps the names of
+ * the last answer (a busy server must not lock visitors out mid-session); a stopped server serves none. Answers
+ * that arrive out of order are dropped.
+ */
+export function watchServedHostnames(intervalMs = 15_000): void {
+  const refresh = () => {
+    if (!detect().server.running) { served = NO_NAMES; return; }
+    const seq = ++refreshSeq;
+    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) served = selfHostnames(z); }, () => { /* keep the last answer */ });
+  };
+  refresh();
+  setInterval(refresh, intervalMs).unref();
+}

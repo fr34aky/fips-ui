@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, binaryVersion, isSide, latestRelease, liveZonesDir, parseUnitShow, parseVersionLine, readEditable, zoneFileWithin } from '../server/pubdom.ts';
+import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, binaryVersion, isSide, latestRelease, liveZonesDir, parseUnitShow, parseVersionLine, readEditable, zoneFileWithin, selfHostnames, hostMatches } from '../server/pubdom.ts';
 
 const paths = {
   resolver: { socket: '/run/r.sock', files: ['/etc/r.yaml', '/var/r.json'] },
@@ -95,4 +95,21 @@ test('the newest release is read from GitHub and an error keeps the last answer'
   assert.equal(failed.latest?.version, '0.2.8');
   const odd = await latestRelease(true, async () => ({ tag_name: 'nightly' }));
   assert.match(odd.error ?? '', /unexpected release tag/);
+});
+
+test('only the names the domain server answers with this node are this node\'s', () => {
+  const other = 'npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98';
+  const published = { claim_published_at: 1, last_error: null };
+  const names = selfHostnames({ zones: [
+    { domain: 'Example.org.', ...published, names: [{ label: '@', target: 'self' }, { label: 'www', target: 'self' }, { label: 'shop', target: other }, { label: 'old', target: 'legacy' }] },
+    // "*" covers every depth and the domain itself; an exception covers exactly its own label.
+    { domain: 'apps.example.net', ...published, names: [{ label: '*', target: 'self' }, { label: 'blog', target: 'legacy' }, { label: 'shop', target: other }] },
+    { domain: 'unclaimed.org', claim_published_at: null, names: [{ label: '@', target: 'self' }] },
+    { domain: 'failing.org', claim_published_at: 1, last_error: 'relay refused', names: [{ label: '@', target: 'self' }] },
+    { domain: 'bad domain', ...published, names: [{ label: '@', target: 'self' }] },
+  ] });
+  for (const h of ['example.org', 'www.example.org', 'WWW.Example.org.', 'apps.example.net', 'ui.apps.example.net', 'a.b.apps.example.net', 'x.blog.apps.example.net']) assert.ok(hostMatches(h, names), h);
+  for (const h of ['shop.example.org', 'old.example.org', 'x.www.example.org', 'blog.apps.example.net', 'shop.apps.example.net',
+    'unclaimed.org', 'failing.org', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
+  assert.equal(selfHostnames(null).size, 0);
 });

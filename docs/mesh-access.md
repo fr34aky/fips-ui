@@ -78,6 +78,12 @@ Managed on **Access → Web UI over the mesh** (admins only) and stored in
 
 Browsers may address the mesh listener by this node's fips0 address or any `<name>.fips` name, including a
 name from the visitor's own hosts file (`.fips` names are resolved by the visitor's FIPS daemon, never by
-public DNS, so they cannot be rebound to this node). Other `Host` values, such as a bare name without `.fips`,
-are refused, and the browser shows the reason; cross-origin writes need the request's exact `Origin`. Someone who is not on the list gets a page that tells
+public DNS, so they cannot be rebound to this node). It also accepts the public domain names this node serves
+itself with fips-pub-domains: the names its domain server answers with this node (target `self`: the domain,
+a label, or what a `*` entry covers, by the server's own lookup rule), for zones whose claim is published without
+an error, read from the
+server's zones every 15 seconds. A visitor's resolver binds
+such a name to a node only when that node published the claim, so they cannot be pointed here by anyone else;
+names in the zones that point to other nodes are not accepted ([public-domains.md](public-domains.md#reaching-this-dashboard-under-a-public-domain)).
+Other `Host` values, such as a bare name without `.fips`, are refused, and the browser shows the reason; cross-origin writes need the request's exact `Origin`. Someone who is not on the list gets a page that tells
 them their own npub, so they can send it to you.
