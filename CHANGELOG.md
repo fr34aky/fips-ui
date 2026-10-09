@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Copy buttons work when the dashboard is opened over the mesh: plain http on a
+  fips0 address has no Clipboard API, so they fall back to the copy command (and
+  show the value to copy by hand if that fails too). They are always visible on
+  touch screens.
+- The copy button next to a hosts-file name copies the npub behind it, not the
+  name; the Peers page's DNS row no longer builds a name from the daemon's
+  shortened peer label (`npub1ab...cdef.fips`).
 - On NixOS the helper refuses to install or update fips-pub-domains with a clear
   message, instead of failing on the read-only system paths.
 

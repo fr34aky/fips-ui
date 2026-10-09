@@ -40,7 +40,8 @@ export function HostNameLink({ npub, readOnly }: { npub: string; readOnly?: bool
   const host = useHostName(npub);
   return (
     <span className="inline-flex items-center gap-2">
-      {host ? <Copyable text={`${host}.fips`} display={<b>{host}</b>} mono={false} /> : <span className="text-ink-3">none</span>}
+      {/* The copy button copies the npub, the identity behind the name. */}
+      {host ? <Copyable text={npub} display={<b>{host}</b>} mono={false} /> : <span className="text-ink-3">none</span>}
       {!readOnly && <a className="text-xs text-ink-3 hover:text-ink" href={`#/access?name=${encodeURIComponent(npub)}`}>{host ? 'change…' : 'add a name…'}</a>}
     </span>
   );
