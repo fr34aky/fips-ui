@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
-import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames, watchServedHostnames } from './pubdom.ts';
+import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames, setServedOwnNpub, watchServedHostnames } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -692,8 +692,9 @@ async function denyMesh(req: Req, res: Res, reason?: string): Promise<void> {
 const mesh = new MeshAccess((req, res) => { handle(req, res, 'mesh').catch((e) => errToResponse(res, e)); });
 // Under a public domain this node serves itself (fips-pub-domains): those names are this node's too.
 mesh.extraHostAllowed = (h) => hostMatches(h, servedHostnames());
-// Zones may name this node by its npub: known from the mesh listener, else from the daemon's last status.
-if (!SELFTEST) watchServedHostnames(() => mesh.status().npub ?? (lastSnapshot?.status as { npub?: string } | undefined)?.npub);
+// Zones may name this node by its npub, which the mesh listener reports as soon as it knows it.
+mesh.onOwnNpub = (npub) => setServedOwnNpub(npub);
+if (!SELFTEST) watchServedHostnames();
 
 /**
  * Bring the kernel guard and the managed firewall rule in line with the access list. Runs outside the

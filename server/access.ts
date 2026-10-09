@@ -255,6 +255,8 @@ export class MeshAccess {
 
   /** Further names of this node (the public domains it serves, server/pubdom.ts), set by server/index.ts. */
   extraHostAllowed: (hostname: string) => boolean = () => false;
+  /** Told whenever this node's npub becomes known or changes (server/index.ts passes it to server/pubdom.ts). */
+  onOwnNpub: (npub: string) => void = () => {};
 
   /** Names a browser may use for this node over the mesh: its fips0 address, any <name>.fips, or extraHostAllowed's. */
   hostAllowed(hostname: string | null): boolean {
@@ -339,7 +341,9 @@ export class MeshAccess {
     try {
       const st = await query<{ ipv6_addr?: string; npub?: string; tun_name?: string }>('show_status', undefined, { timeoutMs: 3000 });
       if (st.ipv6_addr && st.npub) {
+        const changed = this.own?.npub !== st.npub;
         this.own = { address: st.ipv6_addr, npub: st.npub };
+        if (changed) this.onOwnNpub(st.npub);
       }
       if (st.tun_name && st.tun_name !== this.tun) {
         this.tun = st.tun_name;
