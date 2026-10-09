@@ -38,16 +38,42 @@ export function StatusChip({ value, label }: { value: string | null | undefined;
   return <Chip tone={toneFor(value)}>{label ?? (value ?? 'unknown').replace(/_/g, ' ')}</Chip>;
 }
 
+/**
+ * Copy text to the clipboard. The Clipboard API exists only in secure contexts (HTTPS, or localhost), and the
+ * dashboard over the mesh is plain http on a fips0 address: there the copy command on a selected, hidden textarea
+ * still works from a click. As a last resort the value is shown to copy by hand.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  if (window.isSecureContext && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back below */ }
+  }
+  const active = document.activeElement as HTMLElement | null;
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  Object.assign(ta.style, { position: 'fixed', top: '0', left: '0', width: '1px', height: '1px', opacity: '0' });
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { /* not supported */ }
+  ta.remove();
+  active?.focus?.();
+  if (!ok) window.prompt('Copy this value:', text);
+  return ok;
+}
+
 export function Copyable({ text, display, className = '', mono = true }: { text: string; display?: ReactNode; className?: string; mono?: boolean }) {
   const [ok, setOk] = useState(false);
   const copy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    try { await navigator.clipboard.writeText(text); setOk(true); setTimeout(() => setOk(false), 1200); } catch { /* ignore */ }
+    if (await copyText(text)) { setOk(true); setTimeout(() => setOk(false), 1200); }
   };
   return (
     <span className={`inline-flex items-center gap-1.5 min-w-0 group ${className}`} title={text}>
       <span className={`truncate ${mono ? 'mono' : ''}`}>{display ?? text}</span>
-      <button onClick={copy} className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-ink-3 hover:text-ink transition-opacity shrink-0" aria-label="Copy">
+      {/* Shown on hover, and always on touch screens, which have no hover. */}
+      <button onClick={copy} className="opacity-0 group-hover:opacity-100 focus:opacity-100 [@media(hover:none)]:opacity-100 text-ink-3 hover:text-ink transition-opacity shrink-0" aria-label="Copy" title="Copy">
         {ok ? <Check size={13} className="text-good" /> : <Copy size={13} />}
       </button>
     </span>

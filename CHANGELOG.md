@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Copy buttons work when the dashboard is opened over the mesh: plain http on a
+  fips0 address has no Clipboard API, so they fall back to the copy command (and
+  show the value to copy by hand if that fails too). They are always visible on
+  touch screens.
+
 - On NixOS the helper refuses to install or update fips-pub-domains with a clear
   message, instead of failing on the read-only system paths.
 
