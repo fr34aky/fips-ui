@@ -98,12 +98,18 @@ test('the newest release is read from GitHub and an error keeps the last answer'
 });
 
 test('only the names a zone points at this node are this node\'s', () => {
+  const other = 'npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98';
+  const published = { claim_published_at: 1, last_error: null };
   const names = selfHostnames({ zones: [
-    { domain: 'Example.org.', names: [{ label: '@', target: 'self' }, { label: 'www', target: 'self' }, { label: 'shop', target: 'npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98' }, { label: 'old', target: 'legacy' }] },
-    { domain: 'apps.example.net', names: [{ label: '*', target: 'self' }] },
-    { domain: 'bad domain', names: [{ label: '@', target: 'self' }] },
+    { domain: 'Example.org.', ...published, names: [{ label: '@', target: 'self' }, { label: 'www', target: 'self' }, { label: 'shop', target: other }, { label: 'old', target: 'legacy' }] },
+    { domain: 'apps.example.net', ...published, names: [{ label: '*', target: 'self' }, { label: 'blog', target: 'legacy' }, { label: 'shop', target: other }] },
+    { domain: 'example.com', ...published, names: [{ label: '*.dev', target: 'self' }] },
+    { domain: 'unclaimed.org', claim_published_at: null, names: [{ label: '@', target: 'self' }] },
+    { domain: 'failing.org', claim_published_at: 1, last_error: 'relay refused', names: [{ label: '@', target: 'self' }] },
+    { domain: 'bad domain', ...published, names: [{ label: '@', target: 'self' }] },
   ] });
-  for (const h of ['example.org', 'www.example.org', 'WWW.Example.org.', 'ui.apps.example.net', 'a.b.apps.example.net']) assert.ok(hostMatches(h, names), h);
-  for (const h of ['shop.example.org', 'old.example.org', 'apps.example.net', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
+  for (const h of ['example.org', 'www.example.org', 'WWW.Example.org.', 'ui.apps.example.net', 'a.b.apps.example.net', 'x.dev.example.com']) assert.ok(hostMatches(h, names), h);
+  for (const h of ['shop.example.org', 'old.example.org', 'apps.example.net', 'blog.apps.example.net', 'shop.apps.example.net', 'x.shop.apps.example.net',
+    'dev.example.com', 'example.com', 'unclaimed.org', 'failing.org', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
   assert.equal(selfHostnames(null).exact.size, 0);
 });

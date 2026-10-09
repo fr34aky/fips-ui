@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The dashboard under a public domain**: over the mesh fips-ui accepts as
   `Host` the public domain names this node's own fips-pub-domains server answers
-  with this node (target `self`, including `*` entries), so `ui.example.org`
-  works like `<name>.fips`. Names pointing to other nodes stay refused.
+  with this node (target `self`, including `*` entries) for zones whose claim is
+  published, so `ui.example.org` works like `<name>.fips`. Names pointing to
+  other nodes or left to ordinary DNS stay refused, also under a wildcard.
 
 ### Fixed
 

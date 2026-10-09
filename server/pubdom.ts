@@ -194,46 +194,66 @@ export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string
 
 // ---- Names this node serves (fips-ui reached under a public domain) -------------------------------------------
 // A browser that reaches this dashboard under a public domain sends that name as Host. Only the names this node's
-// own domain server answers with this node (target "self") may be accepted: the visitor's fips-pubdomd resolves a
-// domain to a node only when that node published the claim, so nobody else can point one of them here (the same
-// reason any <name>.fips is safe). Names in the zones that point to other nodes are not ours.
+// own domain server answers with this node (target "self") may be accepted, and only for zones whose claim is
+// published without an error: a visitor's fips-pubdomd binds a domain to a node only when that node published a
+// valid claim, so nobody else can point such a name here (the same reason any <name>.fips is safe). Names a zone
+// points to other nodes, or leaves to ordinary DNS ("legacy"), are not ours, also under a "*" entry.
 
-interface ZoneName { label: string; target: string }
-/** Hostnames from a `zones` answer that resolve to this node: exact names, and the domains of `*` entries. */
-export function selfHostnames(zones: { zones?: { domain?: string; names?: ZoneName[] }[] } | null | undefined): { exact: Set<string>; wildcard: Set<string> } {
-  const exact = new Set<string>(), wildcard = new Set<string>();
-  for (const z of zones?.zones ?? []) {
+/** The domain server's `zones` answer, as far as fips-ui reads it (web/src/lib/types.ts PubdomZone has all of it). */
+export interface ZonesAnswer { zones?: { domain?: string; names?: { label?: string; target?: string }[]; claim_published_at?: number | null; last_error?: string | null }[] }
+export interface ServedNames { exact: Set<string>; wildcard: Set<string>; excluded: Set<string> }
+
+const HOST_LABELS_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/;
+
+/** Hostnames from a `zones` answer that resolve to this node: exact names, wildcard domains, and the exceptions. */
+export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNames {
+  const exact = new Set<string>(), wildcard = new Set<string>(), excluded = new Set<string>();
+  for (const z of answer?.zones ?? []) {
     const domain = String(z.domain ?? '').toLowerCase().replace(/\.$/, '');
     if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
+    // An unpublished or failing claim: visitors do not bind the domain to this node, ordinary DNS answers instead.
+    const claimed = !!z.claim_published_at && !z.last_error;
     for (const n of z.names ?? []) {
-      if (n?.target !== 'self') continue;
-      const label = String(n.label ?? '').toLowerCase();
-      if (label === '@') exact.add(domain);
-      else if (label === '*') wildcard.add(domain);
-      else if (/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(label)) exact.add(`${label}.${domain}`);
+      const label = String(n?.label ?? '').toLowerCase();
+      // "@", "www", "a.b", "*" and "*.apps" (everything under apps.<domain>).
+      const wild = label === '*' || label.startsWith('*.');
+      const rest = label === '@' || label === '*' ? '' : wild ? label.slice(2) : label;
+      if (rest && !HOST_LABELS_RE.test(rest)) continue;
+      const name = rest ? `${rest}.${domain}` : domain;
+      if (n?.target === 'self' && claimed) (wild ? wildcard : exact).add(name);
+      else if (!wild) excluded.add(name);
     }
   }
-  return { exact, wildcard };
+  return { exact, wildcard, excluded };
 }
 
-export function hostMatches(hostname: string, names: { exact: Set<string>; wildcard: Set<string> }): boolean {
+export function hostMatches(hostname: string, names: ServedNames): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
   if (names.exact.has(h)) return true;
+  // A name the zone gives to another node (or to ordinary DNS) is not covered by a wildcard, nor are names under it.
+  for (const x of names.excluded) if (h === x || h.endsWith(`.${x}`)) return false;
   for (const d of names.wildcard) if (h.endsWith(`.${d}`)) return true;
   return false;
 }
 
-let served: { exact: Set<string>; wildcard: Set<string> } = { exact: new Set(), wildcard: new Set() };
-let servedAt = 0;
+const NO_NAMES: ServedNames = { exact: new Set(), wildcard: new Set(), excluded: new Set() };
+let served: ServedNames = NO_NAMES;
+let refreshSeq = 0;
+
+/** The names this node serves right now (kept current by watchServedHostnames). */
+export function servedHostnames(): ServedNames { return served; }
+
 /**
- * The names this node serves, refreshed from the domain server at most every 30 s (in the background: a request
- * is never delayed by the socket). Without a server, or while it does not answer, none are served.
+ * Keep the served names current: read the zones at once and every 15 s. A query that fails keeps the names of
+ * the last answer (a busy server must not lock visitors out mid-session); a stopped server serves none. Answers
+ * that arrive out of order are dropped.
  */
-export function servedHostnames(now = Date.now()): { exact: Set<string>; wildcard: Set<string> } {
-  if (now - servedAt > 30_000) {
-    servedAt = now;
-    if (!detect().server.running) served = { exact: new Set(), wildcard: new Set() };
-    else void pubdomQuery<{ zones?: { domain?: string; names?: ZoneName[] }[] }>('server', 'zones').then((z) => { served = selfHostnames(z); }, () => { served = { exact: new Set(), wildcard: new Set() }; });
-  }
-  return served;
+export function watchServedHostnames(intervalMs = 15_000): void {
+  const refresh = () => {
+    if (!detect().server.running) { served = NO_NAMES; return; }
+    const seq = ++refreshSeq;
+    void pubdomQuery<ZonesAnswer>('server', 'zones').then((z) => { if (seq === refreshSeq) served = selfHostnames(z); }, () => { /* keep the last answer */ });
+  };
+  refresh();
+  setInterval(refresh, intervalMs).unref();
 }

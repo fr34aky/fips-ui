@@ -253,9 +253,13 @@ export class MeshAccess {
     }
   }
 
-  /** Names a browser may use for this node over the mesh: its fips0 address or any <name>.fips. */
+  /** Further names of this node (the public domains it serves, server/pubdom.ts), set by server/index.ts. */
+  extraHostAllowed: (hostname: string) => boolean = () => false;
+
+  /** Names a browser may use for this node over the mesh: its fips0 address, any <name>.fips, or extraHostAllowed's. */
   hostAllowed(hostname: string | null): boolean {
     if (!hostname || !this.own) return false;
+    if (this.extraHostAllowed(hostname)) return true;
     // Any <name>.fips: the visitor may call this node by a name from their own hosts file. Such names are resolved
     // by the visitor's FIPS daemon from npubs or its own hosts file, never by public DNS, so a web page elsewhere
     // cannot rebind one to this node; cross-origin writes still need the exact Origin.
