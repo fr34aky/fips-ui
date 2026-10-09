@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, binaryVersion, isSide, latestRelease, liveZonesDir, parseUnitShow, parseVersionLine, readEditable, zoneFileWithin } from '../server/pubdom.ts';
+import { detect, READ_COMMANDS, WRITE_COMMANDS, DOMAIN_RE, ZONE_FILE_RE, PubdomStateError, binaryVersion, isSide, latestRelease, liveZonesDir, parseUnitShow, parseVersionLine, readEditable, zoneFileWithin, selfHostnames, hostMatches } from '../server/pubdom.ts';
 
 const paths = {
   resolver: { socket: '/run/r.sock', files: ['/etc/r.yaml', '/var/r.json'] },
@@ -95,4 +95,15 @@ test('the newest release is read from GitHub and an error keeps the last answer'
   assert.equal(failed.latest?.version, '0.2.8');
   const odd = await latestRelease(true, async () => ({ tag_name: 'nightly' }));
   assert.match(odd.error ?? '', /unexpected release tag/);
+});
+
+test('only the names a zone points at this node are this node\'s', () => {
+  const names = selfHostnames({ zones: [
+    { domain: 'Example.org.', names: [{ label: '@', target: 'self' }, { label: 'www', target: 'self' }, { label: 'shop', target: 'npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98' }, { label: 'old', target: 'legacy' }] },
+    { domain: 'apps.example.net', names: [{ label: '*', target: 'self' }] },
+    { domain: 'bad domain', names: [{ label: '@', target: 'self' }] },
+  ] });
+  for (const h of ['example.org', 'www.example.org', 'WWW.Example.org.', 'ui.apps.example.net', 'a.b.apps.example.net']) assert.ok(hostMatches(h, names), h);
+  for (const h of ['shop.example.org', 'old.example.org', 'apps.example.net', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
+  assert.equal(selfHostnames(null).exact.size, 0);
 });

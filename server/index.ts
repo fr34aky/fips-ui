@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
-import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile } from './pubdom.ts';
+import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
@@ -81,8 +81,9 @@ function hostnameOf(value: string | undefined, isUrl = false): string | null {
  * be JSON, which HTML forms cannot produce and cross-origin fetches cannot send without a CORS preflight.
  */
 function browserChecks(req: Req, method: string, via: 'local' | 'mesh'): string | null {
-  // On the mesh listener the names are this node's fips0 address and .fips names; locally the configured set.
-  const hostOk = (h: string | null) => (via === 'mesh' ? mesh.hostAllowed(h) : !!h && ALLOWED_HOSTS.has(h));
+  // On the mesh listener the names are this node's fips0 address, .fips names and the public domains it serves
+  // itself (server/pubdom.ts servedHostnames); locally the configured set.
+  const hostOk = (h: string | null) => (via === 'mesh' ? mesh.hostAllowed(h) || (!!h && hostMatches(h, servedHostnames())) : !!h && ALLOWED_HOSTS.has(h));
   if (via === 'mesh' || HOST_CHECK) {
     const host = hostnameOf(req.headers.host);
     if (!hostOk(host)) return `host '${req.headers.host ?? ''}' is not allowed${via === 'local' ? ' (set FIPS_UI_ALLOWED_HOSTS)' : ''}`;
