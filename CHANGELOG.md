@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-09
+
 ### Added
 
 - **The dashboard under a public domain**: over the mesh fips-ui accepts as
@@ -580,7 +582,8 @@ Initial release, developed and verified against FIPS `0.6.0-dev`.
   verifies health. Optional bearer-token auth (`FIPS_UI_TOKEN`) and
   read-only mode (`FIPS_UI_READ_ONLY=1`).
 
-[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/fr34aky/fips-ui/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/fr34aky/fips-ui/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/fr34aky/fips-ui/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/fr34aky/fips-ui/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/fr34aky/fips-ui/compare/v0.9.0...v0.10.0
