@@ -229,9 +229,9 @@ export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNam
 /**
  * Whether the domain server answers `hostname` with this node, by its own lookup rule: the part before the domain
  * ("@" for the domain itself) matches a label exactly, or else the `*` entry decides (at any depth, and for the
- * domain itself when there is no "@").
+ * domain itself when there is no "@"). This node is the target "self", or its own npub written out.
  */
-export function hostMatches(hostname: string, names: ServedNames): boolean {
+export function hostMatches(hostname: string, names: ServedNames, ownNpub?: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
   let best: string | null = null;
   for (const d of names.keys()) if ((h === d || h.endsWith(`.${d}`)) && (!best || d.length > best.length)) best = d;
@@ -239,7 +239,7 @@ export function hostMatches(hostname: string, names: ServedNames): boolean {
   const zone = names.get(best)!;
   const part = h === best ? '@' : h.slice(0, -(best.length + 1));
   const target = zone.labels.has(part) ? zone.labels.get(part) : zone.wildcard;
-  return target === 'self';
+  return target === 'self' || (!!ownNpub && target === ownNpub);
 }
 
 const NO_NAMES: ServedNames = new Map();

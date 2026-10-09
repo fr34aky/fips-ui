@@ -113,3 +113,14 @@ test('only the names the domain server answers with this node are this node\'s',
     'unclaimed.org', 'failing.org', 'evil.com', 'example.org.evil.com', 'xapps.example.net']) assert.ok(!hostMatches(h, names), h);
   assert.equal(selfHostnames(null).size, 0);
 });
+
+test('a zone may name this node by its own npub instead of self', () => {
+  const own = 'npub1k3aerhf3f4ed9mrlu2zcusx3yruvzqyeut0kz5we5xd023jfgl0s8wcl6n';
+  const other = 'npub12yu4dny6chzwghtq68ygmkyj7ugz93e403skz3y075mykjsheg7sp0yyzz';
+  const names = selfHostnames({ zones: [{ domain: 'unkn0wn.ch', claim_published_at: 1, last_error: null, names: [{ label: 'home', target: own }, { label: 'pixel', target: other }] }] });
+  assert.ok(hostMatches('home.unkn0wn.ch', names, own));
+  assert.ok(!hostMatches('pixel.unkn0wn.ch', names, own));
+  assert.ok(!hostMatches('home.unkn0wn.ch', names), 'without knowing its own npub only "self" counts');
+  assert.ok(!hostMatches('home.unkn0wn.ch', names, other));
+});
+
