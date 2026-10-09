@@ -84,11 +84,12 @@ Over the mesh the page is subject to the same access list as the rest of the das
 
 A node that serves a domain can be reached under it over fips, the dashboard included: with Web UI over the mesh
 enabled, `http://ui.example.org:8321` works from any node whose resolver knows the domain, for the npubs on the
-access list. fips-ui accepts as `Host` exactly the names its own domain server answers with this node (target
-`self`: `@`, a label, anything under `*` or under `*.<label>`), and only for zones whose claim is published without
-an error: until then visitors' resolvers do not bind the domain to this node, and ordinary DNS answers for it.
-Names a zone points to another node or leaves to ordinary DNS (`legacy`) stay refused, also under a `*` entry,
-together with everything below them. fips-ui cannot check the domain's DNS record itself: the zone card's
+access list. fips-ui accepts as `Host` exactly the names its own domain server answers with this node, by the
+server's own rule: the part before the domain (`@` for the domain itself) matches a label exactly, or else the `*`
+entry decides (at any depth, and for the domain itself without an `@`). So with `*: self` and `blog: legacy`,
+`blog.example.org` is refused and `x.blog.example.org` accepted, as the server answers them. Only zones whose
+claim is published without an error count: until then visitors' resolvers do not bind the domain to this node,
+and ordinary DNS answers for it. fips-ui cannot check the domain's DNS record itself: the zone card's
 **Check DNS** does that. The list is read when fips-ui starts and every 15 seconds; a query that fails keeps the
 last answer, and without a running domain server none are accepted. The dashboard listens on its own port (8321 by
 default), not on 80.

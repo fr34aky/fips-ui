@@ -196,47 +196,53 @@ export async function pubdomQuery<T = unknown>(side: PubdomSide, command: string
 // A browser that reaches this dashboard under a public domain sends that name as Host. Only the names this node's
 // own domain server answers with this node (target "self") may be accepted, and only for zones whose claim is
 // published without an error: a visitor's fips-pubdomd binds a domain to a node only when that node published a
-// valid claim, so nobody else can point such a name here (the same reason any <name>.fips is safe). Names a zone
-// points to other nodes, or leaves to ordinary DNS ("legacy"), are not ours, also under a "*" entry.
+// valid claim, so nobody else can point such a name here (the same reason any <name>.fips is safe). A name the zone
+// gives to another node, or leaves to ordinary DNS ("legacy"), is not ours, even with a "*" entry.
 
 /** The domain server's `zones` answer, as far as fips-ui reads it (web/src/lib/types.ts PubdomZone has all of it). */
 export interface ZonesAnswer { zones?: { domain?: string; names?: { label?: string; target?: string }[]; claim_published_at?: number | null; last_error?: string | null }[] }
-export interface ServedNames { exact: Set<string>; wildcard: Set<string>; excluded: Set<string> }
+/** Per served domain (claim published, no error): what each label answers, and what `*` answers. */
+export type ServedNames = Map<string, { labels: Map<string, string>; wildcard: string | null }>;
 
-const HOST_LABELS_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/;
+// Zone labels are single hostname labels ("@", "www", "*"), as fips-pub-domains validates them.
+const ZONE_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
-/** Hostnames from a `zones` answer that resolve to this node: exact names, wildcard domains, and the exceptions. */
+/** The served zones from a `zones` answer, keyed by domain. */
 export function selfHostnames(answer: ZonesAnswer | null | undefined): ServedNames {
-  const exact = new Set<string>(), wildcard = new Set<string>(), excluded = new Set<string>();
+  const out: ServedNames = new Map();
   for (const z of answer?.zones ?? []) {
     const domain = String(z.domain ?? '').toLowerCase().replace(/\.$/, '');
     if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
     // An unpublished or failing claim: visitors do not bind the domain to this node, ordinary DNS answers instead.
-    const claimed = !!z.claim_published_at && !z.last_error;
+    if (!z.claim_published_at || z.last_error) continue;
+    const labels = new Map<string, string>(); let wildcard: string | null = null;
     for (const n of z.names ?? []) {
-      const label = String(n?.label ?? '').toLowerCase();
-      // "@", "www", "a.b", "*" and "*.apps" (everything under apps.<domain>).
-      const wild = label === '*' || label.startsWith('*.');
-      const rest = label === '@' || label === '*' ? '' : wild ? label.slice(2) : label;
-      if (rest && !HOST_LABELS_RE.test(rest)) continue;
-      const name = rest ? `${rest}.${domain}` : domain;
-      if (n?.target === 'self' && claimed) (wild ? wildcard : exact).add(name);
-      else if (!wild) excluded.add(name);
+      const label = String(n?.label ?? '').toLowerCase(), target = String(n?.target ?? '');
+      if (label === '*') wildcard = target;
+      else if (label === '@' || ZONE_LABEL_RE.test(label)) labels.set(label, target);
     }
+    out.set(domain, { labels, wildcard });
   }
-  return { exact, wildcard, excluded };
+  return out;
 }
 
+/**
+ * Whether the domain server answers `hostname` with this node, by its own lookup rule: the part before the domain
+ * ("@" for the domain itself) matches a label exactly, or else the `*` entry decides (at any depth, and for the
+ * domain itself when there is no "@").
+ */
 export function hostMatches(hostname: string, names: ServedNames): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
-  if (names.exact.has(h)) return true;
-  // A name the zone gives to another node (or to ordinary DNS) is not covered by a wildcard, nor are names under it.
-  for (const x of names.excluded) if (h === x || h.endsWith(`.${x}`)) return false;
-  for (const d of names.wildcard) if (h.endsWith(`.${d}`)) return true;
-  return false;
+  let best: string | null = null;
+  for (const d of names.keys()) if ((h === d || h.endsWith(`.${d}`)) && (!best || d.length > best.length)) best = d;
+  if (!best) return false;
+  const zone = names.get(best)!;
+  const part = h === best ? '@' : h.slice(0, -(best.length + 1));
+  const target = zone.labels.has(part) ? zone.labels.get(part) : zone.wildcard;
+  return target === 'self';
 }
 
-const NO_NAMES: ServedNames = { exact: new Set(), wildcard: new Set(), excluded: new Set() };
+const NO_NAMES: ServedNames = new Map();
 let served: ServedNames = NO_NAMES;
 let refreshSeq = 0;
 
