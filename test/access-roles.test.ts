@@ -31,4 +31,5 @@ test('an admin may not grant, change or remove superadmin entries', () => {
   assert.match(superadminChange(before, [{ npub: A, role: 'superadmin' }, { npub: B, role: 'superadmin' }])!, /grant superadmin/);
   assert.match(superadminChange(before, [{ npub: A, role: 'admin' }, { npub: B, role: 'admin' }])!, /change the role of a superadmin/);
   assert.match(superadminChange(before, [{ npub: A, role: 'admin' }])!, /remove a superadmin/);
+  assert.match(superadminChange(before, [{ npub: A, role: 'admin' }, { npub: B, role: 'superadmin', label: 'renamed' }])!, /change a superadmin's entry/);
 });

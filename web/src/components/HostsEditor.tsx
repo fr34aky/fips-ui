@@ -275,6 +275,7 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
   const set = async (role: Role | 'none') => {
     const you = data.you;
     if (you.kind === 'mesh' && you.npub === npub && (role === 'none' || !isAdmin(role))) { toast('err', 'That would remove your own admin access; change it in the list under Web UI over the mesh'); return; }
+    if (you.kind === 'mesh' && you.npub === npub && isSuperadmin(you.role) && (role === 'none' || !isSuperadmin(role))) { toast('err', 'That would give up your own superadmin role; change it in the list under Web UI over the mesh'); return; }
     const allowed = role === 'none' ? cfg.allowed.filter((e) => e.npub !== npub)
       : entry ? cfg.allowed.map((e) => (e.npub === npub ? { ...e, role } : e))
         : [...cfg.allowed, { npub, role, label: hostname }];

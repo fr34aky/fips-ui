@@ -38,6 +38,8 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   // Hosts-file names not yet on the list (and not this node itself), for the picker.
   const pickable = hosts.filter((h) => h.npub !== st.npub && !draft.allowed.some((e) => e.npub === h.npub));
   const selfRemoved = you.kind === 'mesh' && !draft.allowed.some((e) => e.npub === you.npub && isAdmin(e.role));
+  // A superadmin that gives up the role over the mesh cannot take it back itself.
+  const selfDemoted = !selfRemoved && you.kind === 'mesh' && isSuperadmin(you.role) && !draft.allowed.some((e) => e.npub === you.npub && isSuperadmin(e.role));
   // The superadmin role is offered where it means something: to a superadmin (the Node manager page exists for them).
   const roles: Role[] = isSuperadmin(you.role) ? ['viewer', 'admin', 'superadmin'] : ['viewer', 'admin'];
   const roleOptions = roles.map((r) => <option key={r} value={r}>{r}</option>);
@@ -112,6 +114,7 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
         </div>
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
+        {selfDemoted && <ErrorNote>Saving gives up your own superadmin role; only another superadmin (or someone at this machine) can give it back.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
         {draft.enabled && (data.helperVersion ?? 0) < (data.guardHelperVersion ?? 5) && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 

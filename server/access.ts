@@ -58,12 +58,14 @@ export class ForbiddenError extends AccessError {}
  * the sort changes.
  */
 export function superadminChange(before: AccessEntry[], after: AccessEntry[]): string | null {
-  const was = new Set(before.filter((e) => isSuperadmin(e.role)).map((e) => e.npub));
+  const was = new Map(before.filter((e) => isSuperadmin(e.role)).map((e) => [e.npub, e]));
   for (const e of after) {
-    if (isSuperadmin(e.role) && !was.has(e.npub)) return `only a superadmin can grant superadmin (${e.npub})`;
-    if (was.has(e.npub) && !isSuperadmin(e.role)) return `only a superadmin can change the role of a superadmin (${e.npub})`;
+    const prev = was.get(e.npub);
+    if (isSuperadmin(e.role) && !prev) return `only a superadmin can grant superadmin (${e.npub})`;
+    if (prev && !isSuperadmin(e.role)) return `only a superadmin can change the role of a superadmin (${e.npub})`;
+    if (prev && (prev.label ?? '') !== (e.label ?? '')) return `only a superadmin can change a superadmin's entry (${e.npub})`;
   }
-  for (const npub of was) if (!after.some((e) => e.npub === npub)) return `only a superadmin can remove a superadmin (${npub})`;
+  for (const npub of was.keys()) if (!after.some((e) => e.npub === npub)) return `only a superadmin can remove a superadmin (${npub})`;
   return null;
 }
 
@@ -325,7 +327,7 @@ export class MeshAccess {
   }
 
   /** Validate, derive addresses, persist, and only then put the new list into effect. `by` is the caller's role: below superadmin it may not touch superadmin entries. */
-  save(input: unknown, by: Role = 'superadmin'): Promise<void> {
+  save(input: unknown, by: Role): Promise<void> {
     return this.serial(async () => {
       if (!this.loaded) throw new AccessError(this.loadError ?? 'the saved access list has not loaded yet');
       const cfg = validateAccess(input);
