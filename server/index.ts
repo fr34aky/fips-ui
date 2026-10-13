@@ -439,8 +439,9 @@ async function route(req: Req, res: Res) {
       const node = fleet.config.nodes.find((n) => n.npub === px.npub);
       if (!node) throw new HttpError(404, 'that node is not managed from here');
       const body = method === 'POST' ? await readJsonBody(req, 1024 * 1024) : undefined;
-      // A node told to update its fips-ui or to install fips restarts its fips-ui: expected, not an outage.
-      const onForwarded = (n: { npub: string }, path: string, status: number) => { if (status < 300 && (path === '/api/ui-update/install' || path === '/api/upgrade/install-daemon')) fleet.expectRestart(n.npub); };
+      // A node told to update its fips-ui restarts it once built: expected, not an outage. (A fresh fips install
+      // restarts it only in rare cases; that shows as a short outage.)
+      const onForwarded = (n: { npub: string }, path: string, status: number) => { if (status < 300 && path.replace(/\/$/, '') === '/api/ui-update/install') fleet.expectRestart(n.npub); };
       return proxyRequest(req, res, node, px.path, forwardQuery(url.searchParams), { meshAddress, version: UI_VERSION, body, onForwarded });
     }
     throw new HttpError(404, 'unknown node-manager endpoint');

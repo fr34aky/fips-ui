@@ -371,6 +371,7 @@ test('Fleet.expectRestart: the node is shown restarting once it is away, until i
   now += 20;
   await fleet.refresh();
   assert.equal(fleet.nodeStatus(A)?.phase, 'offline');
+  assert.match(fleet.nodeStatus(A)?.error ?? '', /did not answer again/);
   fleet.close();
 });
 
