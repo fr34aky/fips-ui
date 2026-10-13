@@ -183,3 +183,87 @@ test('Fleet: a file that does not load is never overwritten', async () => {
   assert.equal(fleet.config.nodes.length, 1);
   fleet.close();
 });
+
+// ---- the proxy ----------------------------------------------------------------------------------
+
+import http from 'node:http';
+import { forwardQuery, parseProxyPath, proxyRequest } from '../server/fleet.ts';
+
+test('parseProxyPath: only plain /api paths of a listed-looking npub', () => {
+  assert.deepEqual(parseProxyPath(`/api/fleet/nodes/${A}/api/health`), { npub: A, path: '/api/health' });
+  assert.deepEqual(parseProxyPath(`/api/fleet/nodes/${A}/api/upgrade/jobs/current/events`), { npub: A, path: '/api/upgrade/jobs/current/events' });
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/../etc`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/a//b`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/%2e%2e/x`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/a\\b`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/etc/passwd`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/x:y`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/npub1short/api/health`), null);
+  assert.equal(parseProxyPath(`/api/fleet/nodes/${A}/api/${'a/'.repeat(300)}`), null);
+  assert.equal(forwardQuery(new URLSearchParams('since=3&token=secret&x=y')), '?since=3&x=y');
+  assert.equal(forwardQuery(new URLSearchParams('token=secret')), '');
+});
+
+test('proxyRequest: forwards GET and POST, strips the manager\'s headers, streams, and turns 401 into 502', async () => {
+  // The "managed node": records what arrives, answers JSON, SSE, or 401.
+  const seen: { method?: string; url?: string; headers?: http.IncomingHttpHeaders; body?: string }[] = [];
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url, headers: req.headers, body });
+      if (req.url === '/api/needs-token') { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"error":"unauthorized"}'); }
+      if (req.url?.startsWith('/api/events')) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'set-cookie': 'a=b', connection: 'keep-alive' });
+        res.write('event: snapshot\ndata: {"n":1}\n\n');
+        setTimeout(() => { res.write('event: snapshot\ndata: {"n":2}\n\n'); res.end(); }, 30);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'a=b' });
+      res.end(JSON.stringify({ ok: true, url: req.url, body }));
+    });
+  });
+  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+  const port = (upstream.address() as { port: number }).port;
+  const node = { npub: A, port };
+  // The "manager": every request is proxied (the body read like server/index.ts does).
+  const front = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    let body: Record<string, unknown> | undefined;
+    if (req.method === 'POST') { let t = ''; for await (const c of req) t += c; body = JSON.parse(t); }
+    await proxyRequest(req, res, node, url.pathname, forwardQuery(url.searchParams), { meshAddress: async () => '127.0.0.1', version: 'test', body });
+  });
+  await new Promise<void>((r) => front.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(front.address() as { port: number }).port}`;
+  try {
+    const r1 = await fetch(`${base}/api/health?token=secret&x=1`, { headers: { authorization: 'Bearer secret', cookie: 'c=d', origin: 'http://evil', accept: 'application/json' } });
+    assert.equal(r1.status, 200);
+    assert.equal(r1.headers.get('x-fips-ui-node'), A);
+    assert.equal(r1.headers.get('set-cookie'), null, 'cookies never come back');
+    assert.deepEqual(await r1.json(), { ok: true, url: '/api/health?x=1', body: '' });
+    const h = seen[0].headers!;
+    assert.equal(h.authorization, undefined); assert.equal(h.cookie, undefined); assert.equal(h.origin, undefined);
+    assert.equal(h['user-agent'], 'fips-ui-fleet'); assert.equal(h['x-fips-ui-fleet'], 'test');
+    assert.equal(h.host, `[127.0.0.1]:${port}`);
+
+    const r2 = await fetch(`${base}/api/connect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ peer: 'x' }) });
+    assert.equal(r2.status, 200);
+    assert.equal(seen[1].method, 'POST'); assert.equal(seen[1].headers!['content-type'], 'application/json'); assert.equal(seen[1].body, '{"peer":"x"}');
+
+    const r3 = await fetch(`${base}/api/needs-token`);
+    assert.equal(r3.status, 502);
+    assert.equal((await r3.json() as { upstream: number }).upstream, 401);
+
+    const r4 = await fetch(`${base}/api/events`);
+    assert.equal(r4.headers.get('content-type'), 'text/event-stream');
+    assert.equal(r4.headers.get('set-cookie'), null);
+    const text = await r4.text();
+    assert.ok(text.includes('{"n":1}') && text.includes('{"n":2}'), 'both events streamed through');
+
+    upstream.close();
+    const r5 = await fetch(`${base}/api/health`);
+    assert.equal(r5.status, 502);
+    assert.equal((await r5.json() as { kind: string }).kind, 'offline');
+  } finally { front.close(); upstream.close(); agentClose(); }
+});
+function agentClose() { /* the module-level keep-alive agent holds no sockets once the servers are closed */ }

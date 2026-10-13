@@ -9,10 +9,12 @@
 //
 // Only a superadmin on this node may use the fleet endpoints (server/index.ts): an npub is a node, not a person,
 // and without that distinction every admin of this node would reach every managed node through it.
+import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isAdmin, type AccessEntry, type Role } from './access.ts';
+import { sendJson } from './http.ts';
 
 const DEFAULT_FILE = process.env.FIPS_UI_FLEET_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'fleet.json');
 export const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
@@ -372,4 +374,92 @@ export class Fleet {
     if (this.config.nodes.some((n) => n.npub === node.npub)) this.nodes.set(node.npub, status);
     return status;
   }
+}
+
+// ---- proxy ----------------------------------------------------------------------------------------
+// /api/fleet/nodes/<npub>/api/... forwards one request to that node's own API, so the manager's frontend can show
+// any of its pages for a managed node. The browser cannot call the node itself: its writes are refused as
+// cross-origin there, and it does not carry this node's mesh identity. Only an allow-list of headers travels
+// upstream (never the manager's token or cookies), and the answer streams back as it arrives (SSE included).
+
+const PROXY_RE = /^\/api\/fleet\/nodes\/(npub1[02-9ac-hj-np-z]{58})(\/api(?:\/[A-Za-z0-9_.-]+)*\/?)$/;
+const MAX_PROXY_PATH = 512;
+/** Request headers that go upstream; everything else from the browser stays here. */
+const FORWARD_REQUEST = ['accept', 'last-event-id'];
+/** Response headers that come back; hop-by-hop ones and cookies do not. */
+const FORWARD_RESPONSE = ['content-type', 'cache-control', 'retry-after', 'content-length', 'x-accel-buffering'];
+/** Time for the node to answer with headers; after that a stream may stay open as long as it likes. */
+const HEADERS_TIMEOUT_MS = 10_000;
+
+/** The node and the path on it that a proxied URL names, or null when it is not one (or not a plain /api path). */
+export function parseProxyPath(pathname: string): { npub: string; path: string } | null {
+  if (pathname.length > MAX_PROXY_PATH + 80) return null;
+  const m = PROXY_RE.exec(pathname);
+  if (!m) return null;
+  const path = m[2];
+  if (path.length > MAX_PROXY_PATH || path.includes('//') || path.split('/').some((s) => s === '.' || s === '..')) return null;
+  return { npub: m[1], path };
+}
+
+/** The query string to send upstream: everything but this node's token. */
+export function forwardQuery(params: URLSearchParams): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of params) if (k !== 'token') q.append(k, v);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+const agent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+
+export interface ProxyDeps {
+  meshAddress: (npub: string) => Promise<string>;
+  version?: string;
+  /** The JSON body of a POST, already read and checked by the caller. */
+  body?: Record<string, unknown>;
+  /** Told what the node answered to a forwarded POST (the self-update and install cases restart it). */
+  onForwarded?: (node: FleetNode, path: string, status: number) => void;
+}
+
+/**
+ * Forward `req` to `node` and stream the answer into `res`. Resolves once the node's headers are through (or an
+ * error was answered); a long stream keeps flowing after that. A closed browser connection ends the upstream one.
+ */
+export function proxyRequest(req: IncomingMessage, res: ServerResponse, node: FleetNode, path: string, query: string, deps: ProxyDeps): Promise<void> {
+  const method = req.method === 'POST' ? 'POST' : 'GET';
+  return new Promise<void>((resolve) => {
+    const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => { if (!res.headersSent) sendJson(res, status, { error, ...extra }); else res.destroy(); resolve(); };
+    deps.meshAddress(node.npub).then((addr) => {
+      const headers: Record<string, string> = { host: `[${addr}]:${node.port}`, 'user-agent': USER_AGENT, 'x-fips-ui-fleet': deps.version ?? '' };
+      for (const h of FORWARD_REQUEST) { const v = req.headers[h]; if (typeof v === 'string') headers[h] = v; }
+      headers.accept ??= 'application/json';
+      const body = method === 'POST' ? Buffer.from(JSON.stringify(deps.body ?? {})) : null;
+      if (body) { headers['content-type'] = 'application/json'; headers['content-length'] = String(body.length); }
+      const up = http.request({ host: addr, port: node.port, path: `${path}${query}`, method, headers, agent });
+      const timer = setTimeout(() => up.destroy(new Error('timeout')), HEADERS_TIMEOUT_MS);
+      up.on('response', (upstream) => {
+        clearTimeout(timer);
+        const status = upstream.statusCode ?? 502;
+        if (status === 401) {
+          // The node's main listener answered (mesh access is off there, or the port is wrong). Not passed through:
+          // a 401 would make the manager's frontend ask for the manager's token.
+          upstream.resume();
+          return fail(502, 'the node asked for a token: its main listener answered, so Web UI over the mesh is off there or its port differs', { upstream: 401, kind: 'unauthorised' });
+        }
+        const out: Record<string, string> = { 'x-fips-ui-node': node.npub };
+        for (const h of FORWARD_RESPONSE) { const v = upstream.headers[h]; if (typeof v === 'string') out[h] = v; }
+        res.writeHead(status, out);
+        upstream.pipe(res);
+        upstream.on('error', () => res.destroy());
+        if (method === 'POST') deps.onForwarded?.(node, path, status);
+        resolve();
+      });
+      up.on('error', (e) => {
+        clearTimeout(timer);
+        if (e.message === 'timeout') return fail(504, `the node did not answer within ${HEADERS_TIMEOUT_MS / 1000} seconds`, { kind: 'offline' });
+        fail(502, `cannot reach the node at [${addr}]:${node.port} (${(e as NodeJS.ErrnoException).code ?? e.message})`, { kind: 'offline' });
+      });
+      res.on('close', () => up.destroy());
+      up.end(body ?? undefined);
+    }, (e: Error) => fail(502, `cannot derive the node's address: ${e.message}`, { kind: 'offline' }));
+  });
 }

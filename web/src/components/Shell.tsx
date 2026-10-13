@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe, Server } from 'lucide-react';
+import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe, Server, ArrowLeft } from 'lucide-react';
 import type { ConnState } from '../lib/api';
+import { hashFor } from '../lib/route';
 import { isAdmin, type Principal } from '../lib/types';
 import { useUiUpdate } from '../lib/uiUpdate';
 
@@ -37,7 +38,8 @@ export function useTheme() {
 /** Pages that only make sense with the admin role. */
 export const ADMIN_VIEWS: ViewId[] = ['config', 'firewall', 'upgrade', 'fleet'];
 
-export function Shell({ view, onNav, conn, nodeName, version, uiVersion, principal, children, badge, hidden = [] }: { hidden?: ViewId[]; view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; principal?: Principal; children: ReactNode; badge?: ReactNode }) {
+/** `node`: the managed node whose pages are shown (Node manager → Open); the sidebar and header say so and lead back. */
+export function Shell({ view, onNav, conn, nodeName, version, uiVersion, principal, children, badge, hidden = [], node }: { hidden?: ViewId[]; view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; principal?: Principal; children: ReactNode; badge?: ReactNode; node?: { npub: string; name: string } }) {
   const nav = (principal && !isAdmin(principal.role) ? NAV.filter((n) => !ADMIN_VIEWS.includes(n.id)) : NAV).filter((n) => !hidden.includes(n.id));
   const [theme, toggleTheme] = useTheme();
   const [open, setOpen] = useState(false);
@@ -56,14 +58,14 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
         <div className="flex items-center gap-3 px-4 h-16 shrink-0">
           <img src="/favicon.svg" alt="" width={30} height={30} className="rounded-lg" />
           <div className="min-w-0 leading-tight">
-            <div className="font-semibold tracking-tight">FIPS Node</div>
-            <div className="text-[11px] text-ink-3 truncate">{version ?? 'mesh dashboard'}</div>
+            <div className="font-semibold tracking-tight truncate" title={node?.npub}>{node ? node.name : 'FIPS Node'}</div>
+            <div className="text-[11px] text-ink-3 truncate">{node ? `managed node · ${version ?? '…'}` : version ?? 'mesh dashboard'}</div>
           </div>
           <button className="btn ghost icon sm ml-auto lg:hidden" onClick={() => setOpen(false)} aria-label="Close menu"><X size={16} /></button>
         </div>
         <nav className="flex flex-col gap-0.5 px-3 py-2 overflow-y-auto">
           {nav.map((n) => (
-            <a key={n.id} href={`#/${n.id}`} className={`nav-item ${view === n.id ? 'active' : ''}`} onClick={(e) => { e.preventDefault(); onNav(n.id); }} title={n.hint}>
+            <a key={n.id} href={hashFor(n.id)} className={`nav-item ${view === n.id ? 'active' : ''}`} onClick={(e) => { e.preventDefault(); onNav(n.id); }} title={n.hint}>
               {n.icon}<span>{n.label}</span>
               {n.id === 'gateway' && badge}
             </a>
@@ -74,7 +76,8 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
             <span>{connChip}</span>
             <button className="btn ghost icon sm" onClick={toggleTheme} aria-label="Toggle theme" title="Toggle theme">{theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}</button>
           </div>
-          {principal?.kind === 'mesh' && <div className="mt-2 flex items-center gap-1.5" title={principal.npub}><span className={`chip ${isAdmin(principal.role) ? 'accent' : ''}`}><span className="chip-dot" />via mesh · {principal.label || `${principal.npub.slice(0, 12)}…`} · {principal.role}</span></div>}
+          {node ? <div className="mt-2 flex flex-col items-start gap-1.5"><span className="chip accent" title={`This node is ${principal?.role ?? '…'} on ${node.name}`}><span className="chip-dot" />managing · {principal?.role ?? '…'}</span><a className="inline-flex items-center gap-1 hover:text-ink" href={hashFor('fleet', undefined, null)}><ArrowLeft size={12} />Back to Node manager</a></div>
+            : principal?.kind === 'mesh' && <div className="mt-2 flex items-center gap-1.5" title={principal.npub}><span className={`chip ${isAdmin(principal.role) ? 'accent' : ''}`}><span className="chip-dot" />via mesh · {principal.label || `${principal.npub.slice(0, 12)}…`} · {principal.role}</span></div>}
           {uiVersion && <div className="mt-2 flex flex-wrap items-center gap-1.5"><a href="https://github.com/fr34aky/fips-ui/blob/main/CHANGELOG.md" target="_blank" rel="noreferrer" className="hover:text-ink" title="Changelog">fips-ui v{uiVersion}</a><UiUpdateBadge admin={!principal || isAdmin(principal.role)} /></div>}
         </div>
       </aside>
@@ -89,6 +92,7 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
             <div className="text-[11px] text-ink-3 truncate hidden sm:block">{current.hint}</div>
           </div>
           <div className="ml-auto flex items-center gap-2 min-w-0">
+            {node && <a className="chip accent shrink-0" href={hashFor('fleet', undefined, null)} title="Back to Node manager"><ArrowLeft size={12} />managing {node.name}</a>}
             <span className="text-xs text-ink-2 truncate hidden sm:inline mono">{nodeName}</span>
             <span className="lg:hidden">{connChip}</span>
           </div>
@@ -103,5 +107,5 @@ export function Shell({ view, onNav, conn, nodeName, version, uiVersion, princip
 function UiUpdateBadge({ admin }: { admin: boolean }) {
   const u = useUiUpdate();
   if (!u?.newer || !u.latest) return null;
-  return <a className="chip accent" href={admin ? '#/upgrade' : u.latest.url} target={admin ? undefined : '_blank'} rel="noreferrer" title={admin ? 'Update fips-ui from the Upgrade page' : 'Release notes'}>v{u.latest.version} available</a>;
+  return <a className="chip accent" href={admin ? hashFor('upgrade') : u.latest.url} target={admin ? undefined : '_blank'} rel="noreferrer" title={admin ? 'Update fips-ui from the Upgrade page' : 'Release notes'}>v{u.latest.version} available</a>;
 }

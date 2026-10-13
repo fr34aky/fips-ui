@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon and fips-ui versions, available updates, the helper version and
   whether every manager is listed as an admin there. Standby managers can be
   named for the day this node is lost ([docs/fleet.md](docs/fleet.md)).
+- **Open** a managed node from the Node manager: every page of this dashboard
+  (peers, logs, configuration, firewall, access, upgrade, …) shown for that
+  node, through this node's backend, which forwards the node's own API over
+  the mesh. The sidebar says which node is open and leads back.
 
 ### Fixed
 

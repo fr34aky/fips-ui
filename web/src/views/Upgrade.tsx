@@ -3,7 +3,8 @@ import {
   AlertTriangle, ArrowUpCircle, Check, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Download, ExternalLink,
   GitCommitHorizontal, Hammer, KeyRound, Loader2, Package, Plus, RefreshCw, RotateCcw, ShieldCheck, SkipForward, Terminal, Trash2, X, XCircle,
 } from 'lucide-react';
-import { api, usePoll } from '../lib/api';
+import { api, getApiBase, usePoll } from '../lib/api';
+import { hashFor } from '../lib/route';
 import { DAEMON_INSTALL_HELPER, PEER_SPEC_RE, TEST_PEER } from '../lib/fipsInstall';
 import { UiUpdateCard } from '../components/UiUpdateCard';
 import { Copyable, Modal } from '../components/ui';
@@ -61,7 +62,8 @@ export function Upgrade() {
     if (!restarting) return;
     let down = false;
     const t = setInterval(() => {
-      api.get<{ uiUptimeSecs: number }>('/api/health').then((h) => { if (down || h.uiUptimeSecs < 20) location.reload(); }).catch(() => { down = true; });
+      // On a managed node the page itself did not change: just read its state again.
+      api.get<{ uiUptimeSecs: number }>('/api/health').then((h) => { if (down || h.uiUptimeSecs < 20) { if (getApiBase()) refresh(); else location.reload(); } }).catch(() => { down = true; });
     }, 1500);
     return () => clearInterval(t);
   }, [restarting]);
@@ -426,7 +428,7 @@ function ConfigOutcome({ c }: { c: ConfigMergeResult }) {
   const label = { unchanged: 'template unchanged', current: 'already up to date', applied: 'updated', proposed: 'review needed', failed: 'not updated', skipped: 'skipped' }[c.status];
   return (
     <div className="grid gap-1 text-xs">
-      <div className="flex flex-wrap items-center gap-1.5"><span className="text-ink-2">fips.yaml:</span><span className={`chip ${tone}`}><span className="chip-dot" />{label}</span>{(c.status === 'proposed' || c.status === 'failed') && <a className="text-ink-3 hover:text-ink" href="#/config">review on the Configuration page →</a>}</div>
+      <div className="flex flex-wrap items-center gap-1.5"><span className="text-ink-2">fips.yaml:</span><span className={`chip ${tone}`}><span className="chip-dot" />{label}</span>{(c.status === 'proposed' || c.status === 'failed') && <a className="text-ink-3 hover:text-ink" href={hashFor('config')}>review on the Configuration page →</a>}</div>
       <div className="text-ink-3 break-words">{c.detail}</div>
       {!!c.deprecations?.length && <div className="text-warn break-words">Deprecated settings reported by the new daemon: {c.deprecations.join(' · ')}</div>}
       {c.configDiff && <details><summary className="cursor-pointer text-ink-2">Change to your fips.yaml</summary><DiffBlock text={c.configDiff} /></details>}

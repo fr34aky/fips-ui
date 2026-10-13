@@ -1,7 +1,7 @@
 // New fips-ui releases: one shared copy of the server's check, refreshed every 30 minutes while in use (the server
 // itself asks GitHub at most every 6 hours unless an admin forces it).
 import { useSyncExternalStore } from 'react';
-import { api } from './api';
+import { api, getApiBase, onApiBaseChange } from './api';
 
 export interface UiRelease { tag: string; version: string; url: string; publishedAt: string; notes: string }
 export interface UiUpdateJob { tag: string; state: 'running' | 'done' | 'failed'; startedAt: number; finishedAt?: number; log: string[]; error?: string; restarting?: boolean }
@@ -20,8 +20,10 @@ let timer: ReturnType<typeof setInterval> | undefined;
 const emit = () => subs.forEach((f) => f());
 
 export function refreshUiUpdate(force = false): Promise<UiUpdateInfo | null> {
-  return api.get<UiUpdateInfo>(`/api/ui-update${force ? '?refresh=1' : ''}`).then((d) => { data = d; emit(); return d; }, () => null);
+  const base = getApiBase();
+  return api.get<UiUpdateInfo>(`/api/ui-update${force ? '?refresh=1' : ''}`).then((d) => { if (base === getApiBase()) { data = d; emit(); } return d; }, () => null);
 }
+onApiBaseChange(() => { data = null; emit(); if (subs.size) void refreshUiUpdate(); });
 
 function subscribe(f: () => void) {
   subs.add(f);

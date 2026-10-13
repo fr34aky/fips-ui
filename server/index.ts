@@ -15,7 +15,7 @@ import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
 import { HostsFollowers, isSyncRequest, parseSubtree, syncRole } from './hosts-followers.ts';
-import { Fleet, FleetError } from './fleet.ts';
+import { Fleet, FleetError, forwardQuery, parseProxyPath, proxyRequest } from './fleet.ts';
 import { SelfUpdate } from './self-update.ts';
 import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
@@ -420,6 +420,15 @@ async function route(req: Req, res: Res) {
       const body = await readJsonBody(req);
       try { await fleet.save(body); } catch (e) { throw new HttpError(e instanceof FleetError ? 400 : 500, (e as Error).message); }
       return json(res, 200, fleet.snapshot());
+    }
+    // Any page of a managed node: its own API, forwarded (GET and POST only; the body is read and checked here).
+    const px = parseProxyPath(p);
+    if (px) {
+      if (method !== 'GET' && method !== 'POST') throw new HttpError(405, 'GET or POST only');
+      const node = fleet.config.nodes.find((n) => n.npub === px.npub);
+      if (!node) throw new HttpError(404, 'that node is not managed from here');
+      const body = method === 'POST' ? await readJsonBody(req, 1024 * 1024) : undefined;
+      return proxyRequest(req, res, node, px.path, forwardQuery(url.searchParams), { meshAddress, version: UI_VERSION, body });
     }
     throw new HttpError(404, 'unknown node-manager endpoint');
   }
