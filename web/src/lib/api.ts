@@ -34,6 +34,11 @@ export const api = {
     return request<T>(`/api/q/${command}${s ? `?${s}` : ''}`);
   },
   health: () => request<Health>('/api/health'),
+  /** This node's own API, whatever node the page is looking at (the node manager's own endpoints). */
+  local: {
+    get: <T,>(path: string) => request<T>(path),
+    post: <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+  },
 };
 
 // ------------------------------------------------------------- auth store

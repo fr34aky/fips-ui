@@ -30,6 +30,7 @@ NixOS module), FreeBSD, pfSense, macOS and Windows.
 | **Configuration** | Edit `fips.yaml` (`/etc/fips`, `/usr/local/etc/fips` on FreeBSD and macOS, `/var/lib/fips` on NixOS) with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. Offers template merges from daemon upgrades that need review. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
 | **Upgrade** | Install the latest fips release (checksum-verified) or build any ref from source with cargo, with backups and rollback; afterwards `fips.yaml` is merged with the new version's template ([docs/upgrade.md](docs/upgrade.md)). Root steps go through a tiny helper you install once from a shell. On a machine without fips it **installs fips** itself, with a persistent identity and bootstrap peers ([docs/install.md](docs/install.md#installing-the-fips-daemon)). Also updates **fips-ui itself** to its newest release, shown next to the version in the sidebar ([docs/self-update.md](docs/self-update.md)). |
+| **Node manager** | Other fips nodes whose fips-ui this one reaches over the mesh: reachability, daemon and fips-ui versions, available updates, helper version, and whether every manager is listed as an admin there; standby managers for the day this node is lost ([docs/fleet.md](docs/fleet.md)). Superadmins only. |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
 
@@ -113,6 +114,8 @@ Everything is via environment variables.
 | `FIPS_UI_HOSTS_SYNC_FILE` | `~/.config/fips-ui/hosts-sync.json` | Settings for syncing names from another node. |
 | `FIPS_UI_HOSTS_FOLLOWERS_FILE` | `~/.config/fips-ui/hosts-followers.json` | On a master or distribution node: the nodes that sync from it. |
 | `FIPS_UI_CONFIG_PROPOSAL_FILE` | `~/.config/fips-ui/config-proposal.json` | A fips.yaml template merge waiting for review. |
+| `FIPS_UI_FLEET_FILE` | `~/.config/fips-ui/fleet.json` | The nodes this one manages and the standby managers ([docs/fleet.md](docs/fleet.md)). |
+| `FIPS_UI_FLEET_POLL_MS` | `30000` | How often the managed nodes are probed. |
 | `FIPS_UI_REPO` | `fr34aky/fips-ui` | Repository whose releases fips-ui installs for itself. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
 
@@ -188,6 +191,12 @@ POST /api/hosts/sync/run              sync now
 GET  /api/hosts/followers             the nodes that sync from this one, with their subtrees (admin);  POST /api/hosts/followers/forget {npub}
 GET  /api/access                      Web UI over the mesh: settings and status (admin), who you are;  POST saves them
 GET  /api/ui-update                   newest fips-ui release; for admins (not read-only) also the update state;  POST /api/ui-update/install {tag}
+```
+
+**Node manager** (superadmin only, [docs/fleet.md](docs/fleet.md))
+
+```
+GET  /api/fleet                       the managed nodes with what each last answered (?refresh=1 probes them now);  POST {nodes: [{npub, label?, port?}], managers: [{npub, label?}]} saves the list
 ```
 
 **Node management** (through the privileged helper, [docs/node-management.md](docs/node-management.md))
@@ -271,6 +280,7 @@ docs/              feature documentation, screenshots
 | [docs/upgrade.md](docs/upgrade.md) | Upgrading the fips daemon, the privilege model, the fips.yaml template merge |
 | [docs/public-domains.md](docs/public-domains.md) | The Public domains page: fips-pub-domains' resolver and domain server, zones, installing and updating them |
 | [docs/self-update.md](docs/self-update.md) | fips-ui updating itself |
+| [docs/fleet.md](docs/fleet.md) | The Node manager: other nodes' fips-ui instances managed from this one over the mesh, standby managers for recovery |
 
 ## Contributing
 

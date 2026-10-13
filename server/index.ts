@@ -15,6 +15,7 @@ import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
 import { HostsFollowers, isSyncRequest, parseSubtree, syncRole } from './hosts-followers.ts';
+import { Fleet, FleetError } from './fleet.ts';
 import { SelfUpdate } from './self-update.ts';
 import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
@@ -340,7 +341,7 @@ const restartBlocker = (): string | null => {
 /** Exit with 75 so the service manager starts fips-ui again, once nothing privileged is running. */
 function restartWhenIdle(message: string): void {
   if (restartBlocker()) { setTimeout(() => restartWhenIdle(message), 2000); return; }
-  console.log(message); server.close(); mesh.close(); hostsSync.close(); process.exit(75);
+  console.log(message); server.close(); mesh.close(); hostsSync.close(); fleet.close(); process.exit(75);
 }
 
 const hostsFollowers = new HostsFollowers();
@@ -353,6 +354,16 @@ const hostsSync = new HostsSync({
   subtree: () => hostsFollowers.subtreeHeader(),
 });
 if (!SELFTEST) void hostsSync.start();
+
+// The node manager (server/fleet.ts): the nodes this one manages over the mesh, probed every FIPS_UI_FLEET_POLL_MS.
+const fleet = new Fleet({
+  version: UI_VERSION,
+  ownNpub: async () => (await query<{ npub?: string }>('show_status', undefined, { timeoutMs: 3000 })).npub,
+  meshAddress,
+  intervalMs: envInt('FIPS_UI_FLEET_POLL_MS', 30_000, 5_000, 600_000),
+});
+// Read-only: the page is off (health.fleet), so the nodes are not probed either.
+if (!SELFTEST && !READ_ONLY) void fleet.start();
 
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
@@ -394,6 +405,24 @@ async function route(req: Req, res: Res) {
   }
 
   if (p === '/api/events') return handleSse(req, res);
+
+  // The node manager: superadmins only (an npub is a node; this keeps an admin of this node from reaching every
+  // managed node through it). Changes are refused in read-only mode.
+  if (p === '/api/fleet' || p.startsWith('/api/fleet/')) {
+    if (!isSuperadmin(principalOf(req).role)) throw new HttpError(403, 'superadmin role required');
+    if (method !== 'GET' && READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
+    if (p === '/api/fleet' && method === 'GET') {
+      // ?refresh=1 probes every node now and answers when that is done (or after 20 seconds with what is known).
+      if (url.searchParams.get('refresh') === '1') { let t: NodeJS.Timeout | undefined; await Promise.race([fleet.refresh(), new Promise((r) => { t = setTimeout(r, 20_000); })]); clearTimeout(t); }
+      return json(res, 200, fleet.snapshot());
+    }
+    if (p === '/api/fleet' && method === 'POST') {
+      const body = await readJsonBody(req);
+      try { await fleet.save(body); } catch (e) { throw new HttpError(e instanceof FleetError ? 400 : 500, (e as Error).message); }
+      return json(res, 200, fleet.snapshot());
+    }
+    throw new HttpError(404, 'unknown node-manager endpoint');
+  }
   // Upgrade state (paths, logs, and a refresh that spends the GitHub rate limit) is for admins only.
   if (p.startsWith('/api/upgrade')) {
     if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' });
@@ -842,4 +871,4 @@ server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); hostsSync.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); hostsSync.close(); fleet.close(); process.exit(0); });
