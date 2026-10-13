@@ -7,7 +7,7 @@ import { saveAccess, saveMessage, useAccess, type Role } from '../lib/access';
 import { fmtAgo } from '../lib/format';
 import { shortKey } from '../lib/format';
 import { refreshHosts, setHosts, useHosts, type HostsData } from '../lib/names';
-import { isAdmin, type Snapshot } from '../lib/types';
+import { isAdmin, isSuperadmin, mayChangeRole, type Snapshot } from '../lib/types';
 
 type Row = { hostname: string; npub: string; comment?: string };
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -270,7 +270,8 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
   if (!cfg) return null;
   const entry = cfg.allowed.find((e) => e.npub === npub);
   if (data.status?.npub === npub) return <span className="text-xs text-ink-3">this node</span>;
-  if (readOnly) return entry ? <Chip tone={isAdmin(entry.role) ? 'accent' : 'neutral'}>{entry.role}</Chip> : <span className="text-xs text-ink-3">not allowed</span>;
+  // Superadmin entries are a superadmin's to change (the server refuses anyone else).
+  if (readOnly || !mayChangeRole(data.you.role, entry?.role)) return entry ? <Chip tone={isAdmin(entry.role) ? 'accent' : 'neutral'} title={readOnly ? undefined : 'Only a superadmin can change this entry'}>{entry.role}</Chip> : <span className="text-xs text-ink-3">not allowed</span>;
   const set = async (role: Role | 'none') => {
     const you = data.you;
     if (you.kind === 'mesh' && you.npub === npub && (role === 'none' || !isAdmin(role))) { toast('err', 'That would remove your own admin access; change it in the list under Web UI over the mesh'); return; }
@@ -292,7 +293,7 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
         <option value="none">not allowed</option>
         <option value="viewer">viewer</option>
         <option value="admin">admin</option>
-        {(data.you.role === 'superadmin' || entry?.role === 'superadmin') && <option value="superadmin">superadmin</option>}
+        {isSuperadmin(data.you.role) && <option value="superadmin">superadmin</option>}
       </select>
       <ConfirmDialog open={!!confirmAdmin} onClose={() => setConfirmAdmin(null)} onConfirm={async () => { const role = confirmAdmin!; setConfirmAdmin(null); await set(role); }} busy={busy} danger
         title={`Give ${hostname} ${confirmAdmin} access?`} confirmLabel={`Give ${confirmAdmin} access`}

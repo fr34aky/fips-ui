@@ -56,7 +56,7 @@ access stops admitting anyone.
 | ---- | --- |
 | viewer | Everything read-only: dashboards, peers, metrics, logs, topology. No Configuration, Firewall or Upgrade pages, no connect, disconnect or probe, and no view of the access list. |
 | admin | The same as someone at this machine, including changing the node's configuration and firewall as root and upgrading it. Grant it only to keys you trust as much as this host's own login. |
-| superadmin | Admin, plus the **Node manager** page on a node that manages other nodes (their fips-ui instances reached over the mesh). Admin on the managing node is deliberately not enough for that page: the managed nodes trust the managing node's npub, and this role decides which of its users may act through it. On a node that manages nothing it is the same as admin. |
+| superadmin | Admin, plus the **Node manager** page on a node that manages other nodes (their fips-ui instances reached over the mesh). Admin on the managing node is deliberately not enough for that page: the managed nodes trust the managing node's npub, and this role decides which of its users may act through it. On a node that manages nothing it is the same as admin. Only a superadmin can grant, change or remove a superadmin entry (the API refuses an admin's attempt with 403). fips-ui releases before 0.13 do not know the role and refuse an `access.json` that contains it, so remove such entries before going back to one. |
 
 An npub is a node, not a person: **everything that leaves the listed node under its npub gets its role**,
 including every local user of that node and, if it runs `fips-gateway`, every LAN client behind it. List
