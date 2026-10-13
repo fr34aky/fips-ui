@@ -156,9 +156,9 @@ npubs ([docs/mesh-access.md](docs/mesh-access.md)). Updates of fips-ui itself ar
 ## API
 
 The frontend uses a small JSON API you can script against as well. Changes, and reads marked *(admin)*, need the
-admin role. **Every client of the main listener is an admin** (it is the local operator: loopback by default, or
+admin role. **Every client of the main listener is a superadmin** (it is the local operator: loopback by default, or
 whatever `FIPS_UI_HOST` exposes, so set `FIPS_UI_TOKEN` before binding elsewhere); over the mesh only npubs allowed
-as admins are. Everything under `/api/admin/` and `/api/upgrade/` is admin-only. `FIPS_UI_READ_ONLY=1` refuses
+as admins or superadmins are (superadmin is admin plus the Node manager page, [docs/mesh-access.md](docs/mesh-access.md)). Everything under `/api/admin/` and `/api/upgrade/` is admin-only. `FIPS_UI_READ_ONLY=1` refuses
 every change and also the admin reads that come with one (sync settings, followers, a pending config proposal, the
 update state).
 

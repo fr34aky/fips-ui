@@ -64,8 +64,12 @@ export interface Snapshot {
 
 export interface LogLine { ts: number; level: 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'unknown'; target?: string; message: string; raw: string; cursor?: string }
 
-export type Principal = { kind: 'local'; role: 'admin' } | { kind: 'mesh'; role: 'viewer' | 'admin'; npub: string; label?: string; address: string };
-export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string; pubdom?: PubdomState }
+/** viewer: read-only. admin: everything the local operator can do. superadmin: admin plus the Node manager page. */
+export type Role = 'viewer' | 'admin' | 'superadmin';
+/** Whether a role may change the node (admin or superadmin). */
+export const isAdmin = (role?: Role | null): boolean => role === 'admin' || role === 'superadmin';
+export type Principal = { kind: 'local'; role: Role } | { kind: 'mesh'; role: Role; npub: string; label?: string; address: string };
+export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; /** the caller is a superadmin: the Node manager page applies */ fleet?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string; pubdom?: PubdomState }
 
 // Public domain names over fips (fr34aky/fips-pub-domains): what the node runs, and what the two
 // control sockets answer (that repository's docs/webui.md).

@@ -7,7 +7,7 @@ import { saveAccess, saveMessage, useAccess, type Role } from '../lib/access';
 import { fmtAgo } from '../lib/format';
 import { shortKey } from '../lib/format';
 import { refreshHosts, setHosts, useHosts, type HostsData } from '../lib/names';
-import type { Snapshot } from '../lib/types';
+import { isAdmin, type Snapshot } from '../lib/types';
 
 type Row = { hostname: string; npub: string; comment?: string };
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -260,20 +260,20 @@ function fmtIn(ts: number): string {
   return s < 90 ? 'in a minute' : s < 5400 ? `in ${Math.round(s / 60)} min` : `in ${Math.round(s / 3600)} h`;
 }
 
-/** One name's web UI access: not allowed, viewer or admin. Changing it saves the allowed list at once. */
+/** One name's web UI access: not allowed, viewer, admin (or superadmin, offered to a superadmin). Changing it saves the allowed list at once. */
 function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: string; readOnly: boolean }) {
   const toast = useToast();
   const { data } = useAccess();
   const [busy, setBusy] = useState(false);
-  const [confirmAdmin, setConfirmAdmin] = useState(false);
+  const [confirmAdmin, setConfirmAdmin] = useState<Role | null>(null);
   const cfg = data?.config;
   if (!cfg) return null;
   const entry = cfg.allowed.find((e) => e.npub === npub);
   if (data.status?.npub === npub) return <span className="text-xs text-ink-3">this node</span>;
-  if (readOnly) return entry ? <Chip tone={entry.role === 'admin' ? 'accent' : 'neutral'}>{entry.role}</Chip> : <span className="text-xs text-ink-3">not allowed</span>;
+  if (readOnly) return entry ? <Chip tone={isAdmin(entry.role) ? 'accent' : 'neutral'}>{entry.role}</Chip> : <span className="text-xs text-ink-3">not allowed</span>;
   const set = async (role: Role | 'none') => {
     const you = data.you;
-    if (you.kind === 'mesh' && you.npub === npub && role !== 'admin') { toast('err', 'That would remove your own admin access; change it in the list under Web UI over the mesh'); return; }
+    if (you.kind === 'mesh' && you.npub === npub && (role === 'none' || !isAdmin(role))) { toast('err', 'That would remove your own admin access; change it in the list under Web UI over the mesh'); return; }
     const allowed = role === 'none' ? cfg.allowed.filter((e) => e.npub !== npub)
       : entry ? cfg.allowed.map((e) => (e.npub === npub ? { ...e, role } : e))
         : [...cfg.allowed, { npub, role, label: hostname }];
@@ -288,14 +288,15 @@ function AccessCell({ npub, hostname, readOnly }: { npub: string; hostname: stri
   return (
     <>
       <select className={`input h-8 w-32 ${entry ? '' : 'text-ink-3'}`} aria-label={`Web UI access for ${hostname}`} value={entry?.role ?? 'none'} disabled={busy}
-        onChange={(e) => { const role = e.target.value as Role | 'none'; if (role === 'admin') setConfirmAdmin(true); else void set(role); }}>
+        onChange={(e) => { const role = e.target.value as Role | 'none'; if (role !== 'none' && isAdmin(role)) setConfirmAdmin(role); else void set(role); }}>
         <option value="none">not allowed</option>
         <option value="viewer">viewer</option>
         <option value="admin">admin</option>
+        {(data.you.role === 'superadmin' || entry?.role === 'superadmin') && <option value="superadmin">superadmin</option>}
       </select>
-      <ConfirmDialog open={confirmAdmin} onClose={() => setConfirmAdmin(false)} onConfirm={async () => { setConfirmAdmin(false); await set('admin'); }} busy={busy} danger
-        title={`Give ${hostname} admin access?`} confirmLabel="Give admin access"
-        body={<>Admin over the mesh has the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to an npub whose key you trust as much as this host's own login; every local user of that node shares the grant.</>} />
+      <ConfirmDialog open={!!confirmAdmin} onClose={() => setConfirmAdmin(null)} onConfirm={async () => { const role = confirmAdmin!; setConfirmAdmin(null); await set(role); }} busy={busy} danger
+        title={`Give ${hostname} ${confirmAdmin} access?`} confirmLabel={`Give ${confirmAdmin} access`}
+        body={<>Admin over the mesh has the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to an npub whose key you trust as much as this host's own login; every local user of that node shares the grant.{confirmAdmin === 'superadmin' && <> Superadmin also opens the Node manager page: that node reaches every node this one manages.</>}</>} />
     </>
   );
 }

@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react
 import { Shell, NAV, ADMIN_VIEWS, type ViewId } from './components/Shell';
 import { ToastProvider, Modal, ErrorNote, Empty, Chip } from './components/ui';
 import { api, useLive, useAuthNeeded, setAuthNeeded, setToken, getToken, reconnectLive } from './lib/api';
-import type { Health } from './lib/types';
+import { isAdmin, type Health } from './lib/types';
 import { Overview } from './views/Overview';
 import { Peers } from './views/Peers';
 import { Topology } from './views/Topology';
@@ -44,7 +44,7 @@ export default function App() {
   const probe = useCallback((peer: string) => nav('diagnostics', { peer }), [nav]);
 
   const snap = live.snapshot;
-  const viewer = health?.principal?.role === 'viewer';
+  const viewer = !!health?.principal && !isAdmin(health.principal.role);
   const ownName = useHostName(snap?.status?.npub);
   const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
   const gwBadge = snap?.gateway ? <Chip tone="good" className="ml-auto" dot={false}>on</Chip> : undefined;

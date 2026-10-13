@@ -28,14 +28,24 @@ import { expand6, isMeshAddress } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
 
-export type Role = 'viewer' | 'admin';
+/**
+ * viewer: read-only. admin: everything the local operator can do. superadmin: admin, plus the Node manager page
+ * on a node that manages others (the fleet endpoints); it exists so that an admin npub on the managing node
+ * does not automatically reach every managed node through it.
+ */
+export type Role = 'viewer' | 'admin' | 'superadmin';
+export const ROLES: readonly Role[] = ['viewer', 'admin', 'superadmin'];
+/** Whether a role may change this node (admin or superadmin). */
+export const isAdmin = (role: Role): boolean => role === 'admin' || role === 'superadmin';
+export const isSuperadmin = (role: Role): boolean => role === 'superadmin';
 export interface AccessEntry { npub: string; label?: string; role: Role }
 export interface AccessConfig { enabled: boolean; port: number; allowed: AccessEntry[] }
 export type Principal =
-  | { kind: 'local'; role: 'admin' }
+  | { kind: 'local'; role: Role }
   | { kind: 'mesh'; role: Role; npub: string; label?: string; address: string };
 
-export const LOCAL: Principal = { kind: 'local', role: 'admin' };
+/** The local operator owns this host: superadmin, so the Node manager page is available locally. */
+export const LOCAL: Principal = { kind: 'local', role: 'superadmin' };
 const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'access.json');
 
 export class AccessError extends Error {}
@@ -74,7 +84,7 @@ export function validateAccess(input: unknown): AccessConfig {
   const allowed = x.allowed.map((e) => {
     const en = e as Partial<AccessEntry>;
     if (!NPUB_RE.test(String(en?.npub))) throw new AccessError(`invalid npub '${en?.npub}'`);
-    if (en.role !== 'viewer' && en.role !== 'admin') throw new AccessError(`role for ${en.npub} must be viewer or admin`);
+    if (!ROLES.includes(en.role as Role)) throw new AccessError(`role for ${en.npub} must be viewer, admin or superadmin`);
     if (seen.has(en.npub!)) throw new AccessError(`${en.npub} is listed twice`);
     seen.add(en.npub!);
     const label = typeof en.label === 'string' ? en.label.replace(/[^\p{L}\p{N} ._@-]/gu, '').slice(0, 40).trim() : '';

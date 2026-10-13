@@ -2,9 +2,9 @@
 // list), refreshed every 10 seconds while in use and right after every save.
 import { useSyncExternalStore } from 'react';
 import { api } from './api';
-import type { Principal } from './types';
+import type { Principal, Role } from './types';
 
-export type Role = 'viewer' | 'admin';
+export type { Role };
 export interface AccessEntry { npub: string; label?: string; role: Role }
 export interface AccessConfig { enabled: boolean; port: number; allowed: AccessEntry[] }
 export interface AccessStatus { listening: boolean; address: string | null; npub: string | null; port: number; guard?: { active: boolean; ports: number[]; error?: string }; error?: string }
