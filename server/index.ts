@@ -422,7 +422,11 @@ async function route(req: Req, res: Res) {
       return json(res, 200, fleet.snapshot());
     }
     // Every manager as an admin on one node, or on all of them.
-    if (method === 'POST' && p === '/api/fleet/sync-managers') return json(res, 200, { results: await fleet.syncAllManagers() });
+    if (method === 'POST' && p === '/api/fleet/sync-managers') {
+      const { npubs } = await readJsonBody(req);
+      if (npubs !== undefined && (!Array.isArray(npubs) || npubs.some((x) => typeof x !== 'string'))) throw new HttpError(400, 'npubs must be an array of npubs');
+      return json(res, 200, { results: await fleet.syncAllManagers(npubs as string[] | undefined) });
+    }
     const sm = /^\/api\/fleet\/nodes\/(npub1[02-9ac-hj-np-z]{58})\/sync-managers$/.exec(p);
     if (sm && method === 'POST') {
       try { return json(res, 200, await fleet.syncManagers(sm[1])); }
