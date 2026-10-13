@@ -167,6 +167,8 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
   const refused = classify(h);
   if (refused) return { ...base, phase: refused.kind === 'unauthorised' ? 'unauthorised' : refused.kind === 'not-ready' ? 'not-ready' : 'error', error: refused.message };
   const health = asRecord(h) ?? {};
+  // Something else answered on that port (another service, a page): not a fips-ui.
+  if (typeof health.ok !== 'boolean' || typeof health.auth !== 'string') return { ...base, phase: 'error', error: 'unexpected answer: is that the port of its fips-ui?' };
   // Only the node's mesh listener knows this node by its npub. Its main listener answers /api/health too (openly,
   // as the local operator): that is not a grant, and every other call there would be refused.
   if (health.auth !== 'npub') return { ...base, phase: 'unauthorised', error: 'the node\'s main listener answered, not its mesh listener: Web UI over the mesh is off there, or its port differs' };
@@ -318,8 +320,14 @@ export class Fleet {
 
   nodeStatus(npub: string): NodeStatus | undefined { return this.nodes.get(npub); }
 
+  /** A forced run asked for while one is in flight runs right after it (with the list and checks of that moment). */
+  private forcedNext = false;
   private runOnce(force: boolean): Promise<void> {
-    if (this.inflight) return this.inflight;
+    if (this.inflight) {
+      if (!force) return this.inflight;
+      if (!this.forcedNext) { this.forcedNext = true; this.inflight = this.inflight.then(() => { this.forcedNext = false; return this.pollAll(true); }).catch(() => {}).finally(() => { this.inflight = null; }); }
+      return this.inflight;
+    }
     this.inflight = this.pollAll(force).catch(() => {}).finally(() => { this.inflight = null; });
     return this.inflight;
   }
@@ -342,6 +350,12 @@ export class Fleet {
 
   /** Probe one node and record what it said. Never throws. */
   async pollNode(node: FleetNode, slow: boolean, managers = this.managers()): Promise<NodeStatus> {
+    // A file copied from another manager (recovery) may list this node itself: never probed, flagged instead.
+    if (this.own && node.npub === this.own) {
+      const self: NodeStatus = { npub: node.npub, port: node.port, ...(node.label ? { label: node.label } : {}), reachable: false, phase: 'error', error: 'this is this node itself; remove it from the list', lastAttempt: this.now() };
+      this.nodes.set(node.npub, self);
+      return self;
+    }
     const get = (path: string, timeoutMs = 8000): Promise<Answer> => this.fetchJson(node.npub, node.port, path, { timeoutMs }).catch((e: Error) => e);
     const probe: Probe = { health: await get('/api/health') };
     const health = asRecord(probe.health);

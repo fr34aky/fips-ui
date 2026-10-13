@@ -362,7 +362,8 @@ const fleet = new Fleet({
   meshAddress,
   intervalMs: envInt('FIPS_UI_FLEET_POLL_MS', 30_000, 5_000, 600_000),
 });
-if (!SELFTEST) void fleet.start();
+// Read-only: the page is off (health.fleet), so the nodes are not probed either.
+if (!SELFTEST && !READ_ONLY) void fleet.start();
 
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {

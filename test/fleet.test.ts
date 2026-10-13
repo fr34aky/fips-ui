@@ -89,6 +89,8 @@ test('deriveNodeStatus: managers missing, viewer grant, refusals, and what an of
   const withJob = deriveNodeStatus(node, undefined, { health: health('admin'), uiUpdate: { status: 200, body: { current: '1', newer: false, job: { state: 'failed', restarting: false, log: ['a', 'b'], error: 'x' } } } }, [ME], 1);
   assert.deepEqual(withJob.uiUpdate?.job, { state: 'failed' });
   assert.equal(deriveNodeStatus(node, undefined, { health: { status: 503, body: {} } }, [ME], 3).phase, 'not-ready');
+  // Not a fips-ui at all on that port.
+  assert.equal(deriveNodeStatus(node, undefined, { health: { status: 200, body: { error: '<html>' } } }, [ME], 3).phase, 'error');
   const off = deriveNodeStatus(node, ok, { health: new FleetError('cannot reach', 'offline') }, [ME], 4);
   assert.equal(off.phase, 'offline');
   assert.equal(off.reachable, false);
@@ -137,6 +139,16 @@ test('Fleet: saves, probes with bounded concurrency, and reports the nodes in or
   // The first run is a slow one (release checks included); they were asked for.
   assert.ok(log.some((l) => l.endsWith('/api/ui-update')));
   assert.equal(snap.status.lastRun, 7);
+  // A forced run asked for during a run still happens (with the list of that moment).
+  const slow = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson: async (...a) => { await new Promise((r) => setTimeout(r, 30)); return f.fetchJson(...a); }, file: file(), intervalMs: 60_000 });
+  await slow.start();
+  await slow.save({ nodes: [{ npub: nodes[0] }], managers: [] });
+  const first = slow.refresh();
+  await slow.save({ nodes: [{ npub: nodes[0] }, { npub: nodes[1] }], managers: [] });
+  await first;
+  await slow.refresh();
+  assert.equal(slow.snapshot().nodes[1].phase, 'ok', 'the node added during the run was probed by the run that followed');
+  slow.close();
   // Removing a node drops its status; saving the node itself is refused.
   await fleet.save({ nodes: [{ npub: nodes[0] }], managers: [{ npub: STANDBY }] });
   assert.equal(fleet.snapshot().nodes.length, 1);

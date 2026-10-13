@@ -107,7 +107,8 @@ function VersionCell({ version, latest, available, restartPending }: { version?:
 function HelperChip({ n }: { n: FleetNodeStatus }) {
   const h = n.helper;
   if (!h) return <span className="text-ink-3">–</span>;
-  if (h.installed === null) return <Chip tone="warn" title="The privileged helper is not installed there; configuration, firewall and upgrades need it">none</Chip>;
+  // null: the node did not say (no helper on that platform, or its check failed this time), not "none".
+  if (h.installed === null) return <span className="text-ink-3" title="The node did not report its helper">–</span>;
   if (h.shipped !== null && h.installed < h.shipped) return <Chip tone="warn" title={`Its fips-ui ships helper v${h.shipped}; run sudo ./deploy/setup-local.sh on that node`}>v{h.installed} &lt; v{h.shipped}</Chip>;
   return <Chip dot={false}>v{h.installed}</Chip>;
 }
@@ -137,6 +138,7 @@ function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string
     lastSaved.current = saved;
   }, [data.config]); // eslint-disable-line react-hooks/exhaustive-deps
   const dirty = JSON.stringify(draft) !== JSON.stringify(data.config);
+  const incomplete = draft.nodes.some((n) => !n.port);
   const listed = new Set([...draft.nodes.map((n) => n.npub), ...draft.managers.map((m) => m.npub)]);
   const pickable = hosts.filter((h) => h.npub !== own && !listed.has(h.npub));
 
@@ -189,7 +191,7 @@ function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string
                 <tr key={n.npub}>
                   <td><Copyable text={n.npub} display={shortKey(n.npub, 14, 6)} /></td>
                   <td><input className="input h-8 w-36" placeholder="label" value={n.label ?? ''} maxLength={40} onChange={(e) => setDraft({ ...draft, nodes: draft.nodes.map((y, j) => (j === i ? { ...y, label: e.target.value } : y)) })} /></td>
-                  <td><input className="input h-8 w-24 mono" type="number" min={1} max={65535} title="Mesh-access port on that node" value={n.port} onChange={(e) => setDraft({ ...draft, nodes: draft.nodes.map((y, j) => (j === i ? { ...y, port: Number(e.target.value) } : y)) })} /></td>
+                  <td><input className="input h-8 w-24 mono" type="number" min={1} max={65535} title="Mesh-access port on that node" value={n.port || ''} onChange={(e) => setDraft({ ...draft, nodes: draft.nodes.map((y, j) => (j === i ? { ...y, port: Number(e.target.value) || 0 } : y)) })} /></td>
                   <td className="text-right"><button className="btn ghost icon sm" title="Remove" onClick={() => setDraft({ ...draft, nodes: draft.nodes.filter((_, j) => j !== i) })}><Trash2 size={13} /></button></td>
                 </tr>
               ))}
@@ -213,7 +215,7 @@ function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string
         <div className="grid gap-3">
           <div className="overflow-x-auto -mx-1"><table className="data"><tbody>
             <tr><td><NpubInline npub={own} /></td><td><Chip tone="accent" dot={false}>this node</Chip></td><td /></tr>
-            {draft.managers.map((m, i) => (
+            {draft.managers.map((m, i) => m.npub === own ? null : (
               <tr key={m.npub}>
                 <td><NpubInline npub={m.npub} name={m.label} /></td>
                 <td><Chip dot={false}>standby</Chip></td>
@@ -230,7 +232,7 @@ function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string
       </Card>
       <div className="lg:col-span-2 flex justify-end gap-2">
         <button className="btn" disabled={!dirty || busy} onClick={() => setDraft(data.config)}><Undo2 size={14} />Discard</button>
-        <button className="btn primary" disabled={!dirty || busy} onClick={save}><Save size={14} />Save</button>
+        <button className="btn primary" disabled={!dirty || busy || incomplete} title={incomplete ? 'Every node needs a port' : undefined} onClick={save}><Save size={14} />Save</button>
       </div>
     </div>
   );
