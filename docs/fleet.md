@@ -35,7 +35,7 @@ The table shows for each node:
 
 | Column | Meaning |
 | ------ | ------- |
-| Status | *reachable*; *offline* (no answer); *not allowed* (the node refuses the manager's npub); *viewer only* (listed, but not as an admin); *not ready* (its mesh listener is up but its guard or identity is not); *error* (an unexpected answer). The last known versions stay while a node is away, with when it was last seen. |
+| Status | *reachable*; *offline* (no answer); *not allowed* (the node refuses the manager's npub, or its main listener answered because mesh access is off there or the port differs); *viewer only* (listed, but not as an admin); *not ready* (its mesh listener is up but its guard or identity is not); *restarting* (its fips-ui was told to update or to install fips); *error* (an unexpected answer). The last known versions stay while a node is away, with when it was last seen. |
 | Daemon, fips-ui | The running versions, and a chip when the node's own release check found a newer one, or a daemon restart is pending there. |
 | Helper | The node's privileged helper version; a warning when its fips-ui checkout ships a newer one (run `sudo ./deploy/setup-local.sh` there). |
 | Managers | Whether every manager (see below) is an admin on that node. |
@@ -57,13 +57,20 @@ Behind it, this node's backend forwards the browser's requests to the node's own
 upstream, never this node's token or cookies; `set-cookie` never comes back. A node that answers with a
 token prompt (its main listener instead of its mesh listener) is reported as unreachable rather than passed
 through, so the manager's own token dialog never opens for it. A node that refuses this node's npub shows
-what to do on it. When a managed node's fips-ui restarts (its self-update), the page waits and continues
-without reloading.
+what to do on it. When a managed node's fips-ui restarts (its self-update, or a fresh fips install that
+makes it join the fips group), the page waits and continues without reloading, and the overview shows the
+node as *restarting* (probed every five seconds, for up to five minutes) rather than offline.
 
 ## Standby managers and recovery
 
 `fleet.json` also lists further manager npubs. The manager itself is always the first; the others are
 *standbys*. Every manager should be an admin on every managed node (the overview says when one is not).
+
+**Sync managers** (per node, or for every node that lacks one) reads the node's access list through its API,
+adds the missing managers as admins (a manager listed as a viewer is raised to admin) and writes the list
+back. Nothing is ever removed or demoted there: the node's operator keeps the last word. The list is read
+and written in one go without a version check, so a change made on that node's Access page in the same
+second could be lost; the next probe shows the result either way.
 
 When the manager node is lost for good, or its key with it, start a node with a standby's backed-up nsec
 anywhere: it is an admin on every managed node already. Copy or recreate `fleet.json` there, and it is the
@@ -82,6 +89,8 @@ Without any standby, each managed node's local operator can still grant a new ma
 
 GET  /api/fleet                the configuration, the managers, and what each node last answered;  ?refresh=1 probes them now
 POST /api/fleet                {nodes, managers}: replace the configuration (superadmin, not in read-only mode)
+GET|POST /api/fleet/nodes/<npub>/api/…   the node's own API, forwarded
+POST /api/fleet/nodes/<npub>/sync-managers   every manager as an admin there;  POST /api/fleet/sync-managers for all nodes
 ```
 
 A node cannot manage itself; the same npub may be managed and be a standby manager at the same time.

@@ -21,9 +21,15 @@ export interface FleetNodeStatus {
 export interface FleetStatus { running: boolean; lastRun?: number; nextRun?: number; error?: string }
 export interface FleetData { config: FleetConfig; own?: string; managers: string[]; file: string; status: FleetStatus; nodes: FleetNodeStatus[] }
 
+/** What syncing the managers to one node did. */
+export interface SyncResult { npub: string; changed: boolean; added: string[]; promoted: string[]; error?: string; node?: FleetNodeStatus }
+
 export const fleetApi = {
   get: (refresh = false) => api.local.get<FleetData>(`/api/fleet${refresh ? '?refresh=1' : ''}`),
   save: (config: FleetConfig) => api.local.post<FleetData>('/api/fleet', config),
+  /** Make every manager an admin on that node (or on all of them). */
+  syncManagers: (npub: string) => api.local.post<SyncResult>(`/api/fleet/nodes/${encodeURIComponent(npub)}/sync-managers`),
+  syncAllManagers: () => api.local.post<{ results: SyncResult[] }>('/api/fleet/sync-managers'),
 };
 
 /** What a phase says, and how loud. */
