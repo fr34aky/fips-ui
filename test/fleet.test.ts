@@ -264,6 +264,5 @@ test('proxyRequest: forwards GET and POST, strips the manager\'s headers, stream
     const r5 = await fetch(`${base}/api/health`);
     assert.equal(r5.status, 502);
     assert.equal((await r5.json() as { kind: string }).kind, 'offline');
-  } finally { front.close(); upstream.close(); agentClose(); }
+  } finally { front.close(); upstream.close(); }
 });
-function agentClose() { /* the module-level keep-alive agent holds no sockets once the servers are closed */ }

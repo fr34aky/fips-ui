@@ -42,7 +42,8 @@ export function refreshHosts(): Promise<HostsData | null> {
   inflight = p;
   return p;
 }
-onApiBaseChange(() => { data = null; loadError = null; byNpub = new Map(); inflight = null; subs.forEach((f) => f()); if (subs.size) void refreshHosts(); });
+// Reset only: the App for the new node subscribes afresh, which fetches.
+onApiBaseChange(() => { data = null; loadError = null; byNpub = new Map(); inflight = null; subs.forEach((f) => f()); });
 
 /** Put a saved file's state in place without another request. */
 export function setHosts(d: HostsData) { publish({ ...data, ...d }); }

@@ -22,7 +22,7 @@ export function refreshAccess(): Promise<void> {
   const base = getApiBase();
   return api.get<AccessData>('/api/access').then((d) => { if (base !== getApiBase()) return; data = d; loadError = null; emit(); }, (e: Error) => { if (base !== getApiBase()) return; loadError = e.message; emit(); });
 }
-onApiBaseChange(() => { data = null; loadError = null; emit(); if (subs.size) void refreshAccess(); });
+onApiBaseChange(() => { data = null; loadError = null; emit(); });
 
 function subscribe(f: () => void) {
   subs.add(f);

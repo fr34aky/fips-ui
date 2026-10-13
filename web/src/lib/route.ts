@@ -1,6 +1,6 @@
 // The hash route: '#/<view>?qs' for this node, '#/node/<npub>/<view>?qs' for a node managed from here (its API is
 // reached through this node's proxy, lib/api.ts apiBase).
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
+import { NPUB_RE } from './types';
 
 export interface Route { node: string | null; view: string; params: URLSearchParams }
 

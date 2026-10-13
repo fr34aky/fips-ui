@@ -46,8 +46,8 @@ export default function Root() {
 
 function App({ route }: { route: AppRoute }) {
   const [health, setHealth] = useState<Health | null>(null);
-  /** A managed node that is no longer managed from here (the proxy answers 404). */
-  const [gone, setGone] = useState(false);
+  /** What this node's backend said about reaching the managed node: 404 (no longer managed), 403 (this user is no superadmin), 502/504 (the proxy could not reach it, with its reason). */
+  const [nodeProblem, setNodeProblem] = useState<{ status: number; message: string } | null>(null);
   /** For a managed node: how the Node manager calls it, and this node's own npub (for the "add me as admin" hint). */
   const [fleetMeta, setFleetMeta] = useState<{ own?: string; label?: string } | null>(null);
   const live = useLive();
@@ -55,7 +55,7 @@ function App({ route }: { route: AppRoute }) {
   const nodeNpub = route.node;
   // Health describes the node the page looks at; read again when the stream comes (back) up, e.g. after its restart.
   const up = live.conn === 'live';
-  useEffect(() => { api.health().then((h) => { setHealth(h); setGone(false); }).catch((e) => { if (nodeNpub && e instanceof ApiError && e.status === 404) setGone(true); }); }, [authNeeded, up, nodeNpub]);
+  useEffect(() => { api.health().then((h) => { setHealth(h); setNodeProblem(null); }).catch((e) => { if (nodeNpub && e instanceof ApiError && [403, 404, 502, 504].includes(e.status)) setNodeProblem({ status: e.status, message: e.message }); }); }, [authNeeded, up, nodeNpub]);
   // The App is mounted per node (Root), so the node never changes while this runs.
   useEffect(() => {
     if (!nodeNpub) return;
@@ -85,11 +85,14 @@ function App({ route }: { route: AppRoute }) {
     body = <Empty>This page needs the admin role; your npub has viewer access.</Empty>;
   } else if (route.view === 'fleet' && health && !health.fleet) {
     body = <Empty>{health.readOnly ? 'This UI instance is read-only; the Node manager is off.' : 'This page needs the superadmin role.'}</Empty>;
-  } else if (node && gone) {
+  } else if (node && nodeProblem?.status === 404) {
     body = <Empty>{node.name} is no longer managed from here.{backToFleet}</Empty>;
+  } else if (node && nodeProblem?.status === 403) {
+    body = <Empty>Opening a managed node needs the superadmin role here: {nodeProblem.message}.{backToFleet}</Empty>;
   } else if (!snap) {
     body = node ? (
-      live.refused ? <Empty><ErrorNote>{node.name} refuses this node: {live.refused}</ErrorNote><p className="text-sm text-ink-2 mt-3">On that node, under <b>Access → Web UI over the mesh</b>, add {fleetMeta?.own ? <code>{fleetMeta.own}</code> : 'this node\'s npub'} as an <b>admin</b>.</p><div className="flex gap-2 justify-center"><button className="btn sm mt-3" onClick={() => reconnectLive()}>Retry</button>{backToFleet}</div></Empty>
+      nodeProblem ? <Empty><ErrorNote>Cannot reach {node.name} through this node: {nodeProblem.message}</ErrorNote><div className="flex gap-2 justify-center"><button className="btn sm mt-3" onClick={() => reconnectLive()}>Retry</button>{backToFleet}</div></Empty>
+        : live.refused ? <Empty><ErrorNote>{node.name} refuses this node: {live.refused}</ErrorNote><p className="text-sm text-ink-2 mt-3">On that node, under <b>Access → Web UI over the mesh</b>, add {fleetMeta?.own ? <code>{fleetMeta.own}</code> : 'this node\'s npub'} as an <b>admin</b>.</p><div className="flex gap-2 justify-center"><button className="btn sm mt-3" onClick={() => reconnectLive()}>Retry</button>{backToFleet}</div></Empty>
         : live.conn === 'reconnecting' ? <Empty><ErrorNote>Cannot reach {node.name} through this node. Retrying…</ErrorNote>{backToFleet}</Empty>
         : <Empty><div className="pulse">Connecting to {node.name}…</div></Empty>
     ) : live.refused ? <ErrorNote>The FIPS UI server refused this browser: {live.refused}</ErrorNote>

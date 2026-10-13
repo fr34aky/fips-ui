@@ -7,7 +7,7 @@ import { fleetApi, phaseInfo, type FleetConfig, type FleetData, type FleetNodeSt
 import { fmtAgo, fmtDuration, fmtNum, shortKey } from '../lib/format';
 import { useHosts } from '../lib/names';
 import { hashFor } from '../lib/route';
-import { isAdmin, type Snapshot } from '../lib/types';
+import { isAdmin, NPUB_RE, type Snapshot } from '../lib/types';
 
 /**
  * The node manager: other fips nodes whose fips-ui this node reaches over the mesh, each listing this node's npub
@@ -97,10 +97,11 @@ function NodeActions({ n }: { n: FleetNodeStatus }) {
   const can = n.reachable && isAdmin(n.role);
   const why = !n.reachable ? 'The node is not reachable' : !isAdmin(n.role) ? 'This node is not an admin there' : undefined;
   const upgradeHint = n.upgrade?.available || n.uiUpdate?.available ? 'An update is available there' : 'Upgrade the daemon or fips-ui there';
+  if (!can) return <><button className="btn sm" disabled title={why}><ExternalLink size={13} />Open</button><button className="btn sm" disabled title={why}><ArrowUpCircle size={13} />Upgrade</button></>;
   return (
     <>
-      <a className={`btn sm ${can ? '' : 'pointer-events-none opacity-50'}`} href={hashFor('overview', undefined, n.npub)} title={why ?? 'Open this node\'s pages'} aria-disabled={!can}><ExternalLink size={13} />Open</a>
-      <a className={`btn sm ${can ? '' : 'pointer-events-none opacity-50'} ${n.upgrade?.available || n.uiUpdate?.available ? 'primary' : ''}`} href={hashFor('upgrade', undefined, n.npub)} title={why ?? upgradeHint} aria-disabled={!can}><ArrowUpCircle size={13} />Upgrade</a>
+      <a className="btn sm" href={hashFor('overview', undefined, n.npub)} title="Open this node's pages"><ExternalLink size={13} />Open</a>
+      <a className={`btn sm ${n.upgrade?.available || n.uiUpdate?.available ? 'primary' : ''}`} href={hashFor('upgrade', undefined, n.npub)} title={upgradeHint}><ArrowUpCircle size={13} />Upgrade</a>
     </>
   );
 }
@@ -136,8 +137,6 @@ function ManagersChip({ n }: { n: FleetNodeStatus }) {
 }
 
 // ---- configuration ----------------------------------------------------------------------------
-
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string; onSaved: () => void }) {
   const toast = useToast();

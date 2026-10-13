@@ -23,7 +23,7 @@ export function refreshUiUpdate(force = false): Promise<UiUpdateInfo | null> {
   const base = getApiBase();
   return api.get<UiUpdateInfo>(`/api/ui-update${force ? '?refresh=1' : ''}`).then((d) => { if (base === getApiBase()) { data = d; emit(); } return d; }, () => null);
 }
-onApiBaseChange(() => { data = null; emit(); if (subs.size) void refreshUiUpdate(); });
+onApiBaseChange(() => { data = null; emit(); });
 
 function subscribe(f: () => void) {
   subs.add(f);

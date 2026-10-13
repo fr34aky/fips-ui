@@ -388,8 +388,10 @@ const MAX_PROXY_PATH = 512;
 const FORWARD_REQUEST = ['accept', 'last-event-id'];
 /** Response headers that come back; hop-by-hop ones and cookies do not. */
 const FORWARD_RESPONSE = ['content-type', 'cache-control', 'retry-after', 'content-length', 'x-accel-buffering'];
-/** Time for the node to answer with headers; after that a stream may stay open as long as it likes. */
+/** Time for the node to answer a read with headers; after that a stream may stay open as long as it likes. */
 const HEADERS_TIMEOUT_MS = 10_000;
+/** A change may take long on the node (a service restart waits up to 150 s there): it is given that long. */
+const POST_TIMEOUT_MS = 180_000;
 
 /** The node and the path on it that a proxied URL names, or null when it is not one (or not a plain /api path). */
 export function parseProxyPath(pathname: string): { npub: string; path: string } | null {
@@ -409,7 +411,8 @@ export function forwardQuery(params: URLSearchParams): string {
   return s ? `?${s}` : '';
 }
 
-const agent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+// No socket cap: every open page of a managed node holds a stream, which must not queue the next request.
+const agent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
 
 export interface ProxyDeps {
   meshAddress: (npub: string) => Promise<string>;
@@ -427,15 +430,22 @@ export interface ProxyDeps {
 export function proxyRequest(req: IncomingMessage, res: ServerResponse, node: FleetNode, path: string, query: string, deps: ProxyDeps): Promise<void> {
   const method = req.method === 'POST' ? 'POST' : 'GET';
   return new Promise<void>((resolve) => {
-    const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => { if (!res.headersSent) sendJson(res, status, { error, ...extra }); else res.destroy(); resolve(); };
+    const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => { if (!res.headersSent && !res.destroyed) sendJson(res, status, { error, ...extra }); else res.destroy(); resolve(); };
+    // The browser may be gone before the address is known (or while the body was read): then nothing is sent
+    // upstream. Only the response side tells: a request whose body was consumed counts as destroyed already.
+    let up: http.ClientRequest | null = null;
+    let gone = res.destroyed;
+    res.on('close', () => { gone = true; up?.destroy(); });
     deps.meshAddress(node.npub).then((addr) => {
+      if (gone) return resolve();
       const headers: Record<string, string> = { host: `[${addr}]:${node.port}`, 'user-agent': USER_AGENT, 'x-fips-ui-fleet': deps.version ?? '' };
       for (const h of FORWARD_REQUEST) { const v = req.headers[h]; if (typeof v === 'string') headers[h] = v; }
       headers.accept ??= 'application/json';
       const body = method === 'POST' ? Buffer.from(JSON.stringify(deps.body ?? {})) : null;
       if (body) { headers['content-type'] = 'application/json'; headers['content-length'] = String(body.length); }
-      const up = http.request({ host: addr, port: node.port, path: `${path}${query}`, method, headers, agent });
-      const timer = setTimeout(() => up.destroy(new Error('timeout')), HEADERS_TIMEOUT_MS);
+      up = http.request({ host: addr, port: node.port, path: `${path}${query}`, method, headers, agent });
+      const limit = method === 'POST' ? POST_TIMEOUT_MS : HEADERS_TIMEOUT_MS;
+      const timer = setTimeout(() => up?.destroy(new Error('timeout')), limit);
       up.on('response', (upstream) => {
         clearTimeout(timer);
         const status = upstream.statusCode ?? 502;
@@ -455,10 +465,9 @@ export function proxyRequest(req: IncomingMessage, res: ServerResponse, node: Fl
       });
       up.on('error', (e) => {
         clearTimeout(timer);
-        if (e.message === 'timeout') return fail(504, `the node did not answer within ${HEADERS_TIMEOUT_MS / 1000} seconds`, { kind: 'offline' });
+        if (e.message === 'timeout') return fail(504, `the node did not answer within ${limit / 1000} seconds`, { kind: 'offline' });
         fail(502, `cannot reach the node at [${addr}]:${node.port} (${(e as NodeJS.ErrnoException).code ?? e.message})`, { kind: 'offline' });
       });
-      res.on('close', () => up.destroy());
       up.end(body ?? undefined);
     }, (e: Error) => fail(502, `cannot derive the node's address: ${e.message}`, { kind: 'offline' }));
   });
