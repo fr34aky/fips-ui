@@ -41,7 +41,7 @@ test('classify: the node\'s own reason, and what 401 means', () => {
 });
 
 const node = { npub: A, port: 8321, label: 'a' };
-const health = (role: string, extra: Record<string, unknown> = {}): FetchResult => ({ status: 200, body: { ok: true, principal: { kind: 'mesh', role, npub: ME }, readOnly: role === 'viewer', nodeManagement: role !== 'viewer', uiVersion: '0.13.0', uiUptimeSecs: 42, version: '0.6.0', platform: { os: 'linux' }, ...extra } });
+const health = (role: string, extra: Record<string, unknown> = {}): FetchResult => ({ status: 200, body: { ok: true, auth: 'npub', principal: { kind: 'mesh', role, npub: ME }, readOnly: role === 'viewer', nodeManagement: role !== 'viewer', uiVersion: '0.13.0', uiUptimeSecs: 42, version: '0.6.0', platform: { os: 'linux' }, ...extra } });
 const access = (allowed: { npub: string; role: string }[]): FetchResult => ({ status: 200, body: { config: { enabled: true, port: 8321, allowed }, status: { npub: A } } });
 
 test('deriveNodeStatus: an admin grant with every manager listed', () => {
@@ -79,6 +79,15 @@ test('deriveNodeStatus: managers missing, viewer grant, refusals, and what an of
   assert.equal(viewer.reachable, true);
   assert.equal(viewer.uiVersion, '0.13.0');
   assert.equal(deriveNodeStatus(node, undefined, { health: { status: 403, body: { error: 'nope' } } }, [ME], 3).phase, 'unauthorised');
+  // The node's main listener answers health openly as its local operator: not a grant.
+  const main = deriveNodeStatus(node, undefined, { health: health('superadmin', { auth: 'none', principal: { kind: 'local', role: 'superadmin' } }) }, [ME], 3);
+  assert.equal(main.phase, 'unauthorised');
+  assert.match(main.error ?? '', /main listener/);
+  // A managed node that is a standby manager too is never missing from its own list.
+  assert.equal(deriveNodeStatus(node, undefined, { health: health('admin'), access: { status: 200, body: { config: { allowed: [{ npub: ME, role: 'admin' }] }, status: {} } } }, [ME, A], 1).managersInSync, true);
+  // Only the job's state travels, not its log.
+  const withJob = deriveNodeStatus(node, undefined, { health: health('admin'), uiUpdate: { status: 200, body: { current: '1', newer: false, job: { state: 'failed', restarting: false, log: ['a', 'b'], error: 'x' } } } }, [ME], 1);
+  assert.deepEqual(withJob.uiUpdate?.job, { state: 'failed' });
   assert.equal(deriveNodeStatus(node, undefined, { health: { status: 503, body: {} } }, [ME], 3).phase, 'not-ready');
   const off = deriveNodeStatus(node, ok, { health: new FleetError('cannot reach', 'offline') }, [ME], 4);
   assert.equal(off.phase, 'offline');
@@ -136,6 +145,17 @@ test('Fleet: saves, probes with bounded concurrency, and reports the nodes in or
   fleet.close();
 });
 
+test('Fleet: concurrent saves land in order, the last one wins', async () => {
+  const path = file();
+  const fleet = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson: fakeFetch({}).fetchJson, file: path, intervalMs: 60_000 });
+  await fleet.start();
+  await Promise.all([fleet.save({ nodes: [{ npub: A }], managers: [] }), fleet.save({ nodes: [{ npub: B }], managers: [] })]);
+  const { readFileSync } = await import('node:fs');
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).nodes.map((n: { npub: string }) => n.npub), [B]);
+  assert.deepEqual(fleet.config.nodes.map((n) => n.npub), [B]);
+  fleet.close();
+});
+
 test('Fleet: a file that does not load is never overwritten', async () => {
   const path = file();
   const { writeFileSync } = await import('node:fs');
@@ -144,5 +164,10 @@ test('Fleet: a file that does not load is never overwritten', async () => {
   await fleet.start();
   assert.match(fleet.status.error ?? '', /cannot load/);
   await assert.rejects(fleet.save({ nodes: [], managers: [] }), /cannot load/);
+  // Once the file is fixed (or removed), saving works again without a restart.
+  writeFileSync(path, '{"nodes":[],"managers":[]}');
+  await fleet.save({ nodes: [{ npub: A }], managers: [] });
+  assert.equal(fleet.status.error, undefined);
+  assert.equal(fleet.config.nodes.length, 1);
   fleet.close();
 });

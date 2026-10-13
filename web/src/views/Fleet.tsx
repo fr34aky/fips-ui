@@ -14,11 +14,12 @@ import type { Snapshot } from '../lib/types';
  * of standby managers is edited below it.
  */
 export function Fleet({ snap }: { snap: Snapshot }) {
+  const toast = useToast();
   const r = usePoll(() => fleetApi.get(), [], 10_000);
   const [probing, setProbing] = useState(false);
   const probeNow = async () => {
     setProbing(true);
-    try { await fleetApi.get(true); r.refresh(); } finally { setProbing(false); }
+    try { await fleetApi.get(true); r.refresh(); } catch (x) { toast('err', (x as Error).message); } finally { setProbing(false); }
   };
   const own = r.data?.own ?? snap.status?.npub;
   return (
@@ -37,7 +38,8 @@ export function Fleet({ snap }: { snap: Snapshot }) {
 function Nodes({ data, own }: { data: FleetData; own?: string }) {
   if (data.status.error) return <div className="px-4 pb-4"><ErrorNote>{data.status.error}</ErrorNote></div>;
   if (data.nodes.length === 0) return <Empty>No nodes yet. Add the first one below: it must run fips-ui with <b>Web UI over the mesh</b> on, listing this node as an admin.</Empty>;
-  const attention = data.nodes.filter((n) => n.phase !== 'ok' && n.error);
+  // Nodes with something to do; not the ones that simply have not been probed yet.
+  const attention = data.nodes.filter((n) => n.phase !== 'ok' && n.error && n.lastAttempt > 0);
   return (
     <div className="grid gap-3 pb-4">
       <div className="hidden md:block overflow-x-auto">

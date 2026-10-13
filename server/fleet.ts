@@ -95,8 +95,19 @@ export function makeFetchJson(meshAddress: (npub: string) => Promise<string>, ve
       const cause = (e as Error).cause;
       throw new FleetError(`cannot reach [${addr}]:${port} (${cause ? String((cause as Error).message ?? cause) : (e as Error).message})`, 'offline');
     }
-    const text = await res.text();
-    if (text.length > MAX_ANSWER) throw new FleetError(`the node's answer is too large (${text.length} bytes)`);
+    // Read at most MAX_ANSWER bytes: a node is trusted less than this one, so its answer is bounded before it is held.
+    if (Number(res.headers.get('content-length')) > MAX_ANSWER) { await res.body?.cancel().catch(() => {}); throw new FleetError('the node\'s answer is too large'); }
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (let r = await reader.read(); !r.done; r = await reader.read()) {
+        size += r.value.byteLength;
+        if (size > MAX_ANSWER) { await reader.cancel().catch(() => {}); throw new FleetError(`the node's answer is too large (over ${MAX_ANSWER} bytes)`); }
+        chunks.push(r.value);
+      }
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
     let body: unknown = null;
     try { body = text ? JSON.parse(text) : null; } catch { body = { error: text.slice(0, 200) }; }
     return { status: res.status, body };
@@ -156,6 +167,9 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
   const refused = classify(h);
   if (refused) return { ...base, phase: refused.kind === 'unauthorised' ? 'unauthorised' : refused.kind === 'not-ready' ? 'not-ready' : 'error', error: refused.message };
   const health = asRecord(h) ?? {};
+  // Only the node's mesh listener knows this node by its npub. Its main listener answers /api/health too (openly,
+  // as the local operator): that is not a grant, and every other call there would be refused.
+  if (health.auth !== 'npub') return { ...base, phase: 'unauthorised', error: 'the node\'s main listener answered, not its mesh listener: Web UI over the mesh is off there, or its port differs' };
   const principal = health.principal as { role?: Role } | undefined;
   const role = principal?.role;
   const out: NodeStatus = {
@@ -171,15 +185,16 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
   const access = asRecord(probe.access);
   const allowed = (access?.config as { allowed?: AccessEntry[] } | undefined)?.allowed;
   if (Array.isArray(allowed)) {
-    const targetOwn = str((access?.status as { npub?: unknown } | undefined)?.npub);
-    const missing = managers.filter((m) => m !== targetOwn && !allowed.some((e) => e?.npub === m && isAdmin(e.role)));
+    // The node itself cannot be on its own list (a standby that is also managed).
+    const missing = managers.filter((m) => m !== node.npub && !allowed.some((e) => e?.npub === m && isAdmin(e.role)));
     out.managersInSync = missing.length === 0; out.managersMissing = missing;
   }
   const u = asRecord(probe.uiUpdate);
   if (u) {
     const latest = str((u.latest as { version?: unknown } | null | undefined)?.version);
     const helper = u.helper as { installed?: unknown; shipped?: unknown } | undefined;
-    out.uiUpdate = { current: str(u.current), latest, available: u.newer === true, job: (u.job as NodeStatus['uiUpdate'] extends infer T ? T extends { job?: infer J } ? J : never : never) ?? null };
+    const job = u.job as { state?: unknown; restarting?: unknown } | null | undefined;
+    out.uiUpdate = { current: str(u.current), latest, available: u.newer === true, job: job && typeof job.state === 'string' ? { state: job.state, ...(job.restarting === true ? { restarting: true } : {}) } : null };
     if (helper) out.helper = { installed: typeof helper.installed === 'number' ? helper.installed : null, shipped: typeof helper.shipped === 'number' ? helper.shipped : null };
   }
   const g = asRecord(probe.upgrade);
@@ -216,6 +231,7 @@ export interface FleetDeps {
 }
 
 export interface FleetStatus { running: boolean; lastRun?: number; nextRun?: number; error?: string }
+let saveSeq = 0;
 
 export class Fleet {
   config: FleetConfig = { nodes: [], managers: [] };
@@ -232,6 +248,14 @@ export class Fleet {
   /** The file exists but could not be loaded: saving is refused until it does, so it is never overwritten. */
   private loadError: string | undefined;
   private own: string | undefined;
+  /** Loads and saves run one at a time, in order (a save cannot race the load at start, nor another save). */
+  private queue: Promise<unknown> = Promise.resolve();
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.queue.then(fn);
+    this.queue = p.catch(() => {});
+    return p;
+  }
 
   constructor(deps: FleetDeps) {
     this.deps = deps;
@@ -246,9 +270,15 @@ export class Fleet {
   get enabled(): boolean { return this.config.nodes.length > 0; }
   get ownNpub(): string | undefined { return this.own; }
 
+  /** Read the file; a missing file means nothing is managed. The outcome is in `loadError` (cleared when it loads). */
+  private async load(): Promise<void> {
+    try { this.config = validateFleetConfig(JSON.parse(await readFile(this.file_, 'utf8'))); this.loadError = undefined; }
+    catch (e) { this.loadError = (e as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : `cannot load ${this.file_}: ${(e as Error).message}`; }
+    this.status = { ...this.status, error: this.loadError };
+  }
+
   async start(): Promise<void> {
-    try { this.config = validateFleetConfig(JSON.parse(await readFile(this.file_, 'utf8'))); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') { this.loadError = `cannot load ${this.file_}: ${(e as Error).message}`; this.status.error = this.loadError; } }
+    await this.serial(() => this.load());
     this.timer = setInterval(() => { if (this.enabled) void this.runOnce(false); }, this.intervalMs);
     this.timer.unref();
     if (this.enabled) void this.runOnce(true);
@@ -256,19 +286,22 @@ export class Fleet {
 
   close(): void { if (this.timer) { clearInterval(this.timer); this.timer = null; } }
 
-  /** Persist a new configuration and probe the nodes at once. */
-  async save(input: unknown): Promise<FleetConfig> {
-    if (this.loadError) throw new FleetError(`${this.loadError}; fix or remove the file first`, 'config');
-    const own = await this.deps.ownNpub().catch(() => undefined);
-    const cfg = validateFleetConfig(input, own);
-    await mkdir(dirname(this.file_), { recursive: true, mode: 0o700 });
-    const tmp = `${this.file_}.${process.pid}.tmp`;
-    try { await writeFile(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, this.file_); }
-    catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${this.file_}: ${(e as Error).message}`); }
-    this.config = cfg;
-    for (const npub of [...this.nodes.keys()]) if (!cfg.nodes.some((n) => n.npub === npub)) this.nodes.delete(npub);
-    if (this.enabled) void this.runOnce(true);
-    return cfg;
+  /** Persist a new configuration and probe the nodes at once. A file that failed to load is read again first, so fixing or removing it is enough. */
+  save(input: unknown): Promise<FleetConfig> {
+    return this.serial(async () => {
+      if (this.loadError) await this.load();
+      if (this.loadError) throw new FleetError(`${this.loadError}; fix or remove the file first`, 'config');
+      const own = await this.deps.ownNpub().catch(() => undefined);
+      const cfg = validateFleetConfig(input, own);
+      await mkdir(dirname(this.file_), { recursive: true, mode: 0o700 });
+      const tmp = `${this.file_}.${process.pid}.${++saveSeq}.tmp`;
+      try { await writeFile(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, this.file_); }
+      catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${this.file_}: ${(e as Error).message}`); }
+      this.config = cfg;
+      for (const npub of [...this.nodes.keys()]) if (!cfg.nodes.some((n) => n.npub === npub)) this.nodes.delete(npub);
+      if (this.enabled) void this.runOnce(true);
+      return cfg;
+    });
   }
 
   /** Probe every node now (one run at a time; a call during a run waits for that run). */
