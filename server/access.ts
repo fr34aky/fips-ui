@@ -28,17 +28,46 @@ import { expand6, isMeshAddress } from './net6.ts';
 import { query } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
 
-export type Role = 'viewer' | 'admin';
+/**
+ * viewer: read-only. admin: everything the local operator can do. superadmin: admin, plus the Node manager page
+ * on a node that manages others (the fleet endpoints); it exists so that an admin npub on the managing node
+ * does not automatically reach every managed node through it.
+ */
+export type Role = 'viewer' | 'admin' | 'superadmin';
+export const ROLES: readonly Role[] = ['viewer', 'admin', 'superadmin'];
+/** Whether a role may change this node (admin or superadmin). */
+export const isAdmin = (role: Role): boolean => role === 'admin' || role === 'superadmin';
+export const isSuperadmin = (role: Role): boolean => role === 'superadmin';
 export interface AccessEntry { npub: string; label?: string; role: Role }
 export interface AccessConfig { enabled: boolean; port: number; allowed: AccessEntry[] }
 export type Principal =
-  | { kind: 'local'; role: 'admin' }
+  | { kind: 'local'; role: Role }
   | { kind: 'mesh'; role: Role; npub: string; label?: string; address: string };
 
-export const LOCAL: Principal = { kind: 'local', role: 'admin' };
+/** The local operator owns this host: superadmin, so the Node manager page is available locally. */
+export const LOCAL: Principal = { kind: 'local', role: 'superadmin' };
 const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'access.json');
 
 export class AccessError extends Error {}
+/** A caller below superadmin tried to grant, change or drop a superadmin entry (answered 403, not 400). */
+export class ForbiddenError extends AccessError {}
+
+/**
+ * Why `after` may not replace `before` for a caller who is not a superadmin: superadmin entries can be neither
+ * added, nor changed, nor removed by an admin (otherwise an admin could promote itself). Null when nothing of
+ * the sort changes.
+ */
+export function superadminChange(before: AccessEntry[], after: AccessEntry[]): string | null {
+  const was = new Map(before.filter((e) => isSuperadmin(e.role)).map((e) => [e.npub, e]));
+  for (const e of after) {
+    const prev = was.get(e.npub);
+    if (isSuperadmin(e.role) && !prev) return `only a superadmin can grant superadmin (${e.npub})`;
+    if (prev && !isSuperadmin(e.role)) return `only a superadmin can change the role of a superadmin (${e.npub})`;
+    if (prev && (prev.label ?? '') !== (e.label ?? '')) return `only a superadmin can change a superadmin's entry (${e.npub})`;
+  }
+  for (const npub of was.keys()) if (!after.some((e) => e.npub === npub)) return `only a superadmin can remove a superadmin (${npub})`;
+  return null;
+}
 
 /**
  * Every IPv6 address configured on this host (expanded), re-read at most once a second. /proc/net/if_inet6 lists
@@ -74,7 +103,7 @@ export function validateAccess(input: unknown): AccessConfig {
   const allowed = x.allowed.map((e) => {
     const en = e as Partial<AccessEntry>;
     if (!NPUB_RE.test(String(en?.npub))) throw new AccessError(`invalid npub '${en?.npub}'`);
-    if (en.role !== 'viewer' && en.role !== 'admin') throw new AccessError(`role for ${en.npub} must be viewer or admin`);
+    if (!ROLES.includes(en.role as Role)) throw new AccessError(`role for ${en.npub} must be viewer, admin or superadmin`);
     if (seen.has(en.npub!)) throw new AccessError(`${en.npub} is listed twice`);
     seen.add(en.npub!);
     const label = typeof en.label === 'string' ? en.label.replace(/[^\p{L}\p{N} ._@-]/gu, '').slice(0, 40).trim() : '';
@@ -297,11 +326,12 @@ export class MeshAccess {
     void this.onChange(this.config).catch(() => {});
   }
 
-  /** Validate, derive addresses, persist, and only then put the new list into effect. */
-  save(input: unknown): Promise<void> {
+  /** Validate, derive addresses, persist, and only then put the new list into effect. `by` is the caller's role: below superadmin it may not touch superadmin entries. */
+  save(input: unknown, by: Role): Promise<void> {
     return this.serial(async () => {
       if (!this.loaded) throw new AccessError(this.loadError ?? 'the saved access list has not loaded yet');
       const cfg = validateAccess(input);
+      if (!isSuperadmin(by)) { const why = superadminChange(this.config.allowed, cfg.allowed); if (why) throw new ForbiddenError(why); }
       if (this.own && cfg.allowed.some((e) => e.npub === this.own!.npub)) throw new AccessError('this node\'s own npub cannot be on the list: any local user could use it to bypass the token');
       const map = await this.buildMap(cfg);
       await mkdir(dirname(FILE), { recursive: true, mode: 0o700 });

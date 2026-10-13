@@ -56,6 +56,7 @@ access stops admitting anyone.
 | ---- | --- |
 | viewer | Everything read-only: dashboards, peers, metrics, logs, topology. No Configuration, Firewall or Upgrade pages, no connect, disconnect or probe, and no view of the access list. |
 | admin | The same as someone at this machine, including changing the node's configuration and firewall as root and upgrading it. Grant it only to keys you trust as much as this host's own login. |
+| superadmin | Admin, plus the **Node manager** page on a node that manages other nodes (their fips-ui instances reached over the mesh). Admin on the managing node is deliberately not enough for that page: the managed nodes trust the managing node's npub, and this role decides which of its users may act through it. On a node that manages nothing it is the same as admin. Only a superadmin can grant, change or remove a superadmin entry (the API refuses an admin's attempt with 403). Releases from before the role existed (see the CHANGELOG) refuse an `access.json` that contains it, so remove such entries before going back to one. |
 
 An npub is a node, not a person: **everything that leaves the listed node under its npub gets its role**,
 including every local user of that node and, if it runs `fips-gateway`, every LAN client behind it. List
@@ -64,7 +65,7 @@ user could use it to get around `FIPS_UI_TOKEN`). Browsers must address the node
 `<its npub>.fips`, or a name that this node's own `/etc/fips/hosts` maps to its npub (a name that only exists
 in the visiting node's hosts file is refused; use the npub name or the address).
 
-The local listener (loopback) is always admin. Mesh access requires helper v5 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
+The local listener (loopback) is always superadmin (admin everywhere, and the Node manager page). Mesh access requires helper v5 (`sudo ./deploy/setup-local.sh`). `FIPS_UI_TOKEN`, when set, is required on the local
 listener only; over the mesh the npub is the credential.
 
 ## Configuration

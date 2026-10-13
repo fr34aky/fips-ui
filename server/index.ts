@@ -18,7 +18,7 @@ import { HostsFollowers, isSyncRequest, parseSubtree, syncRole } from './hosts-f
 import { SelfUpdate } from './self-update.ts';
 import { uiVersion } from './version.ts';
 import { createConfigMerge, readProposal, clearProposal } from './config-merge.ts';
-import { MeshAccess, LOCAL, AccessError, type Principal, type AccessConfig } from './access.ts';
+import { MeshAccess, LOCAL, AccessError, ForbiddenError, isAdmin, isSuperadmin, type Principal, type AccessConfig } from './access.ts';
 import { expand6, isMeshAddress } from './net6.ts';
 
 function envInt(name: string, def: number, min: number, max: number): number {
@@ -260,7 +260,9 @@ const principals = new WeakMap<Req, Principal>();
 const mainRequests = new WeakSet<Req>();
 /** The recorded principal, or the local operator for requests the main listener accepted; otherwise nobody. */
 const principalOf = (req: Req): Principal => principals.get(req) ?? (mainRequests.has(req) ? LOCAL : NOBODY);
-const canChange = (req: Req) => !READ_ONLY && principalOf(req).role === 'admin';
+/** Whether the caller is an admin or superadmin (reads reserved for admins). */
+const isAdminReq = (req: Req) => isAdmin(principalOf(req).role);
+const canChange = (req: Req) => !READ_ONLY && isAdminReq(req);
 // Node upgrade API (/api/upgrade/*). Reads are open like every other API route; mutations are
 // refused in read-only mode. Token auth (when configured) is enforced by route() before this runs.
 setDaemonProbe(async () => (await query<{ pid?: number }>('show_status', undefined, { timeoutMs: 2000 })).pid);
@@ -388,13 +390,13 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || pr.role !== 'admin', upgrade: true, serviceControl: pr.role === 'admin' && (await serviceControlMode()) !== null, nodeManagement: pr.role === 'admin' && (await admin.helperInfo()).managementCapable && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
   // Upgrade state (paths, logs, and a refresh that spends the GitHub rate limit) is for admins only.
   if (p.startsWith('/api/upgrade')) {
-    if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' });
+    if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' });
     if (method === 'POST' && admin.changePending()) return json(res, 409, { error: 'a node-management change is in progress; wait for it to finish' });
     // Requests that start an upgrade or rollback are counted before any await, so a node-management change
     // cannot start while one of them reads its body (the upgrade module takes its own slot after that).
@@ -414,7 +416,7 @@ async function route(req: Req, res: Res) {
     return json(res, 200, { proposal: { ...prop, stale: !!cur && cur.base !== prop.base } });
   }
   // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
-  if (p.startsWith('/api/admin/')) { if (principalOf(req).role !== 'admin') return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
+  if (p.startsWith('/api/admin/')) { if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
   if (p === '/api/snapshot') return json(res, 200, await pollOnce());
 
   // Public domain names (server/pubdom.ts): /api/pubdom/state says what is installed and running right now;
@@ -423,7 +425,7 @@ async function route(req: Req, res: Res) {
   // The newest release on GitHub, for the install and update buttons (admins: it is a request to a third party).
   if (p === '/api/pubdom/releases') {
     if (method !== 'GET') throw new HttpError(405, 'GET only');
-    if (principalOf(req).role !== 'admin') throw new HttpError(403, 'admin role required');
+    if (!isAdminReq(req)) throw new HttpError(403, 'admin role required');
     return json(res, 200, await pubdomLatestRelease(url.searchParams.get('refresh') === '1'));
   }
   if (p.startsWith('/api/pubdom/')) {
@@ -433,7 +435,7 @@ async function route(req: Req, res: Res) {
     // The files the editors show: the side's configuration, or a zone file the zones listing named. Admins
     // only: unlike the socket's answers, a file is whatever the operator wrote in it.
     if (cmd === 'config-file' || cmd === 'zone-file') {
-      if (principalOf(req).role !== 'admin') throw new HttpError(403, 'admin role required');
+      if (!isAdminReq(req)) throw new HttpError(403, 'admin role required');
     }
     if (cmd === 'config-file') return json(res, 200, readEditable(PUBDOM_CONFIG_FILE[side]));
     if (cmd === 'zone-file' && side === 'server') {
@@ -459,7 +461,7 @@ async function route(req: Req, res: Res) {
 
   if (p === '/api/access' && method === 'GET') {
     const you = principalOf(req);
-    if (you.role !== 'admin') return json(res, 200, { you });
+    if (!isAdmin(you.role)) return json(res, 200, { you });
     const h = await admin.helperInfo();
     return json(res, 200, { config: mesh.config, status: mesh.status(), file: mesh.file, you, firewallManaged: h.features.firewall !== 'none', guardSupported: h.features.guard !== 'none', helperVersion: h.version, guardHelperVersion: GUARD_HELPER_VERSION });
   }
@@ -512,7 +514,7 @@ async function route(req: Req, res: Res) {
   // ---- mutating -----------------------------------------------------------------------------
   if (method !== 'POST') throw new HttpError(404, 'not found');
   if (READ_ONLY) throw new HttpError(403, 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)');
-  if (principalOf(req).role !== 'admin') throw new HttpError(403, 'your npub has viewer access; changes need admin');
+  if (!isAdminReq(req)) throw new HttpError(403, 'your npub has viewer access; changes need admin');
   const body = await readJsonBody(req);
 
   if (p === '/api/access') {
@@ -520,7 +522,8 @@ async function route(req: Req, res: Res) {
     // The mesh listener binds this node's fips0 address, which the main listener already holds on its port when it
     // is bound to every IPv6 address or to that address itself.
     if (want?.enabled === true && mainHoldsMeshPort(Number(want.port))) throw new HttpError(400, `port ${want.port} is already used by the main listener (FIPS_UI_HOST=${HOST}); choose another port for mesh access`);
-    try { await mesh.save(body); } catch (e) { throw new HttpError(e instanceof AccessError ? 400 : 500, (e as Error).message); }
+    // An admin may not grant, change or remove superadmin entries (it could promote itself otherwise).
+    try { await mesh.save(body, principalOf(req).role); } catch (e) { throw new HttpError(e instanceof ForbiddenError ? 403 : e instanceof AccessError ? 400 : 500, (e as Error).message); }
     // Syncs already in flight (or chained on them) were built from the previous list: wait for a few of them,
     // then run this save's own full sync. The dirty flag guarantees a full sync on the next tick regardless.
     for (let i = 0; meshSync.running && i < 3; i++) await meshSync.running.catch(() => {});

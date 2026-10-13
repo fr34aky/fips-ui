@@ -4,6 +4,7 @@ import { Card, Chip, Copyable, Empty, ErrorNote, useToast } from './ui';
 import { api } from '../lib/api';
 import { saveAccess, saveMessage, useAccess, type AccessConfig as Config, type AccessSaveResult as SaveResponse, type Role } from '../lib/access';
 import { shortKey } from '../lib/format';
+import { isAdmin, isSuperadmin, mayChangeRole } from '../lib/types';
 import { NameText } from './PeerName';
 import { useHosts } from '../lib/names';
 
@@ -36,7 +37,12 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
   const st = data.status!;
   // Hosts-file names not yet on the list (and not this node itself), for the picker.
   const pickable = hosts.filter((h) => h.npub !== st.npub && !draft.allowed.some((e) => e.npub === h.npub));
-  const selfRemoved = you.kind === 'mesh' && !draft.allowed.some((e) => e.npub === you.npub && e.role === 'admin');
+  const selfRemoved = you.kind === 'mesh' && !draft.allowed.some((e) => e.npub === you.npub && isAdmin(e.role));
+  // A superadmin that gives up the role over the mesh cannot take it back itself.
+  const selfDemoted = !selfRemoved && you.kind === 'mesh' && isSuperadmin(you.role) && !draft.allowed.some((e) => e.npub === you.npub && isSuperadmin(e.role));
+  // The superadmin role is offered where it means something: to a superadmin (the Node manager page exists for them).
+  const roles: Role[] = isSuperadmin(you.role) ? ['viewer', 'admin', 'superadmin'] : ['viewer', 'admin'];
+  const roleOptions = roles.map((r) => <option key={r} value={r}>{r}</option>);
 
   const addEntry = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -83,8 +89,8 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
               {draft.allowed.map((e, i) => (
                 <tr key={e.npub}>
                   <td><div className="font-medium"><NameText npub={e.npub} name={e.label} fallback={<span className="text-ink-3">no label</span>} /></div><Copyable text={e.npub} display={shortKey(e.npub, 14, 6)} className="text-[11px] text-ink-3" /></td>
-                  <td>{readOnly ? <Chip tone={e.role === 'admin' ? 'accent' : 'neutral'}>{e.role}</Chip> : <select className="input h-8 w-auto" value={e.role} onChange={(x) => setDraft({ ...draft, allowed: draft.allowed.map((y, j) => (j === i ? { ...y, role: x.target.value as Role } : y)) })}><option value="viewer">viewer</option><option value="admin">admin</option></select>}</td>
-                  <td className="text-right">{!readOnly && <button className="btn ghost icon sm" title="Remove" onClick={() => setDraft({ ...draft, allowed: draft.allowed.filter((_, j) => j !== i) })}><Trash2 size={13} /></button>}</td>
+                  <td>{readOnly || !mayChangeRole(you.role, e.role) ? <Chip tone={isAdmin(e.role) ? 'accent' : 'neutral'} title={readOnly ? undefined : 'Only a superadmin can change this entry'}>{e.role}</Chip> : <select className="input h-8 w-auto" value={e.role} onChange={(x) => setDraft({ ...draft, allowed: draft.allowed.map((y, j) => (j === i ? { ...y, role: x.target.value as Role } : y)) })}>{roleOptions}</select>}</td>
+                  <td className="text-right">{!readOnly && mayChangeRole(you.role, e.role) && <button className="btn ghost icon sm" title="Remove" onClick={() => setDraft({ ...draft, allowed: draft.allowed.filter((_, j) => j !== i) })}><Trash2 size={13} /></button>}</td>
                 </tr>
               ))}
             </tbody></table></div>
@@ -100,14 +106,15 @@ export function RemoteAccess({ readOnly }: { readOnly: boolean }) {
               <input className="input mono flex-1 min-w-[220px]" placeholder="npub1… or hosts-file name" list="access-hosts" value={add.id} onChange={(e) => setAdd({ ...add, id: e.target.value })} />
               <datalist id="access-hosts">{pickable.map((h) => <option key={h.hostname} value={h.hostname}>{shortKey(h.npub, 12, 6)}</option>)}</datalist>
               <input className="input w-36" placeholder="label" value={add.label} onChange={(e) => setAdd({ ...add, label: e.target.value })} maxLength={40} />
-              <select className="input w-28" value={add.role} onChange={(e) => setAdd({ ...add, role: e.target.value as Role })}><option value="viewer">viewer</option><option value="admin">admin</option></select>
+              <select className="input w-28" value={add.role} onChange={(e) => setAdd({ ...add, role: e.target.value as Role })}>{roleOptions}</select>
               <button className="btn"><Plus size={14} />Add</button>
             </form>
           )}
-          <p className="text-xs text-ink-3"><b>Viewer</b>: everything read-only, no configuration, firewall or upgrade pages. <b>Admin</b>: the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to npubs whose keys you trust as much as this host's own login. An npub is a whole node: all of its local users and, if it runs fips-gateway, its LAN clients share the grant.</p>
+          <p className="text-xs text-ink-3"><b>Viewer</b>: everything read-only, no configuration, firewall or upgrade pages. <b>Admin</b>: the same rights as someone on this machine, including changing the node's configuration and firewall as root. Grant it only to npubs whose keys you trust as much as this host's own login. An npub is a whole node: all of its local users and, if it runs fips-gateway, its LAN clients share the grant.{isSuperadmin(you.role) && <> <b>Superadmin</b>: admin here, plus the Node manager page, which reaches every node this one manages. Only a superadmin can grant, change or remove it.</>}</p>
         </div>
 
         {selfRemoved && <ErrorNote>Saving removes your own admin access; this page will stop working for you over the mesh.</ErrorNote>}
+        {selfDemoted && <ErrorNote>Saving gives up your own superadmin role; only another superadmin (or someone at this machine) can give it back.</ErrorNote>}
         {lastFw && !lastFw.ok && <ErrorNote>Not fully applied: {[lastFw.skipped, lastFw.guard && `guard: ${lastFw.guard}`, lastFw.rule && `firewall rule: ${lastFw.rule}`].filter(Boolean).join('; ')}. The UI retries every 15 seconds.</ErrorNote>}
         {draft.enabled && (data.helperVersion ?? 0) < (data.guardHelperVersion ?? 5) && <ErrorNote>Mesh access needs the privileged helper (v5): it installs the kernel rule that makes mesh source addresses trustworthy. Until it is installed nobody is admitted from the mesh. Run <code>sudo ./deploy/setup-local.sh</code>.</ErrorNote>}
 

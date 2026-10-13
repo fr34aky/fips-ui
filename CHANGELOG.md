@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Role `superadmin` for Web UI over the mesh: admin, plus the upcoming Node
+  manager page on a node that manages other nodes. The local listener is now
+  superadmin; admin keeps exactly its former rights.
+
 ### Fixed
 
 - Right after fips-ui starts, a public domain whose zone names this node by its
