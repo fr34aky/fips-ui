@@ -312,19 +312,21 @@ test('Fleet.syncManagers writes the merged list to the node and reports it; a vi
   const again = await fleet.syncManagers(A);
   assert.equal(again.changed, false);
   assert.equal(writes.length, 1);
-  // Bulk: one result per node, in order.
-  const all = await fleet.syncAllManagers();
-  assert.deepEqual(all.map((x) => x.npub), [A]);
+  // Bulk without a list: only reachable out-of-sync nodes (none now); with a list: those.
+  assert.deepEqual(await fleet.syncAllManagers(), []);
+  const all = await fleet.syncAllManagers([A, B]);
+  assert.deepEqual(all.map((x) => [x.npub, x.changed]), [[A, false]], 'an unknown npub is left out, not thrown');
   await assert.rejects(fleet.syncManagers(B), /not managed/);
   fleet.close();
 });
 
-test('Fleet.expectRestart: a node that is away after being told to restart reads as restarting until it answers', async () => {
+test('Fleet.expectRestart: the node is shown restarting once it is away, until it answers again or the window ends', async () => {
   let up = true;
+  let uptime = 500;
   let now = 1000;
   const fetchJson: FetchJson = async (_n, _p, path) => {
     if (!up) throw new FleetError('cannot reach', 'offline');
-    if (path === '/api/health') return health('admin');
+    if (path === '/api/health') return health('admin', { uiUptimeSecs: uptime });
     return { status: 200, body: { peer_count: 1, config: { allowed: [{ npub: ME, role: 'admin' }] }, status: { npub: A } } };
   };
   const fleet = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson, file: file(), intervalMs: 60_000, now: () => now });
@@ -332,20 +334,57 @@ test('Fleet.expectRestart: a node that is away after being told to restart reads
   await fleet.save({ nodes: [{ npub: A }], managers: [] });
   await fleet.refresh();
   assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
-  up = false;
+  // Told to restart, still up: nothing changes yet (the node answers 202 and restarts later).
   fleet.expectRestart(A, 60_000);
-  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting');
-  await fleet.refresh();
-  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting', 'offline inside the window reads as restarting');
-  assert.equal(fleet.nodeStatus(A)?.uiVersion, '0.13.0', 'the last known version stays');
-  up = true;
+  assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
+  uptime = 510;
   await fleet.refresh();
   assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
-  // Outside the window an unreachable node is offline again.
+  // Away: restarting, with the last known version.
   up = false;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting');
+  assert.equal(fleet.nodeStatus(A)?.uiVersion, '0.13.0');
+  // Back: the wait is over; away again later is plain offline.
+  up = true; uptime = 3;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
+  up = false;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'offline');
+  // A restart between two probes shows as a fallen uptime: the wait ends without a failed probe.
+  up = true; uptime = 100;
+  await fleet.refresh();
+  fleet.expectRestart(A, 60_000);
+  uptime = 2;
+  await fleet.refresh();
+  up = false;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'offline', 'the uptime fell, so the restart had happened');
+  // The window ends: a node still away is offline.
+  up = true;
+  await fleet.refresh();
   fleet.expectRestart(A, 10);
+  up = false;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting');
   now += 20;
   await fleet.refresh();
-  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting', 'the window check runs on the restart timer; a refresh inside it keeps the state');
+  assert.equal(fleet.nodeStatus(A)?.phase, 'offline');
+  fleet.close();
+});
+
+test('Fleet.pollNode: a probe already under way is shared, not raced', async () => {
+  let calls = 0;
+  const fetchJson: FetchJson = async (_n, _p, path) => { calls++; await new Promise((r) => setTimeout(r, 20)); return path === '/api/health' ? health('admin') : { status: 200, body: {} }; };
+  const fleet = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson, file: file(), intervalMs: 60_000 });
+  await fleet.start();
+  await fleet.save({ nodes: [{ npub: A }], managers: [] });
+  await fleet.refresh();
+  const before = calls;
+  const node = { npub: A, port: 8321 };
+  const [x, y] = await Promise.all([fleet.pollNode(node, false), fleet.pollNode(node, false)]);
+  assert.equal(x, y);
+  assert.equal(calls - before, 3, 'health, status and access once');
   fleet.close();
 });

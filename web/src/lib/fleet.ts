@@ -29,7 +29,7 @@ export const fleetApi = {
   save: (config: FleetConfig) => api.local.post<FleetData>('/api/fleet', config),
   /** Make every manager an admin on that node (or on all of them). */
   syncManagers: (npub: string) => api.local.post<SyncResult>(`/api/fleet/nodes/${encodeURIComponent(npub)}/sync-managers`),
-  syncAllManagers: () => api.local.post<{ results: SyncResult[] }>('/api/fleet/sync-managers'),
+  syncAllManagers: (npubs: string[]) => api.local.post<{ results: SyncResult[] }>('/api/fleet/sync-managers', { npubs }),
 };
 
 /** What a phase says, and how loud. */
