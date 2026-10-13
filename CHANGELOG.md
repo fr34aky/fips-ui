@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Role `superadmin` for Web UI over the mesh: admin, plus the upcoming Node
   manager page on a node that manages other nodes. The local listener is now
   superadmin; admin keeps exactly its former rights.
+- **Node manager** page (superadmins): a list of other fips nodes whose fips-ui
+  this one reaches over the mesh, probed every 30 seconds for reachability,
+  daemon and fips-ui versions, available updates, the helper version and
+  whether every manager is listed as an admin there. Standby managers can be
+  named for the day this node is lost ([docs/fleet.md](docs/fleet.md)).
 
 ### Fixed
 

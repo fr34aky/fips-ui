@@ -17,6 +17,7 @@ import { Upgrade } from './views/Upgrade';
 const Config = lazy(() => import('./views/Config'));
 import { Firewall } from './views/Firewall';
 import { PublicDomains } from './views/PublicDomains';
+import { Fleet } from './views/Fleet';
 import { shortKey } from './lib/format';
 import { useHostName } from './lib/names';
 
@@ -51,11 +52,13 @@ export default function App() {
   // The public-domains page exists where the node runs the resolver or the server (health says), and for an
   // admin whose helper can install them.
   const pd = health?.pubdom;
-  const hidden: ViewId[] = (pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom'];
+  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet ? [] : ['fleet' as const])];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
     body = <Empty>This page needs the admin role; your npub has viewer access.</Empty>;
+  } else if (route.view === 'fleet' && health && !health.fleet) {
+    body = <Empty>{health.readOnly ? 'This UI instance is read-only; the Node manager is off.' : 'This page needs the superadmin role.'}</Empty>;
   } else if (!snap) {
     body = live.refused ? <ErrorNote>The FIPS UI server refused this browser: {live.refused}</ErrorNote>
       : live.conn === 'reconnecting' ? <ErrorNote>Cannot reach the FIPS UI server. Retrying…</ErrorNote> : <Empty><div className="pulse">Connecting to the node…</div></Empty>;
@@ -72,6 +75,7 @@ export default function App() {
       case 'gateway': body = <Gateway snap={snap} />; break;
       case 'pubdom': body = <PublicDomains health={health} />; break;
       case 'upgrade': body = <Upgrade />; break;
+      case 'fleet': body = <Fleet snap={snap} />; break;
       case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;
       case 'firewall': { const port = route.params.get('port'); body = <Firewall snap={snap} readOnly={!!health?.readOnly} prefill={port ? { port, proto: route.params.get('proto') === 'udp' ? 'udp' : 'tcp', comment: route.params.get('note') ?? undefined } : null} />; break; }
       default: body = <Overview snap={snap} health={health} onNav={nav} />;

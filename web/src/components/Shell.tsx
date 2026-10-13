@@ -1,10 +1,10 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe } from 'lucide-react';
+import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe, Server } from 'lucide-react';
 import type { ConnState } from '../lib/api';
 import { isAdmin, type Principal } from '../lib/types';
 import { useUiUpdate } from '../lib/uiUpdate';
 
-export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'pubdom' | 'upgrade' | 'config' | 'firewall';
+export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'pubdom' | 'upgrade' | 'config' | 'firewall' | 'fleet';
 
 export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[] = [
   { id: 'overview', label: 'Overview', icon: <Activity size={17} />, hint: 'Node status at a glance' },
@@ -21,6 +21,7 @@ export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[]
   { id: 'config', label: 'Configuration', icon: <FileCog size={17} />, hint: 'Edit fips.yaml with automatic rollback' },
   { id: 'firewall', label: 'Firewall', icon: <BrickWall size={17} />, hint: 'fips0 firewall service and inbound rules' },
   { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={17} />, hint: 'Install a release or build master' },
+  { id: 'fleet', label: 'Node manager', icon: <Server size={17} />, hint: 'Other fips nodes managed from this one' },
 ];
 
 export function useTheme() {
@@ -34,7 +35,7 @@ export function useTheme() {
 }
 
 /** Pages that only make sense with the admin role. */
-export const ADMIN_VIEWS: ViewId[] = ['config', 'firewall', 'upgrade'];
+export const ADMIN_VIEWS: ViewId[] = ['config', 'firewall', 'upgrade', 'fleet'];
 
 export function Shell({ view, onNav, conn, nodeName, version, uiVersion, principal, children, badge, hidden = [] }: { hidden?: ViewId[]; view: ViewId; onNav: (v: ViewId) => void; conn: ConnState; nodeName: string; version?: string; uiVersion?: string; principal?: Principal; children: ReactNode; badge?: ReactNode }) {
   const nav = (principal && !isAdmin(principal.role) ? NAV.filter((n) => !ADMIN_VIEWS.includes(n.id)) : NAV).filter((n) => !hidden.includes(n.id));
