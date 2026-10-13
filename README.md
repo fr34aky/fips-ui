@@ -198,6 +198,7 @@ GET  /api/ui-update                   newest fips-ui release; for admins (not re
 ```
 GET  /api/fleet                       the managed nodes with what each last answered (?refresh=1 probes them now);  POST {nodes: [{npub, label?, port?}], managers: [{npub, label?}]} saves the list
 GET  /api/fleet/nodes/<npub>/api/…    that node's own API, forwarded (GET and POST, streams included): the pages above shown for a managed node
+POST /api/fleet/nodes/<npub>/sync-managers   make every manager (this node and the standbys) an admin on that node;  POST /api/fleet/sync-managers for all nodes
 ```
 
 **Node management** (through the privileged helper, [docs/node-management.md](docs/node-management.md))

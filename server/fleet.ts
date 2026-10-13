@@ -13,7 +13,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { isAdmin, type AccessEntry, type Role } from './access.ts';
+import { isAdmin, MAX_ACCESS_ENTRIES, type AccessEntry, type Role } from './access.ts';
 import { sendJson } from './http.ts';
 
 const DEFAULT_FILE = process.env.FIPS_UI_FLEET_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'fleet.json');
@@ -222,6 +222,32 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
   return out;
 }
 
+// ---- the manager set on a node --------------------------------------------------------------------
+
+/**
+ * What a node's access list must become for every manager to be an admin there: missing managers are appended as
+ * admins, viewers among them are raised to admin, admins and superadmins are left alone, and nothing is ever
+ * removed (the node's operator keeps the last word over everyone else). The node itself is skipped: it cannot be
+ * on its own list.
+ */
+export function mergeManagers(allowed: AccessEntry[], managers: string[], nodeNpub: string): { allowed: AccessEntry[]; added: string[]; promoted: string[] } {
+  const added: string[] = [], promoted: string[] = [];
+  const out = allowed.map((e) => {
+    if (!managers.includes(e.npub) || isAdmin(e.role)) return e;
+    promoted.push(e.npub);
+    return { ...e, role: 'admin' as Role };
+  });
+  for (const m of managers) {
+    if (m === nodeNpub || out.some((e) => e.npub === m)) continue;
+    added.push(m);
+    out.push({ npub: m, role: 'admin', label: 'fips-ui manager' });
+  }
+  if (out.length > MAX_ACCESS_ENTRIES) throw new FleetError(`the node's access list would exceed ${MAX_ACCESS_ENTRIES} entries`, 'config');
+  return { allowed: out, added, promoted };
+}
+
+export interface SyncResult { npub: string; changed: boolean; added: string[]; promoted: string[]; error?: string; node?: NodeStatus }
+
 // ---- the fleet ----------------------------------------------------------------------------------
 
 export interface FleetDeps {
@@ -260,6 +286,17 @@ export class Fleet {
   private own: string | undefined;
   /** Loads and saves run one at a time, in order (a save cannot race the load at start, nor another save). */
   private queue: Promise<unknown> = Promise.resolve();
+  /**
+   * Nodes told to restart their fips-ui (self-update, install). They answer 202 and restart later, so the wait is
+   * over only once the node was away and answers again (or its uptime fell), or the window ends. `down`: a probe
+   * has failed since; `uptime`: its fips-ui uptime when told.
+   */
+  private restarting = new Map<string, { until: number; down: boolean; uptime?: number; lastProbe: number }>();
+  /** While the node is still up (building its update), it is probed this often; once away, every timer tick. */
+  private static readonly UP_PROBE_MS = 15_000;
+  private restartTimer: NodeJS.Timeout | null = null;
+  /** One probe per node at a time: a later one waits for it rather than racing it (a stale answer could win). */
+  private probing = new Map<string, Promise<NodeStatus>>();
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.queue.then(fn);
@@ -294,7 +331,85 @@ export class Fleet {
     if (this.enabled) void this.runOnce(true);
   }
 
-  close(): void { if (this.timer) { clearInterval(this.timer); this.timer = null; } }
+  close(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.restartTimer) { clearInterval(this.restartTimer); this.restartTimer = null; }
+  }
+
+  /**
+   * The node's fips-ui is about to restart (it was told to update itself): it builds the new version first, which
+   * can take many minutes on a small machine, then exits. For up to `windowMs` it is probed every 15 seconds while
+   * still up and every five once away, and shown as restarting rather than offline, until it answers again.
+   */
+  expectRestart(npub: string, windowMs = 30 * 60_000): void {
+    if (!this.config.nodes.some((n) => n.npub === npub)) return;
+    // The node is still up at this point: its status stays as it is until a probe fails.
+    this.restarting.set(npub, { until: this.now() + windowMs, down: false, uptime: this.nodes.get(npub)?.uiUptimeSecs, lastProbe: this.now() });
+    if (!this.restartTimer) {
+      this.restartTimer = setInterval(() => {
+        for (const [n, r] of this.restarting) {
+          const node = this.config.nodes.find((x) => x.npub === n);
+          if (!node || this.now() > r.until) { this.endRestart(n); continue; }
+          if (!this.probing.has(n) && (r.down || this.now() - r.lastProbe >= Fleet.UP_PROBE_MS)) { r.lastProbe = this.now(); void this.pollNode(node, false); }
+        }
+        if (this.restarting.size === 0 && this.restartTimer) { clearInterval(this.restartTimer); this.restartTimer = null; }
+      }, 5000);
+      this.restartTimer.unref();
+    }
+  }
+
+  private static readonly NOT_BACK = 'did not answer again after its restart';
+  /** The wait is over (the window ended): a node still shown as restarting is offline. */
+  private endRestart(npub: string): void {
+    this.restarting.delete(npub);
+    const cur = this.nodes.get(npub);
+    if (cur?.phase === 'restarting') this.nodes.set(npub, { ...cur, phase: 'offline', error: Fleet.NOT_BACK });
+  }
+
+  /**
+   * Make every manager an admin on `npub` (the node's list is read, merged and written back through its own API).
+   * Never removes or demotes anyone there; the node's operator can always take the managers off again.
+   */
+  async syncManagers(npub: string): Promise<SyncResult> {
+    const node = this.config.nodes.find((n) => n.npub === npub);
+    if (!node) throw new FleetError('that node is not managed from here', 'config');
+    const managers = this.managers();
+    const result: SyncResult = { npub, changed: false, added: [], promoted: [] };
+    try {
+      const cur = await this.fetchJson(npub, node.port, '/api/access', { timeoutMs: 10_000 });
+      const refused = classify(cur);
+      if (refused) throw refused;
+      const body = cur.body as { config?: { enabled?: boolean; port?: number; allowed?: AccessEntry[] } } | null;
+      const cfg = body?.config;
+      if (!cfg || !Array.isArray(cfg.allowed)) throw new FleetError('the node did not show its access list: this node is not an admin there', 'viewer');
+      const merged = mergeManagers(cfg.allowed, managers, npub);
+      if (merged.added.length || merged.promoted.length) {
+        // The node's save waits for its own guard and firewall sync; it gets as long as any forwarded change.
+        const saved = await this.fetchJson(npub, node.port, '/api/access', { method: 'POST', body: { enabled: cfg.enabled, port: cfg.port, allowed: merged.allowed }, timeoutMs: POST_TIMEOUT_MS });
+        const failed = classify(saved);
+        if (failed) throw failed;
+        Object.assign(result, { changed: true, added: merged.added, promoted: merged.promoted });
+      }
+    } catch (e) { result.error = (e as Error).message; }
+    // What the node looks like now: after any probe already under way (it may predate the write), a fresh one; a node
+    // that could not be reached is not asked again.
+    if (result.error && !this.nodes.get(npub)?.reachable) result.node = this.nodes.get(npub);
+    else { await this.probing.get(npub)?.catch(() => {}); result.node = await this.pollNode(node, false, managers); }
+    return result;
+  }
+
+  /**
+   * syncManagers on the given nodes, a few at a time; without a list, on every reachable node whose managers are
+   * out of sync. A node that left the configuration meanwhile is reported, never thrown.
+   */
+  async syncAllManagers(npubs?: string[]): Promise<SyncResult[]> {
+    const wanted = npubs ? this.config.nodes.filter((n) => npubs.includes(n.npub)) : this.config.nodes.filter((n) => { const s = this.nodes.get(n.npub); return s?.reachable && s.managersInSync === false; });
+    const queue = [...wanted];
+    const out: SyncResult[] = [];
+    const worker = async () => { for (let n = queue.shift(); n; n = queue.shift()) out.push(await this.syncManagers(n.npub).catch((e: Error) => ({ npub: n.npub, changed: false, added: [], promoted: [], error: e.message }))); };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
+    return wanted.map((n) => out.find((r) => r.npub === n.npub)!).filter(Boolean);
+  }
 
   /** Persist a new configuration and probe the nodes at once. A file that failed to load is read again first, so fixing or removing it is enough. */
   save(input: unknown): Promise<FleetConfig> {
@@ -357,8 +472,16 @@ export class Fleet {
     }
   }
 
-  /** Probe one node and record what it said. Never throws. */
-  async pollNode(node: FleetNode, slow: boolean, managers = this.managers()): Promise<NodeStatus> {
+  /** Probe one node and record what it said. Never throws; a probe of the same node already under way is shared. */
+  pollNode(node: FleetNode, slow: boolean, managers = this.managers()): Promise<NodeStatus> {
+    const pending = this.probing.get(node.npub);
+    if (pending) return pending;
+    const p = this.probeNode(node, slow, managers).finally(() => { if (this.probing.get(node.npub) === p) this.probing.delete(node.npub); });
+    this.probing.set(node.npub, p);
+    return p;
+  }
+
+  private async probeNode(node: FleetNode, slow: boolean, managers: string[]): Promise<NodeStatus> {
     // A file copied from another manager (recovery) may list this node itself: never probed, flagged instead.
     if (this.own && node.npub === this.own) {
       const self: NodeStatus = { npub: node.npub, port: node.port, ...(node.label ? { label: node.label } : {}), reachable: false, phase: 'error', error: 'this is this node itself; remove it from the list', lastAttempt: this.now() };
@@ -378,7 +501,18 @@ export class Fleet {
       }
       await Promise.all(reads);
     }
-    const status = deriveNodeStatus(node, this.nodes.get(node.npub), probe, managers, this.now());
+    let status = deriveNodeStatus(node, this.nodes.get(node.npub), probe, managers, this.now());
+    // Told to restart: away reads as restarting, not offline. The wait ends when it answers after having been away
+    // (or with a smaller uptime: it restarted between two probes), when it refuses this node, or when the window ends.
+    const r = this.restarting.get(node.npub);
+    if (r) {
+      if (this.now() > r.until) { this.restarting.delete(node.npub); if (!status.reachable && status.phase === 'offline') status = { ...status, error: Fleet.NOT_BACK }; }
+      else if (status.reachable) {
+        const uptimeFell = r.uptime !== undefined && status.uiUptimeSecs !== undefined && status.uiUptimeSecs < r.uptime;
+        if (r.down || uptimeFell) this.restarting.delete(node.npub);
+      } else if (status.phase === 'unauthorised') this.restarting.delete(node.npub);
+      else { r.down = true; status = { ...status, phase: 'restarting', error: undefined }; }
+    }
     if (this.config.nodes.some((n) => n.npub === node.npub)) this.nodes.set(node.npub, status);
     return status;
   }

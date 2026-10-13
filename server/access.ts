@@ -48,6 +48,8 @@ export type Principal =
 export const LOCAL: Principal = { kind: 'local', role: 'superadmin' };
 const FILE = process.env.FIPS_UI_ACCESS_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'access.json');
 
+/** Most entries on the allowed list. */
+export const MAX_ACCESS_ENTRIES = 200;
 export class AccessError extends Error {}
 /** A caller below superadmin tried to grant, change or drop a superadmin entry (answered 403, not 400). */
 export class ForbiddenError extends AccessError {}
@@ -98,7 +100,7 @@ export function validateAccess(input: unknown): AccessConfig {
   if (typeof x?.enabled !== 'boolean') throw new AccessError('enabled must be a boolean');
   const port = Number(x.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new AccessError('port must be an integer between 1 and 65535');
-  if (!Array.isArray(x.allowed) || x.allowed.length > 200) throw new AccessError('allowed must be an array of at most 200 entries');
+  if (!Array.isArray(x.allowed) || x.allowed.length > MAX_ACCESS_ENTRIES) throw new AccessError(`allowed must be an array of at most ${MAX_ACCESS_ENTRIES} entries`);
   const seen = new Set<string>();
   const allowed = x.allowed.map((e) => {
     const en = e as Partial<AccessEntry>;

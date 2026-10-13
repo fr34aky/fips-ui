@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUpCircle, ExternalLink, Plus, RefreshCw, Save, Trash2, Undo2 } from 'lucide-react';
-import { Card, Chip, Copyable, Empty, ErrorNote, KV, useToast } from '../components/ui';
+import { ArrowUpCircle, ExternalLink, Plus, RefreshCw, Save, Trash2, Undo2, UserPlus } from 'lucide-react';
+import { Card, Chip, ConfirmDialog, Copyable, Empty, ErrorNote, KV, useToast } from '../components/ui';
 import { NpubInline } from '../components/PeerName';
 import { api, usePoll } from '../lib/api';
-import { fleetApi, phaseInfo, type FleetConfig, type FleetData, type FleetNodeStatus } from '../lib/fleet';
+import { fleetApi, phaseInfo, type FleetConfig, type FleetData, type FleetNodeStatus, type SyncResult } from '../lib/fleet';
 import { fmtAgo, fmtDuration, fmtNum, shortKey } from '../lib/format';
 import { useHosts } from '../lib/names';
 import { hashFor } from '../lib/route';
@@ -23,12 +23,30 @@ export function Fleet({ snap }: { snap: Snapshot }) {
     try { await fleetApi.get(true); r.refresh(); } catch (x) { toast('err', (x as Error).message); } finally { setProbing(false); }
   };
   const own = r.data?.own ?? snap.status?.npub;
+  // Every manager as an admin on every node that lacks one, after a confirmation (it writes those nodes' access lists).
+  const outOfSync = r.data?.nodes.filter((n) => n.managersInSync === false && n.reachable && isAdmin(n.role)) ?? [];
+  const [confirmSync, setConfirmSync] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const syncAll = async () => {
+    setConfirmSync(false); setSyncing(true);
+    try {
+      const { results } = await fleetApi.syncAllManagers(outOfSync.map((n) => n.npub));
+      const changed = results.filter((x) => x.changed).length, failed = results.filter((x) => x.error);
+      toast(failed.length ? 'err' : 'ok', `${changed} node${changed === 1 ? '' : 's'} updated${failed.length ? `; ${failed.length} failed: ${failed.map((x) => x.error).join('; ')}` : ''}`);
+      r.refresh();
+    } catch (x) { toast('err', (x as Error).message); } finally { setSyncing(false); }
+  };
   return (
     <div className="grid gap-4 fade-in">
       <Card title="Managed nodes" pad={false} hint="What each node last answered. Reads every 30 seconds; Probe now asks all of them at once."
-        actions={<button className="btn sm" onClick={probeNow} disabled={probing || !r.data?.nodes.length}><RefreshCw size={13} className={probing ? 'spin' : ''} />Probe now</button>}>
-        {r.error ? <div className="px-4 pb-4"><ErrorNote>{r.error}</ErrorNote></div> : !r.data ? <Empty>Loading…</Empty> : <Nodes data={r.data} own={own} />}
+        actions={<>
+          {outOfSync.length > 0 && <button className="btn sm" onClick={() => setConfirmSync(true)} disabled={syncing}><UserPlus size={13} />Sync managers ({outOfSync.length})</button>}
+          <button className="btn sm" onClick={probeNow} disabled={probing || !r.data?.nodes.length}><RefreshCw size={13} className={probing ? 'spin' : ''} />Probe now</button>
+        </>}>
+        {r.error ? <div className="px-4 pb-4"><ErrorNote>{r.error}</ErrorNote></div> : !r.data ? <Empty>Loading…</Empty> : <Nodes data={r.data} own={own} onChanged={r.refresh} busy={syncing} />}
       </Card>
+      <ConfirmDialog open={confirmSync} onClose={() => setConfirmSync(false)} onConfirm={syncAll} busy={syncing} title={`Make every manager an admin on ${outOfSync.length} node${outOfSync.length === 1 ? '' : 's'}?`} confirmLabel="Sync managers"
+        body={<>Each of those nodes' access lists is read and written back with every manager (this node and the standbys) as an <b>admin</b>. Nobody is removed or demoted there. Admin over the mesh has the same rights as someone at that machine, so every manager key must be one you trust with those nodes.</>} />
       {r.data && <FleetConfigCard data={r.data} own={own} onSaved={r.refresh} />}
     </div>
   );
@@ -36,7 +54,7 @@ export function Fleet({ snap }: { snap: Snapshot }) {
 
 // ---- overview ---------------------------------------------------------------------------------
 
-function Nodes({ data, own }: { data: FleetData; own?: string }) {
+function Nodes({ data, own, onChanged, busy }: { data: FleetData; own?: string; onChanged: () => void; busy: boolean }) {
   if (data.status.error) return <div className="px-4 pb-4"><ErrorNote>{data.status.error}</ErrorNote></div>;
   if (data.nodes.length === 0) return <Empty>No nodes yet. Add the first one below: it must run fips-ui with <b>Web UI over the mesh</b> on, listing this node as an admin.</Empty>;
   // Nodes with something to do; not the ones that simply have not been probed yet.
@@ -57,7 +75,7 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
                 <td className="mono">{n.reachable ? fmtNum(n.peerCount) : '–'}</td>
                 <td><HelperChip n={n} /></td>
                 <td><ManagersChip n={n} /></td>
-                <td className="text-right whitespace-nowrap"><NodeActions n={n} /></td>
+                <td><div className="flex flex-wrap gap-1.5 justify-end"><NodeActions n={n} onChanged={onChanged} busy={busy} /></div></td>
               </tr>
             ))}
           </tbody>
@@ -73,7 +91,7 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
               ['Uptime · peers', <span key="p" className="mono">{n.reachable ? `${fmtDuration(n.uptimeSecs)} · ${fmtNum(n.peerCount)}` : '–'}</span>],
               ['Helper', <HelperChip key="h" n={n} />], ['Managers', <ManagersChip key="m" n={n} />],
             ]} />
-            <div className="flex flex-wrap gap-2"><NodeActions n={n} /></div>
+            <div className="flex flex-wrap gap-2"><NodeActions n={n} onChanged={onChanged} busy={busy} /></div>
           </div>
         ))}
       </div>
@@ -92,14 +110,27 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
   );
 }
 
-/** Open the node's pages here (its API is forwarded by this node): needs it reachable with this node as admin. */
-function NodeActions({ n }: { n: FleetNodeStatus }) {
+/** Open the node's pages here (its API is forwarded by this node): needs it reachable with this node as admin. Plus the managers sync when one is missing there. */
+function NodeActions({ n, onChanged, busy }: { n: FleetNodeStatus; onChanged: () => void; busy: boolean }) {
+  const toast = useToast();
+  const [syncing, setSyncing] = useState(false);
   const can = n.reachable && isAdmin(n.role);
   const why = !n.reachable ? 'The node is not reachable' : !isAdmin(n.role) ? 'This node is not an admin there' : undefined;
   const upgradeHint = n.upgrade?.available || n.uiUpdate?.available ? 'An update is available there' : 'Upgrade the daemon or fips-ui there';
+  const sync = async () => {
+    setSyncing(true);
+    try {
+      const res: SyncResult = await fleetApi.syncManagers(n.npub);
+      if (res.error) toast('err', res.error);
+      else toast('ok', res.changed ? `${n.label || shortKey(n.npub, 12, 6)}: ${[res.added.length && `${res.added.length} added`, res.promoted.length && `${res.promoted.length} promoted`].filter(Boolean).join(', ')}` : 'Already in sync');
+      onChanged();
+    } catch (x) { toast('err', (x as Error).message); } finally { setSyncing(false); }
+  };
+  const syncBtn = n.managersInSync === false && can ? <button className="btn sm" onClick={sync} disabled={syncing || busy} title="Make every manager an admin on this node"><UserPlus size={13} />Sync managers</button> : null;
   if (!can) return <><button className="btn sm" disabled title={why}><ExternalLink size={13} />Open</button><button className="btn sm" disabled title={why}><ArrowUpCircle size={13} />Upgrade</button></>;
   return (
     <>
+      {syncBtn}
       <a className="btn sm" href={hashFor('overview', undefined, n.npub)} title="Open this node's pages"><ExternalLink size={13} />Open</a>
       <a className={`btn sm ${n.upgrade?.available || n.uiUpdate?.available ? 'primary' : ''}`} href={hashFor('upgrade', undefined, n.npub)} title={upgradeHint}><ArrowUpCircle size={13} />Upgrade</a>
     </>
