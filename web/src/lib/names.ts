@@ -1,7 +1,7 @@
 // Clear names for npubs, from the FIPS hosts file (the daemon's own source for <name>.fips). One shared copy,
 // refreshed every minute while any component uses it and right after the file is saved.
 import { useSyncExternalStore } from 'react';
-import { api } from './api';
+import { api, getApiBase, onApiBaseChange } from './api';
 
 export interface HostEntry { hostname: string; npub: string; comment?: string }
 export interface HostsData {
@@ -32,12 +32,18 @@ function publish(d: HostsData) {
 }
 
 export function refreshHosts(): Promise<HostsData | null> {
-  inflight ??= api.get<HostsData>('/api/hosts')
-    .then((d) => { publish(d); return d; })
-    .catch((e: Error) => { loadError = e.message; subs.forEach((f) => f()); return null; })
-    .finally(() => { inflight = null; });
-  return inflight;
+  if (inflight) return inflight;
+  // An answer that arrives after the page moved to another node is not that node's.
+  const base = getApiBase();
+  const p: Promise<HostsData | null> = api.get<HostsData>('/api/hosts')
+    .then((d) => { if (base === getApiBase()) publish(d); return d; })
+    .catch((e: Error) => { if (base === getApiBase()) { loadError = e.message; subs.forEach((f) => f()); } return null; })
+    .finally(() => { if (inflight === p) inflight = null; });
+  inflight = p;
+  return p;
 }
+// Reset only: the App for the new node subscribes afresh, which fetches.
+onApiBaseChange(() => { data = null; loadError = null; byNpub = new Map(); inflight = null; subs.forEach((f) => f()); });
 
 /** Put a saved file's state in place without another request. */
 export function setHosts(d: HostsData) { publish({ ...data, ...d }); }

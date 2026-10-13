@@ -5,21 +5,38 @@ const TOKEN_KEY = 'fips-ui-token';
 export const getToken = () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } };
 export const setToken = (t: string | null) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ } };
 
-export class ApiError extends Error { status: number; body: unknown; constructor(status: number, message: string, body?: unknown) { super(message); this.status = status; this.body = body; } }
+export class ApiError extends Error {
+  status: number; body: unknown;
+  /** The answer came from a managed node (forwarded by this node), not from this node itself. */
+  fromNode: boolean;
+  constructor(status: number, message: string, body?: unknown, fromNode = false) { super(message); this.status = status; this.body = body; this.fromNode = fromNode; }
+}
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// ------------------------------------------------------------- which node the page looks at
+// '' is this node's own API. A managed node (the Node manager page) is '/api/fleet/nodes/<npub>': the same paths,
+// forwarded by this node's backend, which is also what the token and the stream URLs below go to.
+let apiBase = '';
+const baseSubs = new Set<() => void>();
+export const getApiBase = () => apiBase;
+/** `path` always starts with /api/; the result is where to fetch it for the node the page looks at. */
+export const apiUrl = (path: string) => `${apiBase}${path}`;
+/** Set before the App for that node renders; every store below drops what it holds for the previous node. */
+export function setApiBase(base: string) { if (base === apiBase) return; apiBase = base; baseSubs.forEach((f) => f()); }
+export const onApiBaseChange = (f: () => void) => { baseSubs.add(f); return () => { baseSubs.delete(f); }; };
+
+async function request<T>(path: string, init?: RequestInit, local = false): Promise<T> {
   const headers = new Headers(init?.headers);
   const tok = getToken();
   if (tok) headers.set('authorization', `Bearer ${tok}`);
   if (init?.method && init.method !== 'GET') headers.set('content-type', 'application/json');
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(local ? path : apiUrl(path), { ...init, headers });
   const text = await res.text();
   let body: unknown = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = { error: text }; }
   if (!res.ok) {
     const msg = (body as { error?: string } | null)?.error ?? `${res.status} ${res.statusText}`;
     if (res.status === 401) authStore.setNeeded(true);
-    throw new ApiError(res.status, msg, body);
+    throw new ApiError(res.status, msg, body, res.headers.has('x-fips-ui-node'));
   }
   return body as T;
 }
@@ -36,8 +53,8 @@ export const api = {
   health: () => request<Health>('/api/health'),
   /** This node's own API, whatever node the page is looking at (the node manager's own endpoints). */
   local: {
-    get: <T,>(path: string) => request<T>(path),
-    post: <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+    get: <T,>(path: string) => request<T>(path, undefined, true),
+    post: <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }, true),
   },
 };
 
@@ -72,7 +89,7 @@ const live = (() => {
   function open() {
     if (es) return;
     const tok = getToken();
-    es = new EventSource(`/api/events${tok ? `?token=${encodeURIComponent(tok)}` : ''}`);
+    es = new EventSource(apiUrl(`/api/events${tok ? `?token=${encodeURIComponent(tok)}` : ''}`));
     es.addEventListener('snapshot', (ev) => {
       set({ snapshot: JSON.parse((ev as MessageEvent).data), conn: 'live', lastEventAt: Date.now() });
     });
@@ -85,7 +102,7 @@ const live = (() => {
     es.onerror = () => {
       set({ conn: 'reconnecting' });
       // The same checks as the event stream, with the server's reason in the body.
-      const probe = () => fetch('/api/health', { headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then(async (r) => {
+      const probe = () => fetch(apiUrl('/api/health'), { headers: tok ? { authorization: `Bearer ${tok}` } : {} }).then(async (r) => {
         if (r.status === 403) { const b = await r.json().catch(() => null) as { error?: string } | null; set({ refused: b?.error ?? 'access refused' }); }
         return r.status;
       }, () => 0);
@@ -103,6 +120,8 @@ const live = (() => {
     };
   }
   function close() { es?.close(); es = null; }
+  // Another node: drop its predecessor's snapshot and log. The App for the new node subscribes and opens the stream.
+  onApiBaseChange(() => { close(); state = { snapshot: null, conn: 'connecting', lastEventAt: 0 }; logs = []; emit(); logSubs.forEach((f) => f()); });
 
   return {
     subscribe: (fn: () => void) => { subs.add(fn); refs++; open(); return () => { subs.delete(fn); if (--refs === 0) close(); }; },

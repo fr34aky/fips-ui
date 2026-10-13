@@ -64,6 +64,9 @@ export interface Snapshot {
 
 export interface LogLine { ts: number; level: 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'unknown'; target?: string; message: string; raw: string; cursor?: string }
 
+/** A node's public key as the daemon prints it. */
+export const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
+
 /** viewer: read-only. admin: everything the local operator can do. superadmin: admin plus the Node manager page. */
 export type Role = 'viewer' | 'admin' | 'superadmin';
 /** Whether a role may change the node (admin or superadmin). */

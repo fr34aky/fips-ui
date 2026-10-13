@@ -4,6 +4,7 @@ import type { Snapshot } from '../lib/types';
 import { Card, Chip, ConfirmDialog, Empty, ErrorNote, KV, Modal, Segmented, Skeleton, useToast } from '../components/ui';
 import { adminApi, withResult, type DropinResult, type FirewallRule, type RuleSource } from '../lib/admin';
 import { api, usePoll } from '../lib/api';
+import { hashFor } from '../lib/route';
 import { fmtAgo, fmtBytes, fmtNum } from '../lib/format';
 import { HelperGate } from '../components/HelperGate';
 import { NpubInline } from '../components/PeerName';
@@ -95,7 +96,7 @@ export function Firewall({ snap, readOnly, prefill }: { snap: Snapshot; readOnly
                     <td className="mono">{r.ports}</td>
                     <td><Sources sources={r.sources} /></td>
                     <td className="text-xs text-ink-2">{r.comment}{r.tag === 'mesh-access' && <Chip tone="accent" className="ml-2">remote access</Chip>}</td>
-                    <td className="text-right whitespace-nowrap">{!readOnly && r.tag === 'mesh-access' && <a className="text-xs text-ink-3 hover:text-ink" href="#/access">manage on Access</a>}{!readOnly && r.tag !== 'mesh-access' && <>
+                    <td className="text-right whitespace-nowrap">{!readOnly && r.tag === 'mesh-access' && <a className="text-xs text-ink-3 hover:text-ink" href={hashFor('access')}>manage on Access</a>}{!readOnly && r.tag !== 'mesh-access' && <>
                       <button className="btn ghost icon sm" title="Edit" onClick={() => setRuleDialog({ index: i, initial: r })}><Pencil size={13} /></button>
                       <button className="btn ghost icon sm" title="Delete" disabled={busy} onClick={() => setConfirm({ title: 'Remove this rule?', label: 'Remove', body: <>Inbound <b>{r.proto} {r.ports}</b> will be dropped again for every source in this rule.</>, run: async () => { await saveRules(rules.filter((_, j) => j !== i), 'Rule removed'); } })}><Trash2 size={13} /></button>
                     </>}</td>

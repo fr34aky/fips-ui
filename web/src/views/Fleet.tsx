@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { Plus, RefreshCw, Save, Trash2, Undo2 } from 'lucide-react';
+import { ArrowUpCircle, ExternalLink, Plus, RefreshCw, Save, Trash2, Undo2 } from 'lucide-react';
 import { Card, Chip, Copyable, Empty, ErrorNote, KV, useToast } from '../components/ui';
 import { NpubInline } from '../components/PeerName';
 import { api, usePoll } from '../lib/api';
 import { fleetApi, phaseInfo, type FleetConfig, type FleetData, type FleetNodeStatus } from '../lib/fleet';
 import { fmtAgo, fmtDuration, fmtNum, shortKey } from '../lib/format';
 import { useHosts } from '../lib/names';
-import type { Snapshot } from '../lib/types';
+import { hashFor } from '../lib/route';
+import { isAdmin, NPUB_RE, type Snapshot } from '../lib/types';
 
 /**
  * The node manager: other fips nodes whose fips-ui this node reaches over the mesh, each listing this node's npub
@@ -44,7 +45,7 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
     <div className="grid gap-3 pb-4">
       <div className="hidden md:block overflow-x-auto">
         <table className="data">
-          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th></tr></thead>
+          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th><th /></tr></thead>
           <tbody>
             {data.nodes.map((n) => (
               <tr key={n.npub}>
@@ -56,6 +57,7 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
                 <td className="mono">{n.reachable ? fmtNum(n.peerCount) : '–'}</td>
                 <td><HelperChip n={n} /></td>
                 <td><ManagersChip n={n} /></td>
+                <td className="text-right whitespace-nowrap"><NodeActions n={n} /></td>
               </tr>
             ))}
           </tbody>
@@ -71,6 +73,7 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
               ['Uptime · peers', <span key="p" className="mono">{n.reachable ? `${fmtDuration(n.uptimeSecs)} · ${fmtNum(n.peerCount)}` : '–'}</span>],
               ['Helper', <HelperChip key="h" n={n} />], ['Managers', <ManagersChip key="m" n={n} />],
             ]} />
+            <div className="flex flex-wrap gap-2"><NodeActions n={n} /></div>
           </div>
         ))}
       </div>
@@ -86,6 +89,20 @@ function Nodes({ data, own }: { data: FleetData; own?: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+/** Open the node's pages here (its API is forwarded by this node): needs it reachable with this node as admin. */
+function NodeActions({ n }: { n: FleetNodeStatus }) {
+  const can = n.reachable && isAdmin(n.role);
+  const why = !n.reachable ? 'The node is not reachable' : !isAdmin(n.role) ? 'This node is not an admin there' : undefined;
+  const upgradeHint = n.upgrade?.available || n.uiUpdate?.available ? 'An update is available there' : 'Upgrade the daemon or fips-ui there';
+  if (!can) return <><button className="btn sm" disabled title={why}><ExternalLink size={13} />Open</button><button className="btn sm" disabled title={why}><ArrowUpCircle size={13} />Upgrade</button></>;
+  return (
+    <>
+      <a className="btn sm" href={hashFor('overview', undefined, n.npub)} title="Open this node's pages"><ExternalLink size={13} />Open</a>
+      <a className={`btn sm ${n.upgrade?.available || n.uiUpdate?.available ? 'primary' : ''}`} href={hashFor('upgrade', undefined, n.npub)} title={upgradeHint}><ArrowUpCircle size={13} />Upgrade</a>
+    </>
   );
 }
 
@@ -120,8 +137,6 @@ function ManagersChip({ n }: { n: FleetNodeStatus }) {
 }
 
 // ---- configuration ----------------------------------------------------------------------------
-
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string; onSaved: () => void }) {
   const toast = useToast();

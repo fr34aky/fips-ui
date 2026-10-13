@@ -7,11 +7,10 @@ import { saveAccess, saveMessage, useAccess, type Role } from '../lib/access';
 import { fmtAgo } from '../lib/format';
 import { shortKey } from '../lib/format';
 import { refreshHosts, setHosts, useHosts, type HostsData } from '../lib/names';
-import { isAdmin, isSuperadmin, mayChangeRole, type Snapshot } from '../lib/types';
+import { isAdmin, isSuperadmin, mayChangeRole, NPUB_RE, type Snapshot } from '../lib/types';
 
 type Row = { hostname: string; npub: string; comment?: string };
 const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
 
 /**
  * The FIPS hosts file: names resolved as <name>.fips on this node and shown next to npubs throughout the UI.

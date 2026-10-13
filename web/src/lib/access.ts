@@ -1,7 +1,7 @@
 // "Web UI over the mesh" settings, shared by the Access card and the hosts table (both can change the allowed
 // list), refreshed every 10 seconds while in use and right after every save.
 import { useSyncExternalStore } from 'react';
-import { api } from './api';
+import { api, getApiBase, onApiBaseChange } from './api';
 import type { Principal, Role } from './types';
 
 export type { Role };
@@ -18,8 +18,11 @@ let timer: ReturnType<typeof setInterval> | undefined;
 const emit = () => subs.forEach((f) => f());
 
 export function refreshAccess(): Promise<void> {
-  return api.get<AccessData>('/api/access').then((d) => { data = d; loadError = null; emit(); }, (e: Error) => { loadError = e.message; emit(); });
+  // An answer that arrives after the page moved to another node is not that node's (its list must never be edited here).
+  const base = getApiBase();
+  return api.get<AccessData>('/api/access').then((d) => { if (base !== getApiBase()) return; data = d; loadError = null; emit(); }, (e: Error) => { if (base !== getApiBase()) return; loadError = e.message; emit(); });
 }
+onApiBaseChange(() => { data = null; loadError = null; emit(); });
 
 function subscribe(f: () => void) {
   subs.add(f);

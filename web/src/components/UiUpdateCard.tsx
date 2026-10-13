@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ArrowUpCircle, ExternalLink, RefreshCw } from 'lucide-react';
 import { Card, Chip, ConfirmDialog, ErrorNote, useToast } from './ui';
-import { api } from '../lib/api';
+import { api, getApiBase } from '../lib/api';
 import { fmtAgo } from '../lib/format';
 import { refreshUiUpdate, useUiUpdate, type UiUpdateJob } from '../lib/uiUpdate';
 
@@ -13,6 +13,12 @@ export function UiUpdateCard({ readOnly }: { readOnly: boolean }) {
   const [checking, setChecking] = useState(false);
   const [job, setJob] = useState<UiUpdateJob | null>(null);
   const [restarting, setRestarting] = useState(false);
+  // The new version answers: this page reloads to get its new frontend; for a managed node the page is this node's
+  // and did not change, so only the state is read again.
+  const arrived = useCallback((version: string) => {
+    if (!getApiBase()) { location.reload(); return; }
+    setJob(null); setRestarting(false); toast('ok', `fips-ui on this node is now v${version}`); void refreshUiUpdate();
+  }, [toast]);
 
   // Follow a running update, then wait for the restarted server to answer with the new version and reload.
   useEffect(() => {
@@ -21,15 +27,15 @@ export function UiUpdateCard({ readOnly }: { readOnly: boolean }) {
       if (job.state === 'running') {
         const d = await refreshUiUpdate();
         // The server may already have exited (no answer) or restarted on the new version (no job in memory).
-        if (!d || !d.job || d.current === job.tag.slice(1)) { if (d?.current === job.tag.slice(1)) location.reload(); else { setJob({ ...job, state: 'done', restarting: true }); setRestarting(true); } return; }
+        if (!d || !d.job || d.current === job.tag.slice(1)) { if (d?.current === job.tag.slice(1)) arrived(d.current); else { setJob({ ...job, state: 'done', restarting: true }); setRestarting(true); } return; }
         setJob(d.job); if (d.job.state === 'failed') toast('err', d.job.error ?? 'the update failed'); if (d.job.restarting) setRestarting(true);
         return;
       }
       const h = await api.get<{ uiVersion?: string }>('/api/health').catch(() => null);
-      if (h?.uiVersion === job.tag.slice(1)) location.reload();
+      if (h?.uiVersion === job.tag.slice(1)) arrived(h.uiVersion);
     }, 2000);
     return () => clearInterval(t);
-  }, [job, toast]);
+  }, [job, toast, arrived]);
   useEffect(() => { if (info?.job && !job) setJob(info.job); }, [info?.job]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!info) return null;

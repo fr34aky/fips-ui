@@ -9,10 +9,12 @@
 //
 // Only a superadmin on this node may use the fleet endpoints (server/index.ts): an npub is a node, not a person,
 // and without that distinction every admin of this node would reach every managed node through it.
+import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isAdmin, type AccessEntry, type Role } from './access.ts';
+import { sendJson } from './http.ts';
 
 const DEFAULT_FILE = process.env.FIPS_UI_FLEET_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'fleet.json');
 export const NPUB_RE = /^npub1[02-9ac-hj-np-z]{58}$/;
@@ -101,10 +103,16 @@ export function makeFetchJson(meshAddress: (npub: string) => Promise<string>, ve
     let size = 0;
     if (res.body) {
       const reader = res.body.getReader();
-      for (let r = await reader.read(); !r.done; r = await reader.read()) {
-        size += r.value.byteLength;
-        if (size > MAX_ANSWER) { await reader.cancel().catch(() => {}); throw new FleetError(`the node's answer is too large (over ${MAX_ANSWER} bytes)`); }
-        chunks.push(r.value);
+      try {
+        for (let r = await reader.read(); !r.done; r = await reader.read()) {
+          size += r.value.byteLength;
+          if (size > MAX_ANSWER) { await reader.cancel().catch(() => {}); throw new FleetError(`the node's answer is too large (over ${MAX_ANSWER} bytes)`); }
+          chunks.push(r.value);
+        }
+      } catch (e) {
+        // A stall after the headers (the timeout fires mid-body) is the node being away, like a refused connection.
+        if (e instanceof FleetError) throw e;
+        throw new FleetError(`the node stopped answering at [${addr}]:${port} (${(e as Error).message})`, 'offline');
       }
     }
     const text = Buffer.concat(chunks).toString('utf8');
@@ -323,13 +331,14 @@ export class Fleet {
   /** A forced run asked for while one is in flight runs right after it (with the list and checks of that moment). */
   private forcedNext = false;
   private runOnce(force: boolean): Promise<void> {
+    // Only the run that owns the slot clears it: a run chained behind it must not be unseated by its predecessor ending.
+    const track = (run: Promise<void>): Promise<void> => { const p: Promise<void> = run.catch(() => {}).finally(() => { if (this.inflight === p) this.inflight = null; }); this.inflight = p; return p; };
     if (this.inflight) {
       if (!force) return this.inflight;
-      if (!this.forcedNext) { this.forcedNext = true; this.inflight = this.inflight.then(() => { this.forcedNext = false; return this.pollAll(true); }).catch(() => {}).finally(() => { this.inflight = null; }); }
+      if (!this.forcedNext) { this.forcedNext = true; return track(this.inflight.then(() => { this.forcedNext = false; return this.pollAll(true); })); }
       return this.inflight;
     }
-    this.inflight = this.pollAll(force).catch(() => {}).finally(() => { this.inflight = null; });
-    return this.inflight;
+    return track(this.pollAll(force));
   }
 
   private async pollAll(force: boolean): Promise<void> {
@@ -359,7 +368,8 @@ export class Fleet {
     const get = (path: string, timeoutMs = 8000): Promise<Answer> => this.fetchJson(node.npub, node.port, path, { timeoutMs }).catch((e: Error) => e);
     const probe: Probe = { health: await get('/api/health') };
     const health = asRecord(probe.health);
-    if (health) {
+    // Only a mesh-listener answer (auth 'npub') is worth more reads; the main listener would refuse them all.
+    if (health && health.auth === 'npub') {
       const role = (health.principal as { role?: Role } | undefined)?.role;
       const reads: Promise<unknown>[] = [get('/api/q/show_status').then((a) => { probe.status = a; })];
       if (role && isAdmin(role)) {
@@ -372,4 +382,101 @@ export class Fleet {
     if (this.config.nodes.some((n) => n.npub === node.npub)) this.nodes.set(node.npub, status);
     return status;
   }
+}
+
+// ---- proxy ----------------------------------------------------------------------------------------
+// /api/fleet/nodes/<npub>/api/... forwards one request to that node's own API, so the manager's frontend can show
+// any of its pages for a managed node. The browser cannot call the node itself: its writes are refused as
+// cross-origin there, and it does not carry this node's mesh identity. Only an allow-list of headers travels
+// upstream (never the manager's token or cookies), and the answer streams back as it arrives (SSE included).
+
+const PROXY_RE = /^\/api\/fleet\/nodes\/(npub1[02-9ac-hj-np-z]{58})(\/api(?:\/[A-Za-z0-9_.-]+)*\/?)$/;
+const MAX_PROXY_PATH = 512;
+/** Request headers that go upstream; everything else from the browser stays here. */
+const FORWARD_REQUEST = ['accept', 'last-event-id'];
+/** Response headers that come back; hop-by-hop ones and cookies do not. */
+const FORWARD_RESPONSE = ['content-type', 'cache-control', 'retry-after', 'content-length', 'x-accel-buffering'];
+/** Time for the node to answer a read with headers; after that a stream may stay open as long as it likes. */
+const HEADERS_TIMEOUT_MS = 10_000;
+/** A change may take long on the node (a service restart waits up to 150 s there): it is given that long. */
+const POST_TIMEOUT_MS = 180_000;
+
+/** The node and the path on it that a proxied URL names, or null when it is not one (or not a plain /api path). */
+export function parseProxyPath(pathname: string): { npub: string; path: string } | null {
+  if (pathname.length > MAX_PROXY_PATH + 80) return null;
+  const m = PROXY_RE.exec(pathname);
+  if (!m) return null;
+  const path = m[2];
+  if (path.length > MAX_PROXY_PATH || path.split('/').some((s) => s === '.' || s === '..')) return null;
+  return { npub: m[1], path };
+}
+
+/** The query string to send upstream: everything but this node's token. */
+export function forwardQuery(params: URLSearchParams): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of params) if (k !== 'token') q.append(k, v);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+// No socket cap: every open page of a managed node holds a stream, which must not queue the next request.
+const agent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
+
+export interface ProxyDeps {
+  meshAddress: (npub: string) => Promise<string>;
+  version?: string;
+  /** The JSON body of a POST, already read and checked by the caller. */
+  body?: Record<string, unknown>;
+  /** Told what the node answered to a forwarded POST (the self-update and install cases restart it). */
+  onForwarded?: (node: FleetNode, path: string, status: number) => void;
+}
+
+/**
+ * Forward `req` to `node` and stream the answer into `res`. Resolves once the node's headers are through (or an
+ * error was answered); a long stream keeps flowing after that. A closed browser connection ends the upstream one.
+ */
+export function proxyRequest(req: IncomingMessage, res: ServerResponse, node: FleetNode, path: string, query: string, deps: ProxyDeps): Promise<void> {
+  const method = req.method === 'POST' ? 'POST' : 'GET';
+  return new Promise<void>((resolve) => {
+    const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => { if (!res.headersSent && !res.destroyed) sendJson(res, status, { error, ...extra }); else res.destroy(); resolve(); };
+    // The browser may be gone before the address is known (or while the body was read): then nothing is sent
+    // upstream. Only the response side tells: a request whose body was consumed counts as destroyed already.
+    let up: http.ClientRequest | null = null;
+    let gone = res.destroyed;
+    res.on('close', () => { gone = true; up?.destroy(); });
+    deps.meshAddress(node.npub).then((addr) => {
+      if (gone) return resolve();
+      const headers: Record<string, string> = { host: `[${addr}]:${node.port}`, 'user-agent': USER_AGENT, 'x-fips-ui-fleet': deps.version ?? '' };
+      for (const h of FORWARD_REQUEST) { const v = req.headers[h]; if (typeof v === 'string') headers[h] = v; }
+      headers.accept ??= 'application/json';
+      const body = method === 'POST' ? Buffer.from(JSON.stringify(deps.body ?? {})) : null;
+      if (body) { headers['content-type'] = 'application/json'; headers['content-length'] = String(body.length); }
+      up = http.request({ host: addr, port: node.port, path: `${path}${query}`, method, headers, agent });
+      const limit = method === 'POST' ? POST_TIMEOUT_MS : HEADERS_TIMEOUT_MS;
+      const timer = setTimeout(() => up?.destroy(new Error('timeout')), limit);
+      up.on('response', (upstream) => {
+        clearTimeout(timer);
+        const status = upstream.statusCode ?? 502;
+        if (status === 401) {
+          // The node's main listener answered (mesh access is off there, or the port is wrong). Not passed through:
+          // a 401 would make the manager's frontend ask for the manager's token.
+          upstream.resume();
+          return fail(502, 'the node asked for a token: its main listener answered, so Web UI over the mesh is off there or its port differs', { upstream: 401, kind: 'unauthorised' });
+        }
+        const out: Record<string, string> = { 'x-fips-ui-node': node.npub };
+        for (const h of FORWARD_RESPONSE) { const v = upstream.headers[h]; if (typeof v === 'string') out[h] = v; }
+        res.writeHead(status, out);
+        upstream.pipe(res);
+        upstream.on('error', () => res.destroy());
+        if (method === 'POST') deps.onForwarded?.(node, path, status);
+        resolve();
+      });
+      up.on('error', (e) => {
+        clearTimeout(timer);
+        if (e.message === 'timeout') return fail(504, `the node did not answer within ${limit / 1000} seconds`, { kind: 'offline' });
+        fail(502, `cannot reach the node at [${addr}]:${node.port} (${(e as NodeJS.ErrnoException).code ?? e.message})`, { kind: 'offline' });
+      });
+      up.end(body ?? undefined);
+    }, (e: Error) => fail(502, `cannot derive the node's address: ${e.message}`, { kind: 'offline' }));
+  });
 }

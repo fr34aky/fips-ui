@@ -1,6 +1,7 @@
 import { Copyable } from './ui';
 import { shortKey } from '../lib/format';
 import { realName, useHostName } from '../lib/names';
+import { hashFor } from '../lib/route';
 
 /** Two lines: the clear name (given, or from the hosts file) and below it the shortened npub. */
 export function PeerName({ name, npub, nodeAddr, size = 'md' }: { name?: string | null; npub?: string; nodeAddr?: string; size?: 'sm' | 'md' | 'lg' }) {
@@ -42,7 +43,7 @@ export function HostNameLink({ npub, readOnly }: { npub: string; readOnly?: bool
     <span className="inline-flex items-center gap-2">
       {/* The copy button copies the npub, the identity behind the name. */}
       {host ? <Copyable text={npub} display={<b>{host}</b>} mono={false} /> : <span className="text-ink-3">none</span>}
-      {!readOnly && <a className="text-xs text-ink-3 hover:text-ink" href={`#/access?name=${encodeURIComponent(npub)}`}>{host ? 'change…' : 'add a name…'}</a>}
+      {!readOnly && <a className="text-xs text-ink-3 hover:text-ink" href={hashFor('access', { name: npub })}>{host ? 'change…' : 'add a name…'}</a>}
     </span>
   );
 }

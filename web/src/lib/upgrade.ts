@@ -1,6 +1,6 @@
 // Types and client for the node upgrade API (server/upgrade.ts).
 import { useEffect, useRef, useState } from 'react';
-import { api, getToken, ApiError } from './api';
+import { api, apiUrl, getToken, ApiError } from './api';
 
 export type UpgradeSource = 'release' | 'master';
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -64,7 +64,7 @@ export function useUpgradeJob(jobId: string | null | undefined): { job: JobSumma
     const push = (l: JobLogLine) => { if (l.seq > lastSeq.current) { lastSeq.current = l.seq; setLog((prev) => (prev.length > 5000 ? [...prev.slice(-4000), l] : [...prev, l])); } };
     const open = () => {
       if (closed) return;
-      es = new EventSource(`/api/upgrade/jobs/current/events?since=${lastSeq.current}${tok ? `&token=${encodeURIComponent(tok)}` : ''}`);
+      es = new EventSource(apiUrl(`/api/upgrade/jobs/current/events?since=${lastSeq.current}${tok ? `&token=${encodeURIComponent(tok)}` : ''}`));
       es.addEventListener('log', (ev) => push(JSON.parse((ev as MessageEvent).data)));
       es.addEventListener('state', (ev) => { const s: JobSummary = JSON.parse((ev as MessageEvent).data); setJob(s); if (s.state !== 'running' && s.state !== 'queued') { es?.close(); es = null; } });
       es.onerror = () => {

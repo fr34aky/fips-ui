@@ -43,6 +43,23 @@ The table shows for each node:
 The manager's requests carry `user-agent: fips-ui-fleet`, so a managed node does not mistake them for a
 hosts-sync follower.
 
+## Opening a node
+
+**Open** shows the managed node in this dashboard: every page (Overview, Peers, Logs, Configuration,
+Firewall, Access, Upgrade, …) works on that node, with the rights its access list gives this node's npub (an
+admin can do everything there, including its own access list and its fips-ui self-update). The address bar
+reads `#/node/<npub>/<page>`; the header and the sidebar say which node is open and lead back.
+
+![A managed node's Overview](screenshots/fleet-node.png)
+
+Behind it, this node's backend forwards the browser's requests to the node's own API over the mesh
+(`/api/fleet/nodes/<npub>/api/…`, GET and POST, streams included). Only `accept` and `last-event-id` travel
+upstream, never this node's token or cookies; `set-cookie` never comes back. A node that answers with a
+token prompt (its main listener instead of its mesh listener) is reported as unreachable rather than passed
+through, so the manager's own token dialog never opens for it. A node that refuses this node's npub shows
+what to do on it. When a managed node's fips-ui restarts (its self-update), the page waits and continues
+without reloading.
+
 ## Standby managers and recovery
 
 `fleet.json` also lists further manager npubs. The manager itself is always the first; the others are
