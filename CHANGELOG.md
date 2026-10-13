@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (peers, logs, configuration, firewall, access, upgrade, …) shown for that
   node, through this node's backend, which forwards the node's own API over
   the mesh. The sidebar says which node is open and leads back.
+- **Sync managers**: one click makes every manager (this node and the
+  standbys) an admin on a managed node, or on all nodes that lack one; nobody
+  is removed or demoted there. A node told to update its fips-ui, or to
+  install fips, is shown as *restarting* until it answers again.
 
 ### Fixed
 
