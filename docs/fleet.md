@@ -57,9 +57,10 @@ Behind it, this node's backend forwards the browser's requests to the node's own
 upstream, never this node's token or cookies; `set-cookie` never comes back. A node that answers with a
 token prompt (its main listener instead of its mesh listener) is reported as unreachable rather than passed
 through, so the manager's own token dialog never opens for it. A node that refuses this node's npub shows
-what to do on it. When a managed node's fips-ui restarts (its self-update, or a fresh fips install that
-makes it join the fips group), the page waits and continues without reloading, and the overview shows the
-node as *restarting* (probed every five seconds, for up to five minutes) rather than offline.
+what to do on it. When a managed node's fips-ui updates itself, it builds the new version first (minutes on
+a small machine) and then restarts: the page waits and continues without reloading, and the overview shows
+the node as *restarting* once it is away (probed every 15 seconds while still up, every five once away, for
+up to 30 minutes) rather than offline.
 
 ## Standby managers and recovery
 

@@ -291,7 +291,9 @@ export class Fleet {
    * over only once the node was away and answers again (or its uptime fell), or the window ends. `down`: a probe
    * has failed since; `uptime`: its fips-ui uptime when told.
    */
-  private restarting = new Map<string, { until: number; down: boolean; uptime?: number }>();
+  private restarting = new Map<string, { until: number; down: boolean; uptime?: number; lastProbe: number }>();
+  /** While the node is still up (building its update), it is probed this often; once away, every timer tick. */
+  private static readonly UP_PROBE_MS = 15_000;
   private restartTimer: NodeJS.Timeout | null = null;
   /** One probe per node at a time: a later one waits for it rather than racing it (a stale answer could win). */
   private probing = new Map<string, Promise<NodeStatus>>();
@@ -335,19 +337,20 @@ export class Fleet {
   }
 
   /**
-   * The node's fips-ui is about to restart (it was told to update or to install fips): for up to five minutes it is
-   * probed every five seconds and shown as restarting rather than offline, until it answers again.
+   * The node's fips-ui is about to restart (it was told to update itself): it builds the new version first, which
+   * can take many minutes on a small machine, then exits. For up to `windowMs` it is probed every 15 seconds while
+   * still up and every five once away, and shown as restarting rather than offline, until it answers again.
    */
-  expectRestart(npub: string, windowMs = 5 * 60_000): void {
+  expectRestart(npub: string, windowMs = 30 * 60_000): void {
     if (!this.config.nodes.some((n) => n.npub === npub)) return;
     // The node is still up at this point: its status stays as it is until a probe fails.
-    this.restarting.set(npub, { until: this.now() + windowMs, down: false, uptime: this.nodes.get(npub)?.uiUptimeSecs });
+    this.restarting.set(npub, { until: this.now() + windowMs, down: false, uptime: this.nodes.get(npub)?.uiUptimeSecs, lastProbe: this.now() });
     if (!this.restartTimer) {
       this.restartTimer = setInterval(() => {
         for (const [n, r] of this.restarting) {
           const node = this.config.nodes.find((x) => x.npub === n);
           if (!node || this.now() > r.until) { this.endRestart(n); continue; }
-          if (!this.probing.has(n)) void this.pollNode(node, false);
+          if (!this.probing.has(n) && (r.down || this.now() - r.lastProbe >= Fleet.UP_PROBE_MS)) { r.lastProbe = this.now(); void this.pollNode(node, false); }
         }
         if (this.restarting.size === 0 && this.restartTimer) { clearInterval(this.restartTimer); this.restartTimer = null; }
       }, 5000);
@@ -355,11 +358,12 @@ export class Fleet {
     }
   }
 
+  private static readonly NOT_BACK = 'did not answer again after its restart';
   /** The wait is over (the window ended): a node still shown as restarting is offline. */
   private endRestart(npub: string): void {
     this.restarting.delete(npub);
     const cur = this.nodes.get(npub);
-    if (cur?.phase === 'restarting') this.nodes.set(npub, { ...cur, phase: 'offline', error: 'did not answer again after its restart' });
+    if (cur?.phase === 'restarting') this.nodes.set(npub, { ...cur, phase: 'offline', error: Fleet.NOT_BACK });
   }
 
   /**
@@ -387,7 +391,10 @@ export class Fleet {
         Object.assign(result, { changed: true, added: merged.added, promoted: merged.promoted });
       }
     } catch (e) { result.error = (e as Error).message; }
-    result.node = await this.pollNode(node, false, managers);
+    // What the node looks like now: after any probe already under way (it may predate the write), a fresh one; a node
+    // that could not be reached is not asked again.
+    if (result.error && !this.nodes.get(npub)?.reachable) result.node = this.nodes.get(npub);
+    else { await this.probing.get(npub)?.catch(() => {}); result.node = await this.pollNode(node, false, managers); }
     return result;
   }
 
@@ -499,11 +506,11 @@ export class Fleet {
     // (or with a smaller uptime: it restarted between two probes), when it refuses this node, or when the window ends.
     const r = this.restarting.get(node.npub);
     if (r) {
-      if (this.now() > r.until) this.restarting.delete(node.npub);
+      if (this.now() > r.until) { this.restarting.delete(node.npub); if (!status.reachable && status.phase === 'offline') status = { ...status, error: Fleet.NOT_BACK }; }
       else if (status.reachable) {
         const uptimeFell = r.uptime !== undefined && status.uiUptimeSecs !== undefined && status.uiUptimeSecs < r.uptime;
         if (r.down || uptimeFell) this.restarting.delete(node.npub);
-      } else if (status.phase === 'unauthorised' || status.phase === 'viewer') this.restarting.delete(node.npub);
+      } else if (status.phase === 'unauthorised') this.restarting.delete(node.npub);
       else { r.down = true; status = { ...status, phase: 'restarting', error: undefined }; }
     }
     if (this.config.nodes.some((n) => n.npub === node.npub)) this.nodes.set(node.npub, status);

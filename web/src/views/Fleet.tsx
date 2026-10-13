@@ -123,7 +123,7 @@ function NodeActions({ n, onChanged, busy }: { n: FleetNodeStatus; onChanged: ()
       const res: SyncResult = await fleetApi.syncManagers(n.npub);
       if (res.error) toast('err', res.error);
       else toast('ok', res.changed ? `${n.label || shortKey(n.npub, 12, 6)}: ${[res.added.length && `${res.added.length} added`, res.promoted.length && `${res.promoted.length} promoted`].filter(Boolean).join(', ')}` : 'Already in sync');
-      if (!res.error) onChanged();
+      onChanged();
     } catch (x) { toast('err', (x as Error).message); } finally { setSyncing(false); }
   };
   const syncBtn = n.managersInSync === false && can ? <button className="btn sm" onClick={sync} disabled={syncing || busy} title="Make every manager an admin on this node"><UserPlus size={13} />Sync managers</button> : null;
