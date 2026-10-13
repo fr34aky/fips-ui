@@ -5,7 +5,12 @@ const TOKEN_KEY = 'fips-ui-token';
 export const getToken = () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } };
 export const setToken = (t: string | null) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ } };
 
-export class ApiError extends Error { status: number; body: unknown; constructor(status: number, message: string, body?: unknown) { super(message); this.status = status; this.body = body; } }
+export class ApiError extends Error {
+  status: number; body: unknown;
+  /** The answer came from a managed node (forwarded by this node), not from this node itself. */
+  fromNode: boolean;
+  constructor(status: number, message: string, body?: unknown, fromNode = false) { super(message); this.status = status; this.body = body; this.fromNode = fromNode; }
+}
 
 // ------------------------------------------------------------- which node the page looks at
 // '' is this node's own API. A managed node (the Node manager page) is '/api/fleet/nodes/<npub>': the same paths,
@@ -31,7 +36,7 @@ async function request<T>(path: string, init?: RequestInit, local = false): Prom
   if (!res.ok) {
     const msg = (body as { error?: string } | null)?.error ?? `${res.status} ${res.statusText}`;
     if (res.status === 401) authStore.setNeeded(true);
-    throw new ApiError(res.status, msg, body);
+    throw new ApiError(res.status, msg, body, res.headers.has('x-fips-ui-node'));
   }
   return body as T;
 }

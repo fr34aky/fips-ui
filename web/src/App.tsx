@@ -55,7 +55,9 @@ function App({ route }: { route: AppRoute }) {
   const nodeNpub = route.node;
   // Health describes the node the page looks at; read again when the stream comes (back) up, e.g. after its restart.
   const up = live.conn === 'live';
-  useEffect(() => { api.health().then((h) => { setHealth(h); setNodeProblem(null); }).catch((e) => { if (nodeNpub && e instanceof ApiError && [403, 404, 502, 504].includes(e.status)) setNodeProblem({ status: e.status, message: e.message }); }); }, [authNeeded, up, nodeNpub]);
+  // A 403 from the node itself (it refuses this node's npub) is the live store's `refused` case, with its hint; a 403
+  // from this node (no superadmin) and the proxy's own 404/502/504 are told here.
+  useEffect(() => { api.health().then((h) => { setHealth(h); setNodeProblem(null); }).catch((e) => { if (nodeNpub && e instanceof ApiError && [403, 404, 502, 504].includes(e.status) && !(e.status === 403 && e.fromNode)) setNodeProblem({ status: e.status, message: e.message }); }); }, [authNeeded, up, nodeNpub]);
   // The App is mounted per node (Root), so the node never changes while this runs.
   useEffect(() => {
     if (!nodeNpub) return;
@@ -78,13 +80,14 @@ function App({ route }: { route: AppRoute }) {
   // The public-domains page exists where the node runs the resolver or the server (health says), and for an
   // admin whose helper can install them.
   const pd = health?.pubdom;
-  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet ? [] : ['fleet' as const])];
+  // The Node manager is this node's page: never offered while a managed node's pages are shown.
+  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const])];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
     body = <Empty>This page needs the admin role; your npub has viewer access.</Empty>;
-  } else if (route.view === 'fleet' && health && !health.fleet) {
-    body = <Empty>{health.readOnly ? 'This UI instance is read-only; the Node manager is off.' : 'This page needs the superadmin role.'}</Empty>;
+  } else if (route.view === 'fleet' && ((health && !health.fleet) || nodeNpub)) {
+    body = <Empty>{nodeNpub ? 'The Node manager is this node\'s own page.' : health?.readOnly ? 'This UI instance is read-only; the Node manager is off.' : 'This page needs the superadmin role.'}{nodeNpub && backToFleet}</Empty>;
   } else if (node && nodeProblem?.status === 404) {
     body = <Empty>{node.name} is no longer managed from here.{backToFleet}</Empty>;
   } else if (node && nodeProblem?.status === 403) {

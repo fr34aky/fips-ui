@@ -103,10 +103,16 @@ export function makeFetchJson(meshAddress: (npub: string) => Promise<string>, ve
     let size = 0;
     if (res.body) {
       const reader = res.body.getReader();
-      for (let r = await reader.read(); !r.done; r = await reader.read()) {
-        size += r.value.byteLength;
-        if (size > MAX_ANSWER) { await reader.cancel().catch(() => {}); throw new FleetError(`the node's answer is too large (over ${MAX_ANSWER} bytes)`); }
-        chunks.push(r.value);
+      try {
+        for (let r = await reader.read(); !r.done; r = await reader.read()) {
+          size += r.value.byteLength;
+          if (size > MAX_ANSWER) { await reader.cancel().catch(() => {}); throw new FleetError(`the node's answer is too large (over ${MAX_ANSWER} bytes)`); }
+          chunks.push(r.value);
+        }
+      } catch (e) {
+        // A stall after the headers (the timeout fires mid-body) is the node being away, like a refused connection.
+        if (e instanceof FleetError) throw e;
+        throw new FleetError(`the node stopped answering at [${addr}]:${port} (${(e as Error).message})`, 'offline');
       }
     }
     const text = Buffer.concat(chunks).toString('utf8');
@@ -325,13 +331,14 @@ export class Fleet {
   /** A forced run asked for while one is in flight runs right after it (with the list and checks of that moment). */
   private forcedNext = false;
   private runOnce(force: boolean): Promise<void> {
+    // Only the run that owns the slot clears it: a run chained behind it must not be unseated by its predecessor ending.
+    const track = (run: Promise<void>): Promise<void> => { const p: Promise<void> = run.catch(() => {}).finally(() => { if (this.inflight === p) this.inflight = null; }); this.inflight = p; return p; };
     if (this.inflight) {
       if (!force) return this.inflight;
-      if (!this.forcedNext) { this.forcedNext = true; this.inflight = this.inflight.then(() => { this.forcedNext = false; return this.pollAll(true); }).catch(() => {}).finally(() => { this.inflight = null; }); }
+      if (!this.forcedNext) { this.forcedNext = true; return track(this.inflight.then(() => { this.forcedNext = false; return this.pollAll(true); })); }
       return this.inflight;
     }
-    this.inflight = this.pollAll(force).catch(() => {}).finally(() => { this.inflight = null; });
-    return this.inflight;
+    return track(this.pollAll(force));
   }
 
   private async pollAll(force: boolean): Promise<void> {
@@ -361,7 +368,8 @@ export class Fleet {
     const get = (path: string, timeoutMs = 8000): Promise<Answer> => this.fetchJson(node.npub, node.port, path, { timeoutMs }).catch((e: Error) => e);
     const probe: Probe = { health: await get('/api/health') };
     const health = asRecord(probe.health);
-    if (health) {
+    // Only a mesh-listener answer (auth 'npub') is worth more reads; the main listener would refuse them all.
+    if (health && health.auth === 'npub') {
       const role = (health.principal as { role?: Role } | undefined)?.role;
       const reads: Promise<unknown>[] = [get('/api/q/show_status').then((a) => { probe.status = a; })];
       if (role && isAdmin(role)) {
@@ -399,7 +407,7 @@ export function parseProxyPath(pathname: string): { npub: string; path: string }
   const m = PROXY_RE.exec(pathname);
   if (!m) return null;
   const path = m[2];
-  if (path.length > MAX_PROXY_PATH || path.includes('//') || path.split('/').some((s) => s === '.' || s === '..')) return null;
+  if (path.length > MAX_PROXY_PATH || path.split('/').some((s) => s === '.' || s === '..')) return null;
   return { npub: m[1], path };
 }
 
