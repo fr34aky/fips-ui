@@ -266,3 +266,86 @@ test('proxyRequest: forwards GET and POST, strips the manager\'s headers, stream
     assert.equal((await r5.json() as { kind: string }).kind, 'offline');
   } finally { front.close(); upstream.close(); }
 });
+
+// ---- the manager set ------------------------------------------------------------------------------
+
+import { mergeManagers } from '../server/fleet.ts';
+
+test('mergeManagers: adds missing managers as admins, promotes viewers, never removes or demotes', () => {
+  const before = [{ npub: B, role: 'viewer' as const, label: 'b' }, { npub: ME, role: 'viewer' as const }, { npub: STANDBY, role: 'superadmin' as const }];
+  const r = mergeManagers(before, [ME, STANDBY, A, npub(9)], A);
+  assert.deepEqual(r.promoted, [ME]);
+  assert.deepEqual(r.added, [npub(9)]);
+  assert.deepEqual(r.allowed.map((e) => [e.npub, e.role]), [[B, 'viewer'], [ME, 'admin'], [STANDBY, 'superadmin'], [npub(9), 'admin']]);
+  assert.equal(r.allowed[3].label, 'fips-ui manager');
+  // Nothing to do: same list back, no changes reported.
+  const same = mergeManagers(r.allowed, [ME, STANDBY, A, npub(9)], A);
+  assert.equal(same.added.length + same.promoted.length, 0);
+  assert.deepEqual(same.allowed, r.allowed);
+  // Over the node's limit.
+  assert.throws(() => mergeManagers(Array.from({ length: 200 }, (_, i) => ({ npub: npub(100 + i), role: 'viewer' as const })), [ME], A), /200 entries/);
+});
+
+test('Fleet.syncManagers writes the merged list to the node and reports it; a viewer grant cannot', async () => {
+  const writes: unknown[] = [];
+  const list = [{ npub: ME, role: 'viewer' }];
+  const fetchJson: FetchJson = async (_npub, _port, path, init) => {
+    if (path === '/api/health') return health('admin');
+    if (path === '/api/q/show_status') return { status: 200, body: { peer_count: 1 } };
+    if (path === '/api/access' && init?.method === 'POST') { writes.push(init.body); list.splice(0, list.length, ...(init.body as { allowed: typeof list }).allowed); return { status: 200, body: {} }; }
+    if (path === '/api/access') return { status: 200, body: { config: { enabled: true, port: 8321, allowed: [...list] }, status: { npub: A } } };
+    return { status: 404, body: { error: 'not found' } };
+  };
+  const fleet = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson, file: file(), intervalMs: 60_000 });
+  await fleet.start();
+  await fleet.save({ nodes: [{ npub: A }], managers: [{ npub: STANDBY }] });
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.managersInSync, false);
+  const r = await fleet.syncManagers(A);
+  assert.equal(r.changed, true);
+  assert.deepEqual(r.promoted, [ME]);
+  assert.deepEqual(r.added, [STANDBY]);
+  assert.equal(writes.length, 1);
+  assert.deepEqual((writes[0] as { allowed: { npub: string; role: string }[] }).allowed.map((e) => e.role), ['admin', 'admin']);
+  assert.equal(r.node?.managersInSync, true);
+  // Again: nothing to write.
+  const again = await fleet.syncManagers(A);
+  assert.equal(again.changed, false);
+  assert.equal(writes.length, 1);
+  // Bulk: one result per node, in order.
+  const all = await fleet.syncAllManagers();
+  assert.deepEqual(all.map((x) => x.npub), [A]);
+  await assert.rejects(fleet.syncManagers(B), /not managed/);
+  fleet.close();
+});
+
+test('Fleet.expectRestart: a node that is away after being told to restart reads as restarting until it answers', async () => {
+  let up = true;
+  let now = 1000;
+  const fetchJson: FetchJson = async (_n, _p, path) => {
+    if (!up) throw new FleetError('cannot reach', 'offline');
+    if (path === '/api/health') return health('admin');
+    return { status: 200, body: { peer_count: 1, config: { allowed: [{ npub: ME, role: 'admin' }] }, status: { npub: A } } };
+  };
+  const fleet = new Fleet({ ownNpub: async () => ME, meshAddress: async () => 'fd00::1', fetchJson, file: file(), intervalMs: 60_000, now: () => now });
+  await fleet.start();
+  await fleet.save({ nodes: [{ npub: A }], managers: [] });
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
+  up = false;
+  fleet.expectRestart(A, 60_000);
+  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting');
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting', 'offline inside the window reads as restarting');
+  assert.equal(fleet.nodeStatus(A)?.uiVersion, '0.13.0', 'the last known version stays');
+  up = true;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'ok');
+  // Outside the window an unreachable node is offline again.
+  up = false;
+  fleet.expectRestart(A, 10);
+  now += 20;
+  await fleet.refresh();
+  assert.equal(fleet.nodeStatus(A)?.phase, 'restarting', 'the window check runs on the restart timer; a refresh inside it keeps the state');
+  fleet.close();
+});

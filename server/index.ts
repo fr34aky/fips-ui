@@ -421,6 +421,13 @@ async function route(req: Req, res: Res) {
       try { await fleet.save(body); } catch (e) { throw new HttpError(e instanceof FleetError ? 400 : 500, (e as Error).message); }
       return json(res, 200, fleet.snapshot());
     }
+    // Every manager as an admin on one node, or on all of them.
+    if (method === 'POST' && p === '/api/fleet/sync-managers') return json(res, 200, { results: await fleet.syncAllManagers() });
+    const sm = /^\/api\/fleet\/nodes\/(npub1[02-9ac-hj-np-z]{58})\/sync-managers$/.exec(p);
+    if (sm && method === 'POST') {
+      try { return json(res, 200, await fleet.syncManagers(sm[1])); }
+      catch (e) { throw new HttpError(e instanceof FleetError ? 404 : 500, (e as Error).message); }
+    }
     // Any page of a managed node: its own API, forwarded (GET and POST only; the body is read and checked here).
     const px = parseProxyPath(p);
     if (px) {
@@ -428,7 +435,9 @@ async function route(req: Req, res: Res) {
       const node = fleet.config.nodes.find((n) => n.npub === px.npub);
       if (!node) throw new HttpError(404, 'that node is not managed from here');
       const body = method === 'POST' ? await readJsonBody(req, 1024 * 1024) : undefined;
-      return proxyRequest(req, res, node, px.path, forwardQuery(url.searchParams), { meshAddress, version: UI_VERSION, body });
+      // A node told to update its fips-ui or to install fips restarts its fips-ui: expected, not an outage.
+      const onForwarded = (n: { npub: string }, path: string, status: number) => { if (status < 300 && (path === '/api/ui-update/install' || path === '/api/upgrade/install-daemon')) fleet.expectRestart(n.npub); };
+      return proxyRequest(req, res, node, px.path, forwardQuery(url.searchParams), { meshAddress, version: UI_VERSION, body, onForwarded });
     }
     throw new HttpError(404, 'unknown node-manager endpoint');
   }
