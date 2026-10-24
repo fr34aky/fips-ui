@@ -151,10 +151,12 @@ export interface NodeStatus {
   uiUpdate?: { current?: string; latest?: string; available: boolean; job?: { state: string; restarting?: boolean } | null };
   /** Whether every manager (but the node itself) is an admin on the node's access list, and which are not. */
   managersInSync?: boolean; managersMissing?: string[];
+  /** The node's latest security scan (fips-ui 0.14+): whether it can scan, and its score. */
+  security?: { available: boolean; score?: number; grade?: string; scannedAt?: number; critical?: number; high?: number };
 }
 
 type Answer = FetchResult | Error;
-export interface Probe { health: Answer; status?: Answer; access?: Answer; uiUpdate?: Answer; upgrade?: Answer }
+export interface Probe { health: Answer; status?: Answer; access?: Answer; uiUpdate?: Answer; upgrade?: Answer; security?: Answer }
 
 const asRecord = (a: Answer | undefined): Record<string, unknown> | null => {
   if (!a || a instanceof Error || a.status !== 200 || !a.body || typeof a.body !== 'object') return null;
@@ -165,7 +167,7 @@ const num = (v: unknown): number | undefined => (typeof v === 'number' && Number
 
 /** Builds the status record from the answers of one poll; `prev` keeps the last known facts while the node is away. */
 export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, probe: Probe, managers: string[], now: number): NodeStatus {
-  const carry: Partial<NodeStatus> = prev ? { lastSeen: prev.lastSeen, daemonVersion: prev.daemonVersion, uiVersion: prev.uiVersion, platform: prev.platform, helper: prev.helper, upgrade: prev.upgrade, uiUpdate: prev.uiUpdate, managersInSync: prev.managersInSync, managersMissing: prev.managersMissing, role: prev.role } : {};
+  const carry: Partial<NodeStatus> = prev ? { lastSeen: prev.lastSeen, daemonVersion: prev.daemonVersion, uiVersion: prev.uiVersion, platform: prev.platform, helper: prev.helper, upgrade: prev.upgrade, uiUpdate: prev.uiUpdate, managersInSync: prev.managersInSync, managersMissing: prev.managersMissing, role: prev.role, security: prev.security } : {};
   const base: NodeStatus = { ...carry, npub: node.npub, port: node.port, ...(node.label ? { label: node.label } : {}), reachable: false, phase: 'error', lastAttempt: now };
   const h = probe.health;
   if (h instanceof Error) {
@@ -190,7 +192,7 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
   const st = asRecord(probe.status);
   if (st) { out.peerCount = num(st.peer_count); out.uptimeSecs = num(st.uptime_secs ?? st.uptime); out.daemonVersion = str(st.version) ?? out.daemonVersion; }
   if (!role || !isAdmin(role)) {
-    return { ...out, phase: 'viewer', error: `this node is listed as ${role ?? 'nobody'} there; management needs admin`, managersInSync: undefined, managersMissing: undefined };
+    return { ...out, phase: 'viewer', error: `this node is listed as ${role ?? 'nobody'} there; management needs admin`, managersInSync: undefined, managersMissing: undefined, security: undefined };
   }
   const access = asRecord(probe.access);
   const allowed = (access?.config as { allowed?: AccessEntry[] } | undefined)?.allowed;
@@ -218,6 +220,17 @@ export function deriveNodeStatus(node: FleetNode, prev: NodeStatus | undefined, 
     };
     const hv = (g.helper as { version?: unknown } | undefined)?.version;
     if (typeof hv === 'number' && !out.helper) out.helper = { installed: hv, shipped: null };
+  }
+  const sec = probe.security;
+  // An older fips-ui has no such endpoint (404): nothing is known, and the last answer is not carried over.
+  if (sec && !(sec instanceof Error) && sec.status === 404) out.security = undefined;
+  const sr = asRecord(sec);
+  if (sr) {
+    const sum = sr.summary as { score?: unknown; grade?: unknown; scannedAt?: unknown; counts?: { critical?: unknown; high?: unknown } } | null | undefined;
+    out.security = {
+      available: sr.available === true,
+      ...(sum ? { score: num(sum.score), grade: str(sum.grade), scannedAt: num(sum.scannedAt), critical: num(sum.counts?.critical), high: num(sum.counts?.high) } : {}),
+    };
   }
   return out;
 }
@@ -497,7 +510,7 @@ export class Fleet {
       const reads: Promise<unknown>[] = [get('/api/q/show_status').then((a) => { probe.status = a; })];
       if (role && isAdmin(role)) {
         reads.push(get('/api/access').then((a) => { probe.access = a; }));
-        if (slow) reads.push(get('/api/ui-update', 15_000).then((a) => { probe.uiUpdate = a; }), get('/api/upgrade/status', 20_000).then((a) => { probe.upgrade = a; }));
+        if (slow) reads.push(get('/api/ui-update', 15_000).then((a) => { probe.uiUpdate = a; }), get('/api/upgrade/status', 20_000).then((a) => { probe.upgrade = a; }), get('/api/admin/security/summary').then((a) => { probe.security = a; }));
       }
       await Promise.all(reads);
     }

@@ -389,3 +389,14 @@ test('Fleet.pollNode: a probe already under way is shared, not raced', async () 
   assert.equal(calls - before, 3, 'health, status and access once');
   fleet.close();
 });
+
+test('deriveNodeStatus: the security summary, an older fips-ui, carried while offline', () => {
+  const sum = { summary: { score: 72, grade: 'C', scannedAt: 5000, counts: { critical: 0, high: 2, medium: 1, low: 0, info: 3 } }, available: true };
+  const s = deriveNodeStatus(node, undefined, { health: health('admin'), security: { status: 200, body: sum } }, [ME], 1);
+  assert.deepEqual(s.security, { available: true, score: 72, grade: 'C', scannedAt: 5000, critical: 0, high: 2 });
+  assert.deepEqual(deriveNodeStatus(node, undefined, { health: health('admin'), security: { status: 200, body: { summary: null, available: false } } }, [ME], 1).security, { available: false });
+  assert.equal(deriveNodeStatus(node, s, { health: health('admin'), security: { status: 404, body: { error: 'unknown' } } }, [ME], 2).security, undefined);
+  // Between slow polls (no security read) and while offline, the last answer stays.
+  assert.deepEqual(deriveNodeStatus(node, s, { health: health('admin') }, [ME], 3).security, s.security);
+  assert.deepEqual(deriveNodeStatus(node, s, { health: new FleetError('offline', 'offline') }, [ME], 4).security, s.security);
+});

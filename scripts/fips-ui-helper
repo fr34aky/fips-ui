@@ -60,6 +60,10 @@
 #                                     the unit is enabled and started. systemd only (the packaging's units)
 #   pubdom-update [vX.Y.Z]         -> (v12) the same release fetch; binaries and every installed unit replaced,
 #                                     the units that were running restarted
+#   security-scan                  -> (v13, Linux) run a fixed set of read-only checks (listeners, firewalls,
+#                                     pending and security updates from the distribution's tools, reboot and
+#                                     restart needs, sshd and sysctl hardening, accounts, fips file modes) and
+#                                     print their raw output as JSON; fips-ui parses and scores it
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -71,7 +75,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=12
+HELPER_VERSION=13
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -1426,6 +1430,117 @@ daemon_install() { # [tag] [peer...]
   printf '{"ok":true,"tag":%s,"artifact":%s,"socket":%s}\n' "$(json_escape "$tag_found")" "$(json_escape "$file")" "$(json_escape "$sock")"
 }
 
+# ---------------------------------------------------------------- security scan (v13)
+# A fixed set of read-only commands whose raw output fips-ui parses and scores itself (server/security.ts). Nothing
+# here takes input from the UI, and nothing changes the system; package metadata is refreshed only where the tool
+# keeps it apart from the installed state (dnf's cache, checkupdates' temporary database).
+SCAN_MAX_BYTES=262144
+scan_init() {
+  scan_dir=$(mktemp -d)
+  trap 'rm -rf "$scan_dir"' EXIT
+  command -v nice >/dev/null 2>&1 && scan_nice=(nice -n 10) || scan_nice=()
+  command -v ionice >/dev/null 2>&1 && scan_nice+=(ionice -c 3)
+}
+scan_run() { # <name> <timeout-s> <cmd> [args...]: output capped, exit code kept; 127 when the tool is missing
+  local name=$1 t=$2 rc; shift 2
+  if ! command -v "$1" >/dev/null 2>&1; then echo 127 > "$scan_dir/$name.code"; : > "$scan_dir/$name.out"; return 0; fi
+  set +e +o pipefail
+  LC_ALL=C timeout "$t" ${scan_nice[@]+"${scan_nice[@]}"} "$@" </dev/null 2>&1 9>&- | head -c "$SCAN_MAX_BYTES" > "$scan_dir/$name.out"
+  rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  echo "$rc" > "$scan_dir/$name.code"
+}
+scan_sh() { scan_run "$1" "$2" bash -c "$3"; } # <name> <timeout-s> <fixed script>
+
+read -r -d '' SCAN_PY <<'PY' || true
+import json, os, sys, time
+d = sys.argv[1]
+sections = {}
+for f in sorted(os.listdir(d)):
+    if not f.endswith('.out'):
+        continue
+    name = f[:-4]
+    with open(os.path.join(d, f), 'rb') as h:
+        out = h.read().decode('utf-8', 'replace')
+    try:
+        with open(os.path.join(d, name + '.code')) as h:
+            code = int(h.read().strip() or '1')
+    except (OSError, ValueError):
+        code = 1
+    sections[name] = {'code': code, 'out': out}
+print(json.dumps({'ok': True, 'version': int(sys.argv[2]), 'pm': sys.argv[3], 'nixos': sys.argv[4] == 'true',
+                  'started': int(sys.argv[5]), 'finished': int(time.time()), 'sections': sections}, separators=(',', ':')))
+PY
+
+scan_pm() {
+  if $NIXOS; then echo nix
+  elif command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  elif command -v pacman >/dev/null 2>&1; then echo pacman
+  elif command -v zypper >/dev/null 2>&1; then echo zypper
+  else echo none; fi
+}
+
+security_scan() {
+  [[ "$OS" == Linux ]] || die "the security scan supports Linux only"
+  command -v python3 >/dev/null 2>&1 || die "the security scan needs python3"
+  local started pm
+  started=$(date +%s)
+  scan_init
+  pm=$(scan_pm)
+  # System
+  scan_sh os_release 5 'cat /etc/os-release'
+  scan_run uname 5 uname -r
+  scan_sh kernels 5 'ls -1 /usr/lib/modules 2>/dev/null || ls -1 /lib/modules'
+  scan_sh reboot_required 5 'if [[ -e /var/run/reboot-required ]]; then echo yes; cat /var/run/reboot-required.pkgs 2>/dev/null; else echo no; fi'
+  [[ "$SM" == systemd ]] && scan_run failed_units 15 systemctl --failed --no-legend --plain
+  # Listeners and firewalls
+  scan_run ss 15 ss -Htulnp
+  scan_run nft 20 nft -j list ruleset
+  scan_run ufw 15 ufw status verbose
+  scan_run firewalld 15 firewall-cmd --list-all
+  scan_run iptables 15 iptables-save
+  scan_run ip6tables 15 ip6tables-save
+  # Patches and known vulnerabilities, from the distribution's own tools
+  case "$pm" in
+    apt)
+      scan_sh apt_lists_age 5 'stat -c %Y /var/lib/apt/lists/partial /var/lib/apt/lists/*Release 2>/dev/null | sort -n | tail -n 1'
+      scan_run apt_upgrade 180 apt-get -s -o Debug::NoLocking=1 dist-upgrade
+      command -v debsecan >/dev/null 2>&1 && scan_sh debsecan 300 '. /etc/os-release; debsecan --suite "${VERSION_CODENAME:-sid}" --format summary'
+      ;;
+    dnf)
+      scan_run dnf_makecache 300 dnf -q makecache
+      scan_run dnf_updates 300 dnf -q check-update
+      scan_run dnf_security 300 dnf -q updateinfo list --security
+      scan_run dnf_cves 300 dnf -q updateinfo list --security cves
+      ;;
+    pacman)
+      scan_run pacman_updates 300 checkupdates
+      scan_run arch_audit 300 arch-audit --json
+      ;;
+    zypper)
+      scan_run zypper_patches 300 zypper -q --non-interactive --xmlout list-patches -g security
+      scan_run zypper_updates 300 zypper -q --non-interactive --xmlout list-updates
+      ;;
+  esac
+  scan_run needs_restarting 120 needs-restarting -r
+  scan_run needrestart 120 needrestart -b
+  # Hardening
+  scan_run sshd 15 sshd -T
+  scan_run sysctl 10 sysctl -e kernel.randomize_va_space kernel.kptr_restrict kernel.dmesg_restrict kernel.unprivileged_bpf_disabled \
+    net.ipv4.conf.all.rp_filter net.ipv4.conf.all.accept_redirects net.ipv6.conf.all.accept_redirects net.ipv4.conf.all.send_redirects \
+    net.ipv4.conf.all.accept_source_route net.ipv4.tcp_syncookies net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+  scan_sh uid0 5 "awk -F: '\$3 == 0 { print \$1 }' /etc/passwd"
+  # Account names only: the hashes never leave /etc/shadow.
+  scan_sh empty_passwords 5 "awk -F: '\$2 == \"\" { print \$1 }' /etc/shadow"
+  if [[ "$SM" == systemd ]]; then
+    scan_sh auto_updates 15 'for u in unattended-upgrades.service apt-daily-upgrade.timer dnf-automatic.timer dnf-automatic-install.timer dnf5-automatic.timer packagekit-offline-update.service; do systemctl cat "$u" >/dev/null 2>&1 && echo "$u $(systemctl is-enabled "$u" 2>/dev/null) $(systemctl is-active "$u" 2>/dev/null)"; done; command -v apt-config >/dev/null && apt-config dump APT::Periodic::Unattended-Upgrade; true'
+    scan_run timesync 10 timedatectl show -p NTP -p NTPSynchronized
+  fi
+  scan_sh fips_files 5 "stat -c '%a %U %G %n' $(printf '%q ' "$FIPS_CONFIG" "$FIPS_ETC/fips.key" "$FIPS_ETC/fips.pub" "$FIPS_HOSTS") 2>/dev/null; true"
+  python3 -I -c "$SCAN_PY" "$scan_dir" "$HELPER_VERSION" "$pm" "$NIXOS" "$started"
+}
+
 # ---------------------------------------------------------------- commands
 cmd=${1:-}
 case "$cmd" in
@@ -1438,10 +1553,11 @@ case "$cmd" in
     if [[ "$fw" == pf ]]; then fw_dir=$PF_DROPIN_DIR; fw_ext=.pf; else fw_dir=$DROPIN_DIR; fw_ext=.nft; fi
     pd_server=false; command -v fips-pubdom-server >/dev/null 2>&1 && pd_server=true
     pd_resolver=false; command -v fips-pubdomd >/dev/null 2>&1 && pd_resolver=true
-    printf '{"ok":true,"version":%s,"managed_by":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s},"pubdom":{"server":%s,"resolver":%s,"etc":%s}}\n' \
+    security=false; [[ "$OS" == Linux ]] && command -v python3 >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 && security=true
+    printf '{"ok":true,"version":%s,"managed_by":%s,"os":%s,"service_manager":%s,"service":%s,"bin_dir":%s,"backups_dir":%s,"current":%s,"config_path":%s,"hosts_path":%s,"firewall_dropin_dir":%s,"firewall_dropin_ext":%s,"features":{"config":%s,"hosts":%s,"services":%s,"firewall":%s,"guard":%s,"security":%s},"pubdom":{"server":%s,"resolver":%s,"etc":%s}}\n' \
       "$HELPER_VERSION" "$($NIXOS && echo '"nix"' || echo null)" "$(json_escape "$OS")" "$(json_escape "$SM")" "$(json_escape "$SERVICE")" \
       "$(json_escape "$BIN_DIR")" "$(json_escape "$BACKUPS_DIR")" "$(json_escape "$(current_version)")" \
-      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")" \
+      "$(json_escape "$FIPS_CONFIG")" "$(json_escape "$FIPS_HOSTS")" "$(json_escape "$fw_dir")" "$(json_escape "$fw_ext")" "$managed" "$managed" "$managed" "$(json_escape "$fw")" "$(json_escape "$guard")" "$security" \
       "$pd_server" "$pd_resolver" "$(json_escape "$PUBDOM_ETC")"
     ;;
 
@@ -1907,6 +2023,10 @@ NFT
     daemon_install "$@"
     ;;
 
+  security-scan)
+    security_scan
+    ;;
+
   daemon-installed)
     # Exit 0 and say what was found if fips is installed, 1 if not.
     if found=$(fips_trace); then echo "$found"; else exit 1; fi
@@ -1926,6 +2046,6 @@ NFT
     ;;
 
   *)
-    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off|status> [tun] [canary]}"
+    die "usage: $0 {check|install <stagedir> [--no-restart]|rollback <id>|restart|list-backups|config-show [id]|config-apply [--no-restart]|config-backups|config-restore <id>|firewall-status|dropin-apply <name>|dropin-delete <name>|service <action> <unit>|mesh-guard <ports|off|status> [tun] [canary]|security-scan}"
     ;;
 esac

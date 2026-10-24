@@ -29,10 +29,13 @@ NixOS module), FreeBSD, pfSense, macOS and Windows.
 | **Public domains** | Where the node runs [fips-pub-domains](https://github.com/fr34aky/fips-pub-domains): the domains this node serves over fips (names, relays, when the claim was published, the DNS record to add, who attested it) and the domains its resolver has verified, read from their control sockets. Admins install and update both from the GitHub releases, start and stop their units, add and edit zone files as a table, edit both configurations, publish now, check the DNS record, forget a pin and flush caches ([docs/public-domains.md](docs/public-domains.md)). |
 | **Configuration** | Edit `fips.yaml` (`/etc/fips`, `/usr/local/etc/fips` on FreeBSD and macOS, `/var/lib/fips` on NixOS) with live YAML validation, a diff of your changes and backups. Secrets stay redacted and are restored on save; applying restarts the daemon and rolls back automatically if it does not stay up. Offers template merges from daemon upgrades that need review. See [docs/node-management.md](docs/node-management.md). |
 | **Firewall** | Enable, start, stop and reload `fips-firewall`, see drop counters, add inbound rules for specific npubs, hosts-file names, prefixes or anyone, one-click "allow" for a filtered listener, and raw editing of other drop-ins. Every change is validated with `nft -c` before it is written. |
+| **Security** | A weekly scan of the machine (Linux): every listening service and whether the host firewall lets it in from the LAN and from the mesh, pending and security updates, known vulnerabilities from the distribution's own tools, reboots updates wait for, and SSH, kernel, account and fips file settings, scored 0-100 with a fix for each finding and a trend over the last 12 scans. Read-only; through the helper ([docs/security-scan.md](docs/security-scan.md)). Admins only. |
 | **Upgrade** | Install the latest fips release (checksum-verified) or build any ref from source with cargo, with backups and rollback; afterwards `fips.yaml` is merged with the new version's template ([docs/upgrade.md](docs/upgrade.md)). Root steps go through a tiny helper you install once from a shell. On a machine without fips it **installs fips** itself, with a persistent identity and bootstrap peers ([docs/install.md](docs/install.md#installing-the-fips-daemon)). Also updates **fips-ui itself** to its newest release, shown next to the version in the sidebar ([docs/self-update.md](docs/self-update.md)). |
-| **Node manager** | Other fips nodes whose fips-ui this one reaches over the mesh: reachability, daemon and fips-ui versions, available updates, helper version, and whether every manager is listed as an admin there; standby managers for the day this node is lost ([docs/fleet.md](docs/fleet.md)). Superadmins only. |
+| **Node manager** | Other fips nodes whose fips-ui this one reaches over the mesh: reachability, daemon and fips-ui versions, available updates, helper version, security grade, and whether every manager is listed as an admin there; standby managers for the day this node is lost ([docs/fleet.md](docs/fleet.md)). Superadmins only. |
 
 Dark and light themes, responsive down to phone width, no external fonts or CDNs.
+
+![security](docs/screenshots/security.png)
 
 ## Requirements
 
@@ -116,6 +119,7 @@ Everything is via environment variables.
 | `FIPS_UI_CONFIG_PROPOSAL_FILE` | `~/.config/fips-ui/config-proposal.json` | A fips.yaml template merge waiting for review. |
 | `FIPS_UI_FLEET_FILE` | `~/.config/fips-ui/fleet.json` | The nodes this one manages and the standby managers ([docs/fleet.md](docs/fleet.md)). |
 | `FIPS_UI_FLEET_POLL_MS` | `30000` | How often the managed nodes are probed. |
+| `FIPS_UI_SECURITY_FILE` | `~/.config/fips-ui/security.json` | The security scan's schedule; its reports are kept in `security/` next to it ([docs/security-scan.md](docs/security-scan.md)). |
 | `FIPS_UI_REPO` | `fr34aky/fips-ui` | Repository whose releases fips-ui installs for itself. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
 
@@ -213,6 +217,9 @@ POST /api/admin/firewall/rules        {rules};  POST /api/admin/firewall/dropin 
 POST /api/admin/service               {unit, action}: start|stop|restart|reload|enable|disable (no enable/disable on NixOS)
 GET  /api/admin/address?npub=         the npub's fips0 address
 POST /api/admin/log-access            let the UI read the daemon's log file (FreeBSD, macOS)
+GET  /api/admin/security              the security scan: schedule, whether one runs, next run, the latest report ([docs/security-scan.md](docs/security-scan.md))
+GET  /api/admin/security/history      score, grade and counts of the kept reports;  GET …/summary the latest score (for the Node manager)
+POST /api/admin/security/scan         scan now (202, poll GET);  POST …/settings {enabled, weekday 0-6 (Sunday 0), hour 0-23}
 ```
 
 **Daemon upgrades and fresh installs** ([docs/upgrade.md](docs/upgrade.md))

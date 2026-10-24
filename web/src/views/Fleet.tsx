@@ -7,6 +7,7 @@ import { fleetApi, phaseInfo, type FleetConfig, type FleetData, type FleetNodeSt
 import { fmtAgo, fmtDuration, fmtNum, shortKey } from '../lib/format';
 import { useHosts } from '../lib/names';
 import { hashFor } from '../lib/route';
+import { gradeTone, type Grade } from '../lib/security';
 import { isAdmin, NPUB_RE, type Snapshot } from '../lib/types';
 
 /**
@@ -63,7 +64,7 @@ function Nodes({ data, own, onChanged, busy }: { data: FleetData; own?: string; 
     <div className="grid gap-3 pb-4">
       <div className="hidden md:block overflow-x-auto">
         <table className="data">
-          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th><th /></tr></thead>
+          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="The node's latest weekly security scan">Security</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th><th /></tr></thead>
           <tbody>
             {data.nodes.map((n) => (
               <tr key={n.npub}>
@@ -74,6 +75,7 @@ function Nodes({ data, own, onChanged, busy }: { data: FleetData; own?: string; 
                 <td className="mono">{n.reachable ? fmtDuration(n.uptimeSecs) : '–'}</td>
                 <td className="mono">{n.reachable ? fmtNum(n.peerCount) : '–'}</td>
                 <td><HelperChip n={n} /></td>
+                <td><SecurityChip n={n} /></td>
                 <td><ManagersChip n={n} /></td>
                 <td><div className="flex flex-wrap gap-1.5 justify-end"><NodeActions n={n} onChanged={onChanged} busy={busy} /></div></td>
               </tr>
@@ -89,7 +91,7 @@ function Nodes({ data, own, onChanged, busy }: { data: FleetData; own?: string; 
               ['Daemon', <VersionCell key="d" version={n.daemonVersion} latest={n.upgrade?.latest} available={!!n.upgrade?.available} restartPending={n.upgrade?.restartPending} />],
               ['fips-ui', <VersionCell key="u" version={n.uiVersion} latest={n.uiUpdate?.latest} available={!!n.uiUpdate?.available} />],
               ['Uptime · peers', <span key="p" className="mono">{n.reachable ? `${fmtDuration(n.uptimeSecs)} · ${fmtNum(n.peerCount)}` : '–'}</span>],
-              ['Helper', <HelperChip key="h" n={n} />], ['Managers', <ManagersChip key="m" n={n} />],
+              ['Helper', <HelperChip key="h" n={n} />], ['Security', <SecurityChip key="s" n={n} />], ['Managers', <ManagersChip key="m" n={n} />],
             ]} />
             <div className="flex flex-wrap gap-2"><NodeActions n={n} onChanged={onChanged} busy={busy} /></div>
           </div>
@@ -285,3 +287,19 @@ function FleetConfigCard({ data, own, onSaved }: { data: FleetData; own?: string
 }
 
 export default Fleet;
+
+/** The grade and score of the node's latest security scan, leading to its Security page. */
+function SecurityChip({ n }: { n: FleetNodeStatus }) {
+  const s = n.security;
+  if (!s) return <span className="text-ink-3" title="Not reported (fips-ui older than 0.14, or not probed yet)">–</span>;
+  if (!s.available && s.score === undefined) return <span className="text-ink-3" title="The node cannot scan (helper v13 on Linux needed)">n/a</span>;
+  if (s.score === undefined || !s.grade) return <a className="text-xs text-ink-3 hover:text-ink" href={hashFor('security', undefined, n.npub)}>not scanned</a>;
+  const g = s.grade as Grade;
+  const issues = [s.critical ? `${s.critical} critical` : '', s.high ? `${s.high} high` : ''].filter(Boolean).join(', ');
+  return (
+    <a href={hashFor('security', undefined, n.npub)} className="inline-flex items-center gap-1.5" title={`Scanned ${s.scannedAt ? fmtAgo(s.scannedAt) : '?'}${issues ? ` · ${issues}` : ''}`}>
+      <Chip tone={gradeTone(g)} dot={false}>{g} · {s.score}</Chip>
+      {issues && <span className="text-xs text-crit">{issues}</span>}
+    </a>
+  );
+}
