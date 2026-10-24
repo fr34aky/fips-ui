@@ -9,19 +9,23 @@ import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, s
 
 export function Security({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
-  const [fast, setFast] = useState(false);
-  const st = usePoll(() => securityApi.get(), [], fast ? 3000 : 30000);
+  // While a scan runs (or one was just asked for), poll quickly; the toast says how it ended.
+  const [watching, setWatching] = useState(false);
+  const st = usePoll(() => securityApi.get(), [], watching ? 3000 : 30000);
   const hist = usePoll(() => securityApi.history(), [st.data?.latest?.scannedAt], 0);
   const s = st.data;
   // Poll quickly while a scan runs, and say when it is over.
+  // Every answer is a new object: a scan that ended before the next poll still ends the watch.
   useEffect(() => {
     if (!s) return;
-    if (s.running) setFast(true);
-    else if (fast) { setFast(false); if (s.lastError) toast('err', `Scan failed: ${s.lastError}`); else toast('ok', 'Scan finished'); }
-  }, [s?.running]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (s.running) { setWatching(true); return; }
+    if (!watching) return;
+    setWatching(false);
+    if (s.lastError) toast('err', `Scan failed: ${s.lastError}`); else toast('ok', 'Scan finished');
+  }, [s]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const scan = async () => {
-    try { await securityApi.scan(); setFast(true); st.refresh(); toast('info', 'Scan started; it takes a minute or a few'); }
+    try { await securityApi.scan(); setWatching(true); st.refresh(); toast('info', 'Scan started; it takes a minute or a few'); }
     catch (e) { toast('err', (e as Error).message); }
   };
 
@@ -43,7 +47,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatTile hero label="Score" value={r ? <span className="flex items-baseline gap-2">{r.score}<span className="text-base text-ink-3">/ 100</span><Chip tone={gradeTone(r.grade)} dot={false} className="text-sm">{r.grade}</Chip></span> : '–'} sub={r ? `scanned ${fmtAgo(r.scannedAt)}` : 'not scanned yet'} trend={trend} />
         <StatTile label="Findings" value={r ? <SeverityCounts report={r} /> : '–'} sub={r ? `${r.findings.filter((f) => f.severity !== 'info').length} that cost points` : undefined} />
-        <StatTile label="Reachable services" value={r ? String(reachable(r.listeners).length) : '–'} sub={r ? `${r.firewall.backend === 'none' ? 'no host firewall' : r.firewall.defaultDeny ? `${r.firewall.backend}, default deny` : r.firewall.defaultDeny === false ? `${r.firewall.backend}, open by default` : 'firewall unknown'}` : undefined} />
+        <StatTile label="Reachable services" value={r ? String(reachable(r.listeners).length) : '–'} sub={r ? `${r.firewall.backend === 'none' ? 'no host firewall' : r.firewall.defaultDeny ? `${FW_NAME[r.firewall.backend] ?? r.firewall.backend} · default deny` : r.firewall.defaultDeny === false ? `${FW_NAME[r.firewall.backend] ?? r.firewall.backend} · open by default` : 'firewall unknown'}` : undefined} />
         <StatTile label="Pending updates" value={r?.packages.updates ? String(r.packages.updates.length) : '–'} sub={r?.packages.updates ? `${r.packages.updates.filter((u) => u.security).length} security${r.reboot.required ? ' · reboot needed' : ''}` : r ? (r.packages.supported ? 'could not be read' : 'not supported here') : undefined} />
       </div>
 
@@ -54,11 +58,11 @@ export function Security({ readOnly }: { readOnly: boolean }) {
 
       {r && <>
         <FindingsCard report={r} />
-        <ListenersCard listeners={r.listeners} readOnly={readOnly} />
+        <ListenersCard listeners={r.listeners} readOnly={readOnly} defaultDeny={r.firewall.defaultDeny} />
         <PackagesCard report={r} />
         <Card title="About this scan">
           <KV items={[
-            ['System', r.system.name ?? '–'], ['Kernel', <span className="mono">{r.system.kernel ?? '–'}</span>], ['Package manager', r.system.nixos ? 'Nix (NixOS)' : r.system.manager],
+            ['System', r.system.name ?? '–'], ['Kernel', <span key="k" className="mono">{r.system.kernel ?? '–'}</span>], ['Package manager', r.system.nixos ? 'Nix (NixOS)' : r.system.manager],
             ['Firewall', `${r.firewall.backend}${r.firewall.detail ? ` · ${r.firewall.detail}` : ''}`], ['Scanned', `${fmtTime(r.scannedAt, true)} · took ${fmtDuration(r.durationSecs)}`], ['Helper', `v${r.helperVersion}`],
           ]} />
           {r.notes.length > 0 && <div className="mt-3 text-xs text-ink-3 grid gap-1"><div className="font-medium text-ink-2">Not covered by this scan</div>{r.notes.map((n, i) => <div key={i} className="break-words">{n}</div>)}</div>}
@@ -113,7 +117,7 @@ function ScheduleCard({ settings, running, startedAt, nextRun, available, readOn
           <span className="text-ink-3">at</span>
           <select className="input w-auto" disabled={!draft.enabled || readOnly} value={draft.hour} onChange={(e) => setDraft({ ...draft, hour: Number(e.target.value) })}>{Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>)}</select>
         </div>
-        <div className="text-xs text-ink-3">{nextRun === null ? 'Automatic scans are off.' : nextRun <= now ? 'A scheduled scan is due now.' : `Next scan ${fmtTime(nextRun, true)}. A scan missed while fips-ui was down runs when it is back.`}</div>
+        <div className="text-xs text-ink-3">{nextRun === null ? 'Automatic scans are off.' : nextRun <= now ? 'A scheduled scan is due now.' : `Next scan ${fmtSlot(nextRun)}. A scan missed while fips-ui was down runs when it is back.`}</div>
         {!readOnly && <div><button className="btn sm" disabled={!dirty || busy} onClick={save}>Save schedule</button></div>}
       </div>
     </Card>
@@ -163,13 +167,18 @@ function FindingsCard({ report }: { report: Report }) {
   );
 }
 
+const FW_NAME: Record<string, string> = { nft: 'nftables', ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables' };
+const fmtSlot = (ms: number) => new Date(ms).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
 const reachable = (ls: Listener[]) => ls.filter((l) => !l.ephemeral && l.scope !== 'loopback' && (open(l.lan) || open(l.mesh)));
 const open = (v?: Verdict) => v === 'allowed' || v === 'none' || v === 'unknown';
 const VERDICT: Record<Verdict, { label: string; tone: 'good' | 'warn' | 'crit' | 'neutral' | 'accent' }> = {
   blocked: { label: 'blocked', tone: 'good' }, restricted: { label: 'some sources', tone: 'accent' }, allowed: { label: 'open', tone: 'crit' }, unknown: { label: 'unknown', tone: 'warn' }, none: { label: 'no firewall', tone: 'crit' },
 };
+/** An open port behind a default-deny firewall was allowed on purpose: said calmly. */
+const verdictInfo = (v: Verdict, defaultDeny: boolean | null) => (v === 'allowed' && defaultDeny ? { label: 'allowed', tone: 'warn' as const } : VERDICT[v]);
 
-function ListenersCard({ listeners, readOnly }: { listeners: Listener[]; readOnly: boolean }) {
+function ListenersCard({ listeners, readOnly, defaultDeny }: { listeners: Listener[]; readOnly: boolean; defaultDeny: boolean | null }) {
   const [filter, setFilter] = useState<'reachable' | 'all'>('reachable');
   const shown = useMemo(() => (filter === 'all' ? listeners : reachable(listeners)), [filter, listeners]);
   return (
@@ -182,8 +191,8 @@ function ListenersCard({ listeners, readOnly }: { listeners: Listener[]; readOnl
               <td>{l.process ?? <span className="text-ink-3">–</span>}</td>
               <td className="mono text-xs">{l.addr}{l.iface ? `%${l.iface}` : ''}</td>
               <td className="text-xs text-ink-2">{l.ephemeral ? 'client socket' : l.scope}</td>
-              <td>{l.lan ? <Chip tone={VERDICT[l.lan].tone}>{VERDICT[l.lan].label}</Chip> : <span className="text-ink-3">–</span>}</td>
-              <td>{l.mesh ? <Chip tone={VERDICT[l.mesh].tone}>{VERDICT[l.mesh].label}</Chip> : <span className="text-ink-3">–</span>}</td>
+              <td>{l.lan ? <Chip tone={verdictInfo(l.lan, defaultDeny).tone}>{verdictInfo(l.lan, defaultDeny).label}</Chip> : <span className="text-ink-3">–</span>}</td>
+              <td>{l.mesh ? <Chip tone={verdictInfo(l.mesh, true).tone}>{verdictInfo(l.mesh, true).label}</Chip> : <span className="text-ink-3">–</span>}</td>
               <td>{!readOnly && l.mesh === 'blocked' && <a className="btn ghost sm" href={hashFor('firewall', { port: String(l.port), proto: l.proto, note: l.process ?? '' })} title="Allow npubs to reach it over the mesh">Allow on mesh</a>}</td>
             </tr>
           ))}

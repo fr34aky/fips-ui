@@ -6,6 +6,8 @@ reboots that updates are waiting for, and a few hardening settings. Each finding
 report is scored 0–100 with a grade, so a change shows from one week to the next. The Node manager shows the grade
 of every managed node ([fleet.md](fleet.md)).
 
+![The Security page](screenshots/security.png)
+
 The page is for admins: a list of what a node exposes is useful to an attacker too. The scan never changes the
 system and nothing leaves the node; vulnerability data comes from the distribution's own tools.
 
@@ -43,10 +45,13 @@ interface or on fips0, from the mesh:
   depends on the sender (source address, interface) makes it *some sources*; an expression fips-ui cannot read
   (an iptables-nft `xt` match, a named set) makes it *unknown*. Every chain on the hook must accept.
 - **ufw** and **firewalld** (when they are active) by their default policy and their allowed ports and services.
-- **iptables** (legacy) by the INPUT policy and plain `--dport` rules.
+  They write their own nftables tables (ufw through iptables-nft, which `nft -j` cannot express), so those tables
+  are read from the tools and every other table on the input hook, such as fips's own `inet fips`, from nftables:
+  a connection gets in only when both let it.
+- **iptables** (legacy, with an empty nftables ruleset) by the INPUT policy and plain `--dport` rules.
 
-Unconnected UDP sockets on ephemeral ports (≥ 32768) without a process are clients, not services; they are listed but not
-scored.
+UDP sockets in Linux's ephemeral port range (32768–60999) are clients (DNS, mDNS, QUIC, WebRTC), not services;
+they are listed but not scored.
 
 ## Score
 
@@ -63,11 +68,11 @@ at most its cap, so one noisy area cannot hide the others. Any critical finding 
 
 | Category | Cap | Examples |
 | -------- | --- | -------- |
-| Exposure | 30 | a database or Docker API port open to everyone (high, critical on every interface); any other service open to the LAN (medium); SSH (low); a service reachable from every mesh node; fips-ui bound beyond loopback without `FIPS_UI_TOKEN` |
+| Exposure | 30 | without a default-deny firewall: a database or Docker API port open to everyone (high, critical on every interface), any other TCP service (medium), SSH (low). Ports a default-deny firewall allows on purpose cost less: risky ones medium, others low, web (80, 443) nothing. A service every mesh node reaches (medium with nothing filtering fips0, low through a drop-in); fips-ui bound beyond loopback without `FIPS_UI_TOKEN` (high) |
 | Firewall | 20 | no input filtering, or accept by default (high); fips-firewall not running (medium) |
-| Patches | 25 | pending security updates (high, critical from 10); other updates (low, medium from 50); stale apt lists, a pending reboot (medium); services on old libraries (low) |
-| Vulnerabilities | 25 | per package with a fix available, at the distribution's severity; without a fix yet, low |
-| Hardening | 20 | an extra UID-0 account, a world-readable `fips.key` (critical); SSH root login with a password, accounts without a password (high); SSH password login, ASLR off, source routing (medium); kernel pointer and log restrictions, redirects, no automatic updates, unsynchronised clock, failed units (low) |
+| Patches | 20 | pending security updates (high; low, or medium from 10, where the vulnerabilities they fix are scored separately); other updates (low, medium from 50); stale apt lists, a pending reboot (medium); services on old libraries (low) |
+| Vulnerabilities | 20 | per package with a fix available, at the distribution's severity (debsecan: its urgency); without a fix yet, listed but not scored |
+| Hardening | 15 | an extra UID-0 account, a world-readable `fips.key` (critical); SSH root login with a password, accounts without a password (high); SSH password login, ASLR off, source routing (medium); kernel pointer and log restrictions, redirects, no automatic updates, unsynchronised clock, failed units (low) |
 
 Grades: A from 90, B from 80, C from 70, D from 60, F below.
 

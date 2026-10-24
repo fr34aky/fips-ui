@@ -24,8 +24,8 @@ export const HOSTS_HELPER_VERSION = 6;
 export const PUBDOM_HELPER_VERSION = 11;
 /** Helper version with the read-only security scan (docs/security-scan.md). */
 export const SECURITY_HELPER_VERSION = 13;
-// The scan's slowest parts are the package managers' metadata refreshes (5 minutes each at most).
-const SECURITY_SCAN_TIMEOUT = 20 * 60_000;
+// Above the helper's own worst case: four dnf steps of 5 minutes, the restart checks (4 minutes) and the rest.
+const SECURITY_SCAN_TIMEOUT = 30 * 60_000;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;

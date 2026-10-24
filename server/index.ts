@@ -373,9 +373,11 @@ const security = new SecurityScanner({
   run: () => admin.securityScan(),
   available: () => admin.securityCapable(),
   context: async () => {
-    // No browser connected means no polling: ask the daemon itself.
-    const st = (lastSnapshot?.status ?? await query('show_status', undefined, { timeoutMs: 3000 }).catch(() => undefined)) as { tun_name?: string; ipv6_addr?: string } | undefined;
-    const units = (lastSnapshot?.units ?? await unitStates().catch(() => [])) as { id: string; loaded: boolean; active: string }[];
+    // Asked now: the last browser's snapshot can be days old by the time a scheduled scan runs.
+    const [st, units] = await Promise.all([
+      query('show_status', undefined, { timeoutMs: 3000 }).catch(() => lastSnapshot?.status) as Promise<{ tun_name?: string; ipv6_addr?: string } | undefined>,
+      unitStates().catch(() => (lastSnapshot?.units ?? [])) as Promise<{ id: string; loaded: boolean; active: string }[]>,
+    ]);
     const fw = units.find((u) => u.id === 'fips-firewall');
     return {
       tun: st?.tun_name, meshAddr: st?.ipv6_addr,

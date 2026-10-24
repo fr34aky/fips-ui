@@ -14,7 +14,7 @@ export const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low', 'inf
 
 /** Points one finding takes off the score, and the most a category can take (docs/security-scan.md). */
 export const DEDUCTION: Record<Severity, number> = { critical: 25, high: 10, medium: 5, low: 2, info: 0 };
-export const CATEGORY_CAP: Record<Category, number> = { exposure: 30, firewall: 20, patches: 25, vulns: 25, hardening: 20 };
+export const CATEGORY_CAP: Record<Category, number> = { exposure: 30, firewall: 20, patches: 20, vulns: 20, hardening: 15 };
 /** A critical finding keeps the score below this, whatever else is fine. */
 export const CRITICAL_CEILING = 59;
 
@@ -34,13 +34,14 @@ export type Verdict = 'blocked' | 'restricted' | 'allowed' | 'unknown' | 'none';
 export interface Listener {
   proto: 'tcp' | 'udp'; addr: string; port: number; iface?: string; process?: string; pid?: number;
   scope: Scope;
-  /** Unconnected UDP sockets on ephemeral ports are clients' (DNS, mDNS, QUIC), not services: listed, never scored. */
+  /** UDP sockets in the ephemeral port range are clients' (DNS, mDNS, QUIC, WebRTC), not services: listed, never scored. */
   ephemeral?: boolean;
   /** From the LAN and beyond (any interface but loopback and fips0), and from the mesh (fips0), where it applies. */
   lan?: Verdict; mesh?: Verdict;
 }
 
-const EPHEMERAL_MIN = 32768;
+/** Linux's default ephemeral range (net.ipv4.ip_local_port_range), where unconnected UDP client sockets land. */
+const EPHEMERAL_MIN = 32768, EPHEMERAL_MAX = 60999;
 
 /** Split ss's "addr:port" (IPv4, [IPv6], *, with an optional %iface). */
 function splitAddr(s: string): { addr: string; port: number; iface?: string } | null {
@@ -94,7 +95,7 @@ export function parseSs(out: string, tun?: string, meshAddr?: string): Listener[
     seen.set(key, {
       proto: t[0], addr: local.addr, port: local.port, ...(local.iface ? { iface: local.iface } : {}),
       ...(users ? { process: users[1], pid: Number(users[2]) } : {}), scope,
-      ...(t[0] === 'udp' && local.port >= EPHEMERAL_MIN && !users ? { ephemeral: true } : {}),
+      ...(t[0] === 'udp' && local.port >= EPHEMERAL_MIN && local.port <= EPHEMERAL_MAX ? { ephemeral: true } : {}),
     });
   }
   return [...seen.values()].sort((a, b) => a.port - b.port || a.proto.localeCompare(b.proto));
@@ -199,7 +200,8 @@ function matchCond(m: { op?: string; left?: Record<string, unknown>; right?: unk
   return 'unknown';
 }
 
-export function nftModel(json: string): FirewallModel | null {
+/** `skip`: "family table" names another model reads (ufw's iptables-nft tables, firewalld's own). */
+export function nftModel(json: string, skip: Set<string> = new Set()): FirewallModel | null {
   let doc: Nft;
   try { doc = JSON.parse(json) as Nft; } catch { return null; }
   if (!Array.isArray(doc.nftables)) return null;
@@ -210,7 +212,7 @@ export function nftModel(json: string): FirewallModel | null {
     if (item.chain) { const c = item.chain as NftChain; chains.set(key(c.family, c.table, c.name), c); }
     if (item.rule) { const r = item.rule as NftRule; const k = key(r.family, r.table, r.chain); (rules.get(k) ?? rules.set(k, []).get(k)!).push(r); }
   }
-  const bases = [...chains.values()].filter((c) => c.hook === 'input' && (c.type ?? 'filter') === 'filter' && ['inet', 'ip', 'ip6'].includes(c.family));
+  const bases = [...chains.values()].filter((c) => c.hook === 'input' && (c.type ?? 'filter') === 'filter' && ['inet', 'ip', 'ip6'].includes(c.family) && !skip.has(`${c.family} ${c.table}`));
   if (bases.length === 0) return { backend: 'none', defaultDeny: false, detail: 'no nftables input chain', verdict: () => 'none' };
 
   type Outcome = { v: 'accept' | 'drop' | 'return' | 'end'; restricted: boolean; unknown: boolean };
@@ -282,17 +284,19 @@ export function nftModel(json: string): FirewallModel | null {
 export function ufwModel(out: string): FirewallModel | null {
   if (!/^Status: active/m.test(out)) return null;
   const deny = /^Default:\s*(deny|reject)\s*\(incoming\)/m.test(out);
-  const allows: { port: number; to?: number; proto?: string; anywhere: boolean; v6?: boolean }[] = [];
+  // "[dest] port[:port][/proto] [(v6)] [on iface] ALLOW|LIMIT [IN] [on iface] source [# comment]"
+  const allows: { port: number; to?: number; proto?: string; anywhere: boolean; v6: boolean; dest?: string; iface?: string }[] = [];
   for (const line of out.split('\n')) {
-    const m = /^(\d+)(?::(\d+))?(?:\/(tcp|udp))?(?: \(v6\))?\s+(ALLOW|LIMIT)(?: IN)?\s+(.+)$/.exec(line.trim());
-    if (m) allows.push({ port: Number(m[1]), to: m[2] ? Number(m[2]) : undefined, proto: m[3], anywhere: /^Anywhere/.test(m[5].trim()), v6: line.includes('(v6)') });
+    const m = /^(?:(\S+) )?(\d+)(?::(\d+))?(?:\/(tcp|udp))?( \(v6\))?(?: on (\S+))?\s+(?:ALLOW|LIMIT)(?: IN)?(?: on (\S+))?\s+(.+?)\s*(?:#.*)?$/.exec(line.trim());
+    if (!m) continue;
+    allows.push({ port: Number(m[2]), to: m[3] ? Number(m[3]) : undefined, proto: m[4], v6: !!m[5], iface: m[6] ?? m[7], anywhere: /^Anywhere/.test(m[8]), ...(m[1] && m[1] !== 'Anywhere' ? { dest: m[1] } : {}) });
   }
   return {
     backend: 'ufw', defaultDeny: deny, detail: 'ufw',
+    // ufw's rules apply on every interface unless they name one.
     verdict: (p) => {
-      if (p.iface !== '*') return deny ? 'unknown' : 'allowed';
-      const hit = allows.filter((a) => (!a.proto || a.proto === p.proto) && p.port >= a.port && p.port <= (a.to ?? a.port) && (a.v6 === undefined || a.v6 === (p.family === 'ip6')));
-      if (hit.some((a) => a.anywhere)) return 'allowed';
+      const hit = allows.filter((a) => (!a.proto || a.proto === p.proto) && p.port >= a.port && p.port <= (a.to ?? a.port) && a.v6 === (p.family === 'ip6') && (!a.iface || p.iface === '*' || glob(a.iface.replace(/\+$/, '*'), p.iface)));
+      if (hit.some((a) => a.anywhere && !a.dest && (!a.iface || p.iface !== '*'))) return 'allowed';
       if (hit.length) return 'restricted';
       return deny ? 'blocked' : 'allowed';
     },
@@ -362,13 +366,31 @@ export function iptablesModel(v4out: string, v6out: string): FirewallModel | nul
 /** Which tool decides, in the order a host would be configured: ufw, firewalld, then the ruleset itself. */
 export function firewallModel(s: Record<string, RawSection>): FirewallModel {
   const ok = (n: string) => s[n] && s[n].code === 0 ? s[n].out : null;
-  const ufw = ok('ufw'); if (ufw) { const m = ufwModel(ufw); if (m) return m; }
-  const fwd = ok('firewalld'); if (fwd) { const m = firewalldModel(fwd); if (m) return m; }
-  const nft = ok('nft'); if (nft) { const m = nftModel(nft); if (m) return m; }
+  const nft = ok('nft');
+  // ufw and firewalld write their own nftables tables (ufw through iptables-nft, in a form nft -j cannot express);
+  // they are read from the tools, and every other table on the input hook (fips's own, the mesh guard) from nft.
+  const front = (() => { const u = ok('ufw'); const m = u ? ufwModel(u) : null; if (m) return { m, skip: ['ip filter', 'ip6 filter'] }; const f = ok('firewalld'); const n = f ? firewalldModel(f) : null; return n ? { m: n, skip: ['inet firewalld'] } : null; })();
+  if (front) {
+    const rest = nft ? nftModel(nft, new Set(front.skip)) : null;
+    if (!rest || rest.backend === 'none') return front.m;
+    return { ...front.m, detail: `${front.m.detail}, and nftables ${rest.detail}`, verdict: (p) => both(front.m.verdict(p), rest.verdict(p)) };
+  }
+  const nm = nft ? nftModel(nft) : null;
+  if (nm && nm.backend !== 'none') return nm;
+  // An empty nftables ruleset next to iptables-legacy: the legacy tables filter.
   const ipt = iptablesModel(ok('iptables') ?? '', ok('ip6tables') ?? '');
   if (ipt) return ipt;
+  if (nm) return nm;
   const why = s.nft ? (s.nft.code === 127 ? 'nft is not installed' : s.nft.out.trim().split('\n').pop()) : 'not collected';
   return { backend: 'unknown', defaultDeny: null, detail: `the firewall could not be read (${why})`, verdict: () => 'unknown' };
+}
+
+/** Two layers on the input path: a connection gets in only if both let it. */
+function both(a: Verdict, b: Verdict): Verdict {
+  if (a === 'none') return b;
+  if (b === 'none') return a;
+  for (const v of ['blocked', 'unknown', 'restricted'] as const) if (a === v || b === v) return v;
+  return 'allowed';
 }
 
 /** Fill in each listener's verdict from the LAN side, and from the mesh where the node's TUN reaches it. */
@@ -432,7 +454,6 @@ export function parseDebsecan(out: string): Vulnerability[] {
     const fixed = flags.includes('fixed');
     const remote = flags.includes('remotely exploitable');
     let sev: Severity = URGENCY[flags.find((f) => f.endsWith(' urgency'))?.replace(' urgency', '').replace(/\*+$/, '') ?? ''] ?? 'low';
-    if (remote && sev === 'high') sev = 'critical';
     const k = `${m[2]} ${fixed}`;
     const v = by.get(k) ?? { pkg: m[2], ids: [], severity: sev, fixed, remote };
     v.ids.push(m[1]);
@@ -459,7 +480,22 @@ export function parseArchAudit(out: string): Vulnerability[] {
     const fixed = typeof a.fixed === 'string' && !!a.fixed;
     for (const pkg of pkgs) res.push({ pkg, ids, severity, fixed, ...(typeof a.name === 'string' ? { advisory: a.name } : {}), ...(fixed ? { fixedIn: a.fixed as string } : {}), ...(/remote/i.test(String(a.type ?? '')) ? { remote: true } : {}) });
   }
-  return res;
+  return groupVulns(res);
+}
+
+/** One entry per package and fix state: a package in several advisories merges their ids, at the worst severity. */
+export function groupVulns(list: Vulnerability[]): Vulnerability[] {
+  const by = new Map<string, Vulnerability>();
+  for (const v of list) {
+    const k = `${v.pkg} ${v.fixed}`;
+    const had = by.get(k);
+    if (!had) { by.set(k, { ...v, ids: [...v.ids] }); continue; }
+    for (const id of v.ids) if (!had.ids.includes(id)) had.ids.push(id);
+    if (rank(v.severity) < rank(had.severity)) had.severity = v.severity;
+    if (v.advisory && had.advisory && !had.advisory.split(' ').includes(v.advisory)) had.advisory += ` ${v.advisory}`;
+    had.remote ||= v.remote;
+  }
+  return [...by.values()];
 }
 
 /** `checkupdates`: "pkg old -> new". */
@@ -562,8 +598,9 @@ export function packageState(raw: RawScan, now = Date.now()): PackageState {
       break;
     }
     case 'zypper': {
-      if (!failed('zypper_updates', [0, 100])) st.updates = parseZypperUpdates(out('zypper_updates'));
-      if (!failed('zypper_patches', [0, 100])) { st.vulns = parseZypperPatches(out('zypper_patches')); st.vulnSource = 'zypper patches'; }
+      // zypper's informational exit codes: 100 updates, 101 security updates, 102 reboot, 103 restart zypper.
+      if (!failed('zypper_updates', [0, 100, 101, 102, 103])) st.updates = parseZypperUpdates(out('zypper_updates'));
+      if (!failed('zypper_patches', [0, 100, 101, 102, 103])) { st.vulns = parseZypperPatches(out('zypper_patches')); st.vulnSource = 'zypper patches'; }
       break;
     }
     default: st.supported = false;
@@ -605,13 +642,16 @@ const RISKY_PORTS: Record<number, string> = {
 };
 
 const sev = (s: Severity, up: boolean): Severity => (up && rank(s) > 0 ? SEVERITIES[rank(s) - 1] : s);
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const plural = (n: number, w: string) => `${n} ${n === 1 ? w : w.endsWith('y') ? `${w.slice(0, -1)}ies` : `${w}s`}`;
+/** Services the internet is meant to reach: a deliberate allow for them is not a finding. */
+const PUBLIC_PORTS = new Set(['tcp/80', 'tcp/443', 'udp/443']);
 
 /** Client sockets of common system services (DHCP, mDNS): listed, scored only as information. */
 const CLIENT_PORTS: Record<string, string> = { 'udp/68': 'DHCP client', 'udp/546': 'DHCPv6 client', 'udp/5353': 'mDNS' };
 
 /** One finding per service (proto/port) and side, however many addresses it is bound to. */
-export function listenerFindings(listeners: Listener[]): Finding[] {
+/** `defaultDeny`: the firewall refuses what it does not name, so an open port there was allowed on purpose. */
+export function listenerFindings(listeners: Listener[], defaultDeny: boolean | null = null): Finding[] {
   const out = new Map<string, Finding & { addrs: string[] }>();
   const add = (f: Finding, addr: string) => {
     const had = out.get(f.id);
@@ -631,20 +671,24 @@ export function listenerFindings(listeners: Listener[]): Finding[] {
     if (l.lan === 'allowed' || l.lan === 'none' || l.lan === 'unknown') {
       const wide = l.scope === 'public' || l.scope === 'all';
       let severity: Severity;
+      // A port a default-deny firewall names was opened on purpose: worth knowing, rarely a mistake.
+      const deliberate = l.lan === 'allowed' && defaultDeny === true;
       // Whether the firewall lets it in is not known: only what should never face a network costs points.
       if (l.lan === 'unknown') severity = risky ? 'medium' : 'info';
       else if (client || l.scope === 'link-local') severity = risky ? 'medium' : 'info';
+      else if (deliberate) severity = risky ? 'medium' : PUBLIC_PORTS.has(svc) ? 'info' : 'low';
       else if (l.port === 22) severity = 'low';
       else severity = sev(risky ? 'high' : l.proto === 'tcp' ? 'medium' : 'low', wide);
       add({
         id: `exposed-${svc}`, category: 'exposure', severity,
-        title: `${name} listens on ${where}${l.lan === 'unknown' ? ', and the firewall may let it through' : l.lan === 'none' ? ' with no host firewall' : ', and the firewall lets anyone in'}`,
+        title: `${name} listens on ${where}${l.lan === 'unknown' ? ', and the firewall may let it through' : l.lan === 'none' ? ' with no host firewall' : deliberate ? ', and a firewall rule lets anyone in' : ', and the firewall lets anyone in'}`,
         fix: l.port === 22 ? 'Keep it if you administer the node over the network; limit sources in the firewall and use keys only.' : 'Bind it to 127.0.0.1 or ::1 if only this machine uses it, or allow only the hosts that need it in the host firewall.',
       }, addr);
     }
     if (l.mesh === 'allowed' || l.mesh === 'none') {
       add({
-        id: `mesh-${svc}`, category: 'exposure', severity: risky ? 'high' : client ? 'info' : 'medium',
+        // fips-firewall drops by default: an "allowed" here is a drop-in that lets every mesh address in.
+        id: `mesh-${svc}`, category: 'exposure', severity: l.mesh === 'none' ? (risky ? 'high' : client ? 'info' : 'medium') : risky ? 'medium' : client ? 'info' : 'low',
         title: `${name} is reachable from every node on the mesh`,
         detail: l.mesh === 'none' ? 'nothing filters fips0' : 'a fips firewall rule lets any mesh address in',
         fix: 'Turn on fips-firewall, or allow only the npubs that need it (Firewall page).',
@@ -662,7 +706,9 @@ function updateFindings(p: PackageState, nixos: boolean): Finding[] {
   }
   if (p.updates) {
     const sec = p.updates.filter((u) => u.security);
-    if (sec.length) out.push({ id: 'patches-security', category: 'patches', severity: sec.length >= 10 ? 'critical' : 'high', title: `${plural(sec.length, 'security update')} pending`, detail: sec.slice(0, 12).map((u) => u.name).join(', ') + (sec.length > 12 ? ', …' : ''), fix: 'Install them with the package manager, then reboot or restart the services that use them.' });
+    // With vulnerability data the CVEs these updates fix are scored under Vulnerabilities; this only counts the backlog.
+    const known = p.vulns !== null;
+    if (sec.length) out.push({ id: 'patches-security', category: 'patches', severity: known ? (sec.length >= 10 ? 'medium' : 'low') : 'high', title: `${plural(sec.length, 'security update')} pending`, detail: sec.slice(0, 12).map((u) => u.name).join(', ') + (sec.length > 12 ? ', …' : '') + (known ? ' (the vulnerabilities they fix are scored under Vulnerabilities)' : ''), fix: 'Install them with the package manager, then reboot or restart the services that use them.' });
     const other = p.updates.length - sec.length;
     if (other > 0) out.push({ id: 'patches-other', category: 'patches', severity: other >= 50 ? 'medium' : 'low', title: `${plural(other, 'other update')} pending`, fix: 'Update the system regularly.' });
   }
@@ -671,7 +717,8 @@ function updateFindings(p: PackageState, nixos: boolean): Finding[] {
   if (p.vulns === null && p.manager === 'pacman') out.push({ id: 'vulns-no-tool', category: 'vulns', severity: 'info', title: 'Known vulnerabilities are not checked', fix: 'Install arch-audit (pacman -S arch-audit).' });
   for (const v of p.vulns ?? []) {
     out.push({
-      id: `vuln-${v.pkg}-${v.fixed ? 'fixed' : 'open'}`, category: 'vulns', severity: v.fixed ? v.severity : v.severity === 'info' ? 'info' : 'low',
+      // Without a fix there is nothing to install yet (and debsecan lists dozens on any Debian): listed, not scored.
+      id: `vuln-${v.pkg}-${v.fixed ? 'fixed' : 'open'}`, category: 'vulns', severity: v.fixed ? v.severity : 'info',
       title: `${v.pkg}: ${plural(v.ids.length || 1, 'known vulnerability').replace(/^1 known vulnerability$/, 'a known vulnerability')}${v.fixed ? ', fixed in an update' : ', no fix yet'}`,
       detail: [v.advisory, v.ids.slice(0, 8).join(' '), v.ids.length > 8 ? `+${v.ids.length - 8}` : '', v.fixedIn ? `fixed in ${v.fixedIn}` : '', v.remote ? 'remotely exploitable' : ''].filter(Boolean).join(' · '),
       fix: v.fixed ? `Update ${v.pkg}.` : 'Watch for the distribution\'s fix; limit exposure of the service meanwhile.',
@@ -684,7 +731,8 @@ export function rebootState(s: Record<string, RawSection>): Report['reboot'] {
   const reasons: string[] = [];
   const services: string[] = [];
   const running = s.uname?.out.trim();
-  const kernels = (s.kernels?.out ?? '').split('\n').map((x) => x.trim()).filter(Boolean);
+  // Only a listing that worked: an error message is not a list of kernels (NixOS, containers).
+  const kernels = (s.kernels?.code === 0 ? s.kernels.out : '').split('\n').map((x) => x.trim()).filter(Boolean);
   if (running && kernels.length && !kernels.includes(running)) reasons.push(`the running kernel ${running} is no longer installed`);
   if (/^yes/.test(s.reboot_required?.out ?? '')) reasons.push(`the system asks for a reboot${(s.reboot_required!.out.split('\n').slice(1).filter(Boolean).length) ? ` (${s.reboot_required!.out.split('\n').slice(1).filter(Boolean).join(', ')})` : ''}`);
   if (s.needs_restarting?.code === 1) reasons.push('needs-restarting -r reports core libraries or the kernel updated');
@@ -736,8 +784,11 @@ function hardeningFindings(s: Record<string, RawSection>, notes: string[]): Find
     if (names.length) H('empty-passwords', 'high', `Accounts without a password: ${names.join(', ')}`, 'Set a password or lock them (passwd -l).');
   }
   if (s.auto_updates?.code === 0) {
-    const lines = s.auto_updates.out.split('\n');
-    const on = lines.some((l) => /^\S+\s+enabled\b/.test(l)) || /Unattended-Upgrade\s+"1"/.test(s.auto_updates.out);
+    const out = s.auto_updates.out;
+    // On apt systems apt-daily-upgrade.timer is always there; whether it installs anything is APT::Periodic's setting.
+    const apt = /APT::Periodic::Unattended-Upgrade/.test(out) || /^apt-daily-upgrade\.timer /m.test(out);
+    const on = apt ? /Unattended-Upgrade\s+"1"/.test(out) && /^unattended-upgrades\.service /m.test(out)
+      : out.split('\n').some((l) => /^\S+\s+enabled\b/.test(l));
     if (!on) H('auto-updates', 'low', 'Security updates are not installed automatically', 'Enable unattended-upgrades or dnf-automatic, or plan regular updates.');
   }
   if (s.timesync?.code === 0 && /NTPSynchronized=no/.test(s.timesync.out)) H('timesync', 'low', 'The clock is not synchronised', 'Enable systemd-timesyncd or chrony (timedatectl set-ntp true).');
@@ -782,14 +833,14 @@ export function analyse(raw: RawScan, ctx: Context = {}, now = Date.now()): Repo
   const packages = packageState(raw, now);
   notes.push(...packages.errors);
   const reboot = rebootState(s);
-  const findings: Finding[] = [...listenerFindings(listeners)];
+  const findings: Finding[] = [...listenerFindings(listeners, fw.defaultDeny)];
   if (fw.backend === 'unknown') findings.push({ id: 'firewall-unreadable', category: 'firewall', severity: 'info', title: 'The host firewall could not be read', detail: fw.detail });
   else if (!fw.defaultDeny) findings.push({ id: 'firewall-open', category: 'firewall', severity: 'high', title: fw.backend === 'none' ? 'No host firewall filters inbound connections' : `The host firewall (${fw.backend}) accepts inbound connections by default`, detail: fw.detail, fix: 'Drop new inbound connections by default and allow only what the node serves (nftables, ufw or firewalld).' });
   if (ctx.fipsFirewallActive === false) findings.push({ id: 'fips-firewall-off', category: 'firewall', severity: 'medium', title: 'fips-firewall is not running', detail: 'Services listening on [::] are reachable from the whole mesh.', fix: 'Start and enable it on the Firewall page.' });
   if (ctx.uiExposed && !ctx.uiExposed.token) findings.push({ id: 'ui-open', category: 'exposure', severity: 'high', title: `fips-ui listens on ${ctx.uiExposed.host} without FIPS_UI_TOKEN`, detail: 'Every client of that address is a superadmin.', fix: 'Bind fips-ui to 127.0.0.1, or set FIPS_UI_TOKEN in /etc/default/fips-ui.' });
   findings.push(...updateFindings(packages, raw.nixos));
   if (reboot.required) findings.push({ id: 'reboot', category: 'patches', severity: 'medium', title: 'A reboot is needed to finish updates', detail: reboot.reasons.join('; '), fix: 'Reboot when convenient; the fixes are not active until then.' });
-  if (reboot.services.length) findings.push({ id: 'restart-services', category: 'patches', severity: 'low', title: `${plural(reboot.services.length, 'service')} still run old libraries`, detail: reboot.services.slice(0, 12).join(', '), fix: 'Restart them (needrestart -r a).' });
+  if (reboot.services.length) findings.push({ id: 'restart-services', category: 'patches', severity: 'low', title: `${plural(reboot.services.length, 'service')} still ${reboot.services.length === 1 ? 'runs' : 'run'} old libraries`, detail: reboot.services.slice(0, 12).join(', '), fix: 'Restart them (needrestart -r a).' });
   findings.push(...hardeningFindings(s, notes));
   findings.sort((a, b) => rank(a.severity) - rank(b.severity) || CATEGORIES.indexOf(a.category) - CATEGORIES.indexOf(b.category));
   const osName = /^PRETTY_NAME="?([^"\n]*)"?/m.exec(s.os_release?.out ?? '')?.[1];

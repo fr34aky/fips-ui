@@ -6,7 +6,7 @@ import { mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  analyse, firewalldModel, judgeListeners, nextRun, nftModel, parseAptUpgrade, parseArchAudit, parseCheckupdates, parseDebsecan, parseDnfUpdateinfo,
+  analyse, firewallModel, firewalldModel, judgeListeners, nextRun, nftModel, parseAptUpgrade, parseArchAudit, parseCheckupdates, parseDebsecan, parseDnfUpdateinfo,
   parseDnfUpdates, parseSs, parseZypperPatches, parseZypperUpdates, rebootState, score, SecurityScanner, ufwModel, validateSettings,
   type Finding, type RawScan, type RawSection,
 } from '../server/security.ts';
@@ -24,6 +24,7 @@ tcp LISTEN 0 4096 192.168.1.61:8080 0.0.0.0:*
 tcp LISTEN 0 4096 [::1]:5432 [::]:*
 udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*
 udp UNCONN 0 0 0.0.0.0:42778 0.0.0.0:*
+udp UNCONN 0 0 0.0.0.0:41234 0.0.0.0:* users:(("avahi-daemon",pid=600,fd=14))
 udp UNCONN 0 0 [fe80::70df:f28b:3549:6a1f]%wlp0s20f3:546 [::]:*
 udp UNCONN 0 0 0.0.0.0%virbr0:67 0.0.0.0:*
 tcp ESTAB 0 0 192.168.1.61:22 192.168.1.2:50000
@@ -42,6 +43,8 @@ test('parseSs: scopes, processes, duplicates, ephemeral UDP', () => {
   assert.equal(by(5432).scope, 'loopback');
   assert.equal(by(53).scope, 'loopback');
   assert.equal(by(42778).ephemeral, true);
+  // As root ss names every process: a client socket in the ephemeral range is still one.
+  assert.equal(by(41234).ephemeral, true);
   assert.equal(by(546).scope, 'link-local');
   assert.equal(by(546).iface, 'wlp0s20f3');
   assert.equal(by(67).scope, 'lan');
@@ -102,6 +105,38 @@ test('nftModel: no input chain, open policy, unknown expressions', () => {
   ] }))!;
   assert.equal(xt.verdict({ proto: 'tcp', port: 22, family: 'ip', iface: '*' }), 'unknown');
   assert.equal(nftModel('not json'), null);
+});
+
+test('firewallModel: ufw layered over the other nftables tables, iptables-legacy under an empty ruleset', () => {
+  const ufw = ok(`Status: active
+Default: deny (incoming), allow (outgoing), deny (routed)
+
+To                         Action      From
+--                         ------      ----
+22/tcp (v6)                ALLOW IN    Anywhere (v6)
+172.17.0.1 53/udp          ALLOW IN    172.16.0.0/12              # allow-docker-dns
+`);
+  // ufw's own tables (ip/ip6 filter) are skipped; here the only other table is fips's.
+  const fipsOnly = JSON.stringify({ nftables: (JSON.parse(NFT).nftables as Record<string, { table?: string }>[]).filter((x) => Object.values(x)[0]?.table === 'fips' || (x.table as { name?: string } | undefined)?.name === 'fips') });
+  const fw = firewallModel({ ufw, nft: ok(fipsOnly) });
+  assert.equal(fw.backend, 'ufw');
+  // ufw lets ssh in on IPv6; fips's own table drops it on fips0, so the mesh is blocked; the LAN is open.
+  assert.equal(fw.verdict({ proto: 'tcp', port: 22, family: 'ip6', iface: '*', tun: TUN }), 'allowed');
+  assert.equal(fw.verdict({ proto: 'tcp', port: 22, family: 'ip6', iface: TUN, tun: TUN }), 'blocked');
+  assert.equal(fw.verdict({ proto: 'udp', port: 53, family: 'ip', iface: '*', tun: TUN }), 'restricted');
+  const legacy = firewallModel({ nft: ok(JSON.stringify({ nftables: [{ metainfo: {} }] })), iptables: ok('*filter\n:INPUT DROP [0:0]\n-A INPUT -p tcp --dport 22 -j ACCEPT\nCOMMIT\n') });
+  assert.equal(legacy.backend, 'iptables');
+  assert.equal(legacy.verdict({ proto: 'tcp', port: 22, family: 'ip', iface: '*' }), 'allowed');
+  assert.equal(legacy.verdict({ proto: 'tcp', port: 80, family: 'ip', iface: '*' }), 'blocked');
+});
+
+test('auto-updates: apt decides by its Unattended-Upgrade setting', () => {
+  const f = (out: string) => analyse(scan({ auto_updates: ok(out) })).findings.some((x) => x.id === 'auto-updates');
+  assert.equal(f('apt-daily-upgrade.timer enabled active\nAPT::Periodic::Unattended-Upgrade "0";\n'), true);
+  assert.equal(f('apt-daily-upgrade.timer enabled active\n'), true);
+  assert.equal(f('unattended-upgrades.service enabled active\napt-daily-upgrade.timer enabled active\nAPT::Periodic::Unattended-Upgrade "1";\n'), false);
+  assert.equal(f('dnf-automatic-install.timer enabled active\n'), false);
+  assert.equal(f(''), true);
 });
 
 test('ufw and firewalld', () => {
@@ -167,7 +202,7 @@ Conf libssl3 (3.0.11-1~deb12u2 Debian-Security:12/stable-security [amd64])
 CVE-2024-0002 openssl (fixed, low urgency)
 CVE-2024-0003 bash (medium urgency)
 `);
-  assert.deepEqual(deb.map((v) => [v.pkg, v.fixed, v.severity, v.ids.length]), [['openssl', true, 'critical', 2], ['bash', false, 'medium', 1]]);
+  assert.deepEqual(deb.map((v) => [v.pkg, v.fixed, v.severity, v.ids.length]), [['openssl', true, 'high', 2], ['bash', false, 'medium', 1]]);
   assert.deepEqual(parseDnfUpdates(`Last metadata expiration check: 0:10:00 ago.
 
 openssl.x86_64            1:3.1.4-2.fc39       updates
@@ -186,6 +221,9 @@ FEDORA-2024-abc security Critical openssl-1:3.1.4-2.fc40.x86_64 2024-04-01 00:00
   const aa = parseArchAudit(JSON.stringify([{ name: 'AVG-1', packages: ['openssl', 'lib32-openssl'], status: 'Fixed', severity: 'High', type: 'arbitrary code execution', fixed: '3.2.1-1', issues: ['CVE-2024-1'] }, { name: 'AVG-2', packages: ['vim'], status: 'Vulnerable', severity: 'Low', type: 'unknown', fixed: null, issues: ['CVE-2024-2'] }]));
   assert.deepEqual(aa.map((v) => [v.pkg, v.severity, v.fixed]), [['openssl', 'high', true], ['lib32-openssl', 'high', true], ['vim', 'low', false]]);
   assert.deepEqual(parseArchAudit('garbage'), []);
+  // One package in two advisories: one entry with both.
+  const two = parseArchAudit(JSON.stringify([{ name: 'AVG-1', packages: ['chromium'], severity: 'High', fixed: '1', issues: ['CVE-1'] }, { name: 'AVG-2', packages: ['chromium'], severity: 'Critical', fixed: '2', issues: ['CVE-2'] }]));
+  assert.deepEqual(two.map((v) => [v.pkg, v.severity, v.ids, v.advisory]), [['chromium', 'critical', ['CVE-1', 'CVE-2'], 'AVG-1 AVG-2']]);
   assert.deepEqual(parseZypperUpdates('<stream><update-status><update-list><update kind="package" name="curl" edition="8.6-1" edition-old="8.5-1" arch="x86_64"/></update-list></update-status></stream>').map((u) => [u.name, u.to, u.from]), [['curl', '8.6-1', '8.5-1']]);
   const zp = parseZypperPatches('<update kind="patch" name="openSUSE-2024-1" category="security" severity="important" status="needed"><summary>Security update for curl</summary><issue-list><issue type="cve" id="CVE-2024-9"/></issue-list></update>');
   assert.deepEqual(zp.map((v) => [v.pkg, v.severity, v.ids]), [['Security update for curl', 'high', ['CVE-2024-9']]]);
@@ -197,6 +235,8 @@ test('rebootState: removed kernel, reboot-required, needrestart', () => {
   assert.equal(r.reasons.length, 3);
   assert.deepEqual(r.services, ['nginx.service']);
   assert.equal(rebootState({ uname: ok('6.8.2\n'), kernels: ok('6.8.1\n6.8.2\n'), reboot_required: ok('no\n') }).required, false);
+  // A failed listing (no /lib/modules: NixOS, containers) says nothing about the kernel.
+  assert.equal(rebootState({ uname: ok('6.8.2\n'), kernels: { code: 2, out: "ls: cannot access '/lib/modules': No such file or directory\n" } }).required, false);
 });
 
 test('score: deductions, category caps, critical ceiling, grades', () => {
