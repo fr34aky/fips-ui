@@ -11,7 +11,8 @@ import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, SECURITY_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
+import { SecurityScanner, SettingsError } from './security.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
 import { HostsFollowers, isSyncRequest, parseSubtree, syncRole } from './hosts-followers.ts';
@@ -341,7 +342,7 @@ const restartBlocker = (): string | null => {
 /** Exit with 75 so the service manager starts fips-ui again, once nothing privileged is running. */
 function restartWhenIdle(message: string): void {
   if (restartBlocker()) { setTimeout(() => restartWhenIdle(message), 2000); return; }
-  console.log(message); server.close(); mesh.close(); hostsSync.close(); fleet.close(); process.exit(75);
+  console.log(message); server.close(); mesh.close(); hostsSync.close(); fleet.close(); security.stop(); process.exit(75);
 }
 
 const hostsFollowers = new HostsFollowers();
@@ -364,6 +365,26 @@ const fleet = new Fleet({
 });
 // Read-only: the page is off (health.fleet), so the nodes are not probed either.
 if (!SELFTEST && !READ_ONLY) void fleet.start();
+
+// The weekly security scan (server/security.ts) through the helper's read-only security-scan. It changes nothing
+// on the node, so it runs in read-only mode too; starting one by hand and the schedule are changes.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+const security = new SecurityScanner({
+  run: () => admin.securityScan(),
+  available: () => admin.securityCapable(),
+  context: async () => {
+    // No browser connected means no polling: ask the daemon itself.
+    const st = (lastSnapshot?.status ?? await query('show_status', undefined, { timeoutMs: 3000 }).catch(() => undefined)) as { tun_name?: string; ipv6_addr?: string } | undefined;
+    const units = (lastSnapshot?.units ?? await unitStates().catch(() => [])) as { id: string; loaded: boolean; active: string }[];
+    const fw = units.find((u) => u.id === 'fips-firewall');
+    return {
+      tun: st?.tun_name, meshAddr: st?.ipv6_addr,
+      ...(LOOPBACK_HOSTS.has(HOST) ? {} : { uiExposed: { host: HOST, token: !!TOKEN } }),
+      ...(fw?.loaded ? { fipsFirewallActive: fw.active === 'active' } : {}),
+    };
+  },
+});
+if (!SELFTEST) void security.start();
 
 /** Service control is available through the helper (v4+), or directly with the legacy opt-in. */
 async function serviceControlMode(): Promise<'helper' | 'direct' | null> {
@@ -401,7 +422,7 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, security: isAdmin(pr.role) && await admin.securityCapable(), fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -466,6 +487,29 @@ async function route(req: Req, res: Res) {
     // A proposal made for a file that has changed since cannot be applied as it is.
     const cur = await admin.configShow().catch(() => null);
     return json(res, 200, { proposal: { ...prop, stale: !!cur && cur.base !== prop.base } });
+  }
+  // The security scan: admin-only even to read, since it maps what the node exposes.
+  if (p === '/api/admin/security' || p.startsWith('/api/admin/security/')) {
+    if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' });
+    const sub = p.slice('/api/admin/security'.length);
+    if (method === 'GET') {
+      if (sub === '') return json(res, 200, { ...security.status(), available: await admin.securityCapable(), helper: await admin.helperInfo().then((h) => ({ version: h.version, available: h.available, error: h.error })) });
+      if (sub === '/history') return json(res, 200, { history: security.history() });
+      if (sub === '/summary') return json(res, 200, { summary: security.summary(), available: await admin.securityCapable() });
+      throw new HttpError(404, 'unknown security endpoint');
+    }
+    if (method !== 'POST') throw new HttpError(405, 'GET or POST');
+    if (!canChange(req)) throw new HttpError(403, READ_ONLY ? 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)' : 'admin role required');
+    if (sub === '/scan') {
+      if (!(await admin.securityCapable())) throw new HttpError(409, (await admin.helperInfo()).error ?? `the security scan needs helper v${SECURITY_HELPER_VERSION} on Linux; run sudo ./deploy/setup-local.sh`);
+      void security.scan();
+      return json(res, 202, security.status());
+    }
+    if (sub === '/settings') {
+      try { return json(res, 200, await security.saveSettings(await readJsonBody(req))); }
+      catch (e) { if (e instanceof SettingsError) throw new HttpError(400, e.message); throw e; }
+    }
+    throw new HttpError(404, 'unknown security endpoint');
   }
   // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.
   if (p.startsWith('/api/admin/')) { if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' }); if (await admin(req, res)) return; }
@@ -894,4 +938,4 @@ server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
   void serviceControlMode().then((m) => console.log(`  service control: ${m ? `enabled (${m})` : 'disabled'}${READ_ONLY ? ' (read-only mode)' : ''}`));
   console.log(`  allowed hosts  : ${HOST_CHECK ? [...ALLOWED_HOSTS].join(', ') : 'any (wildcard bind without FIPS_UI_ALLOWED_HOSTS: DNS-rebinding protection is off)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); hostsSync.close(); fleet.close(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { server.close(); mesh.close(); hostsSync.close(); fleet.close(); security.stop(); process.exit(0); });

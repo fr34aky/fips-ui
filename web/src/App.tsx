@@ -20,6 +20,7 @@ const Config = lazy(() => import('./views/Config'));
 import { Firewall } from './views/Firewall';
 import { PublicDomains } from './views/PublicDomains';
 import { Fleet } from './views/Fleet';
+import { Security } from './views/Security';
 import { shortKey } from './lib/format';
 import { useHostName } from './lib/names';
 
@@ -81,7 +82,8 @@ function App({ route }: { route: AppRoute }) {
   // admin whose helper can install them.
   const pd = health?.pubdom;
   // The Node manager is this node's page: never offered while a managed node's pages are shown.
-  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const])];
+  // The security page exists where the helper can scan (helper v13 on Linux); health says.
+  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const]), ...(health?.security ? [] : ['security' as const])];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
@@ -114,6 +116,7 @@ function App({ route }: { route: AppRoute }) {
       case 'pubdom': body = <PublicDomains health={health} />; break;
       case 'upgrade': body = <Upgrade />; break;
       case 'fleet': body = <Fleet snap={snap} />; break;
+      case 'security': body = <Security readOnly={!!health?.readOnly} />; break;
       case 'config': body = <Suspense fallback={<Empty><div className="pulse">Loading…</div></Empty>}><Config readOnly={!!health?.readOnly} /></Suspense>; break;
       case 'firewall': { const port = route.params.get('port'); body = <Firewall snap={snap} readOnly={!!health?.readOnly} prefill={port ? { port, proto: route.params.get('proto') === 'udp' ? 'udp' : 'tcp', comment: route.params.get('note') ?? undefined } : null} />; break; }
       default: body = <Overview snap={snap} health={health} onNav={nav} />;

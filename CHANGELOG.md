@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Security** page (admins): a weekly scan of the machine, through a new
+  read-only helper command (`security-scan`, helper v13, Linux). It lists every
+  listening service with what the host firewall (nftables, ufw, firewalld or
+  iptables) does with a new connection from the LAN and from the mesh, pending
+  and security updates and known vulnerabilities from the distribution's own
+  tools (apt and debsecan, dnf updateinfo, pacman with arch-audit, zypper),
+  reboots and restarts updates wait for, and SSH, kernel, account and fips file
+  settings. Findings are scored 0-100 with a grade and a fix for each; the
+  newest 12 reports are kept for a trend. Scans run on a chosen weekday and
+  hour (a missed one runs when fips-ui is back) or with **Scan now**
+  ([docs/security-scan.md](docs/security-scan.md)).
+- Node manager: a **Security** column with each managed node's grade and score.
+
 ## [0.13.0] - 2026-10-13
 
 ### Added

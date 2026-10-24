@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { isMeshPrefix } from './net6.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
 import { unitStates } from './system.ts';
+import type { RawScan } from './security.ts';
 
 export const MIN_HELPER_VERSION = 4;
 /** The helper version that can load the mesh-access spoofing guard. */
@@ -21,6 +22,10 @@ export const GUARD_HELPER_VERSION = 5;
 export const HOSTS_HELPER_VERSION = 6;
 /** Helper version that writes fips-pub-domains' zone and configuration files (docs/public-domains.md). */
 export const PUBDOM_HELPER_VERSION = 11;
+/** Helper version with the read-only security scan (docs/security-scan.md). */
+export const SECURITY_HELPER_VERSION = 13;
+// The scan's slowest parts are the package managers' metadata refreshes (5 minutes each at most).
+const SECURITY_SCAN_TIMEOUT = 20 * 60_000;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
 // The helper ignores SIGTERM during install and rollback, so hitting this only abandons the wait.
 const HELPER_RESTART_TIMEOUT = 330_000;
@@ -191,8 +196,8 @@ export interface AdminOptions {
 }
 
 /** What the installed helper can do on this system (reported by helper v8+, derived for older ones). */
-export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
-const NO_FEATURES: HelperFeatures = { config: false, hosts: false, services: false, firewall: 'none', guard: 'none' };
+export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none'; /** v13: the security scan (Linux) */ security: boolean }
+const NO_FEATURES: HelperFeatures = { config: false, hosts: false, services: false, firewall: 'none', guard: 'none', security: false };
 export type HelperInfo = {
   installed: boolean; available: boolean; version: number | null; error?: string;
   /** Configuration editor and node management: helper v4+ with a service manager it handles. */
@@ -231,7 +236,7 @@ export function createAdminHandler(opts: AdminOptions) {
           // Helpers before v8 do not report features: they did everything with systemd, nothing without it.
           const f: HelperFeatures = j.features
             ? { ...NO_FEATURES, ...j.features }
-            : { config: systemd, hosts: systemd && j.version >= 6, services: systemd, firewall: systemd ? 'nft' : 'none', guard: systemd && j.version >= 5 ? 'nft' : 'none' };
+            : { config: systemd, hosts: systemd && j.version >= 6, services: systemd, firewall: systemd ? 'nft' : 'none', guard: systemd && j.version >= 5 ? 'nft' : 'none', security: false };
           const tooOld = j.version < MIN_HELPER_VERSION;
           value = {
             installed: true, available: j.ok, version: j.version, features: f,
@@ -529,8 +534,27 @@ export function createAdminHandler(opts: AdminOptions) {
     return exclusive(() => helperJson(['config-restore', id], undefined, HELPER_RESTART_TIMEOUT));
   }
 
+  /** Whether this helper can run the security scan here. */
+  async function securityCapable(): Promise<boolean> {
+    const h = await helperInfo();
+    return h.available && (h.version ?? 0) >= SECURITY_HELPER_VERSION && h.features.security;
+  }
+
+  /** The helper's raw scan (parsed and scored by server/security.ts). Read-only, so not exclusive with changes. */
+  async function securityScan(): Promise<RawScan> {
+    const h = await helperInfo();
+    if (!h.available) throw new Error(h.error ?? 'the privileged helper is not available');
+    if ((h.version ?? 0) < SECURITY_HELPER_VERSION) throw new Error(`the security scan needs helper v${SECURITY_HELPER_VERSION} (installed: v${h.version}); run sudo ./deploy/setup-local.sh`);
+    if (!h.features.security) throw new Error('the security scan is not supported on this system (Linux with python3 and ss)');
+    const r = await runHelper(helperPath, ['security-scan'], undefined, SECURITY_SCAN_TIMEOUT);
+    if (r.code !== 0) throw new Error(helperError(r));
+    return lastJson<RawScan>(r.stdout);
+  }
+
   return Object.assign(handler, {
     helperInfo,
+    securityCapable,
+    securityScan,
     hostsApply,
     configShow,
     configApply,

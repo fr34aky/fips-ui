@@ -17,6 +17,7 @@ export interface FleetNodeStatus {
   upgrade?: { installed?: string; running?: string; latest?: string; available: boolean; restartPending?: boolean; job?: { state: string; kind?: string } | null };
   uiUpdate?: { current?: string; latest?: string; available: boolean; job?: { state: string; restarting?: boolean } | null };
   managersInSync?: boolean; managersMissing?: string[];
+  security?: { available: boolean; score?: number; grade?: string; scannedAt?: number; critical?: number; high?: number };
 }
 export interface FleetStatus { running: boolean; lastRun?: number; nextRun?: number; error?: string }
 export interface FleetData { config: FleetConfig; own?: string; managers: string[]; file: string; status: FleetStatus; nodes: FleetNodeStatus[] }

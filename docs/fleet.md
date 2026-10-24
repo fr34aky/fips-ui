@@ -38,6 +38,7 @@ The table shows for each node:
 | Status | *reachable*; *offline* (no answer); *not allowed* (the node refuses the manager's npub, or its main listener answered because mesh access is off there or the port differs); *viewer only* (listed, but not as an admin); *not ready* (its mesh listener is up but its guard or identity is not); *restarting* (its fips-ui was told to update or to install fips); *error* (an unexpected answer). The last known versions stay while a node is away, with when it was last seen. |
 | Daemon, fips-ui | The running versions, and a chip when the node's own release check found a newer one, or a daemon restart is pending there. |
 | Helper | The node's privileged helper version; a warning when its fips-ui checkout ships a newer one (run `sudo ./deploy/setup-local.sh` there). |
+| Security | Grade and score of the node's latest weekly security scan, with its critical and high findings; it opens the node's Security page ([security-scan.md](security-scan.md)). `n/a` where the node cannot scan (helper v13 on Linux), `–` for a fips-ui without the scan. |
 | Managers | Whether every manager (see below) is an admin on that node. |
 
 The manager's requests carry `user-agent: fips-ui-fleet`, so a managed node does not mistake them for a

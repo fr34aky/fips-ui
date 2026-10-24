@@ -34,6 +34,8 @@ let
     diffutils
     procps
     nftables
+    # The security scan: sshd -T for the effective SSH configuration.
+    openssh
     iproute2
     systemd
     shadow
