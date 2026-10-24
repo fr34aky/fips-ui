@@ -114,30 +114,34 @@ fips_group=true; group_exists fips || fips_group=false
 # ---- frontend: built for this checkout ----
 # A checkout moved with git pull keeps serving the frontend built before it, so pages added since stay missing.
 # web/dist/.build-source names the web/ tree it was built from (npm run build writes it). When that is not the
-# checkout's, the frontend is built again as the UI user into web/dist.new and swapped in only once that worked;
-# a failure keeps the previous frontend served and the setup going, with a warning.
+# checkout's, the frontend is built again into web/dist.new and swapped in only once that worked; a failure keeps
+# the previous frontend served and the setup going, with a warning. Everything in web/ runs as the UI user, who
+# can write there: root never moves or deletes anything in it (a symlink planted there must not redirect root).
 as_user() { sudo -u "$user" -H env "PATH=$svc_path" "$@"; }
 build_frontend() {
   local web=$here/web
   as_user test -w "$web" || { echo "warning: $user cannot write $web" >&2; return 1; }
-  # The build tools are devDependencies: installed when missing (NODE_ENV=production leaves them out) or outdated.
+  # The build tools are devDependencies: installed when missing (NODE_ENV=production leaves them out) or outdated,
+  # with the flags server/self-update.ts uses.
   if [[ ! -x "$web/node_modules/.bin/tsc" || ! -x "$web/node_modules/.bin/vite" || "$web/package-lock.json" -nt "$web/node_modules/.package-lock.json" ]]; then
     as_user npm ci --prefix "$web" --include=dev --no-audit --no-fund || return 1
   fi
-  rm -rf "$web/dist.new" "$web/dist.old"
-  if ! as_user npm --prefix "$web" run build -- --outDir dist.new --emptyOutDir || [[ ! -f "$web/dist.new/index.html" ]]; then
-    rm -rf "$web/dist.new"; return 1
+  as_user rm -rf "$web/dist.new" "$web/dist.old" || return 1
+  if ! as_user npm --prefix "$web" run build -- --outDir dist.new --emptyOutDir || ! as_user test -f "$web/dist.new/index.html"; then
+    as_user rm -rf "$web/dist.new"; return 1
   fi
-  mv "$web/dist" "$web/dist.old" || { rm -rf "$web/dist.new"; return 1; }
-  if ! mv "$web/dist.new" "$web/dist"; then mv "$web/dist.old" "$web/dist"; rm -rf "$web/dist.new"; return 1; fi
-  rm -rf "$web/dist.old"
+  as_user mv "$web/dist" "$web/dist.old" || { as_user rm -rf "$web/dist.new"; return 1; }
+  if ! as_user mv "$web/dist.new" "$web/dist"; then as_user mv "$web/dist.old" "$web/dist"; as_user rm -rf "$web/dist.new"; return 1; fi
+  as_user rm -rf "$web/dist.old" || echo "warning: could not remove $web/dist.old" >&2
   as_user "$node" "$here/scripts/stamp-build.mjs" || true
 }
-want=$(as_user git -C "$here" rev-parse HEAD:web 2>/dev/null || true)
-dirty=$(as_user git -C "$here" status --porcelain -- web 2>/dev/null || true)
-have=$(cat "$here/web/dist/.build-source" 2>/dev/null || true)
+git_out=$(as_user git -C "$here" rev-parse HEAD:web 2>&1) && want=$git_out || want=""
+# Tracked changes only: an editor's swap file or a stray note does not make the build stale.
+dirty=$(as_user git -C "$here" status --porcelain --untracked-files=no -- web 2>/dev/null || true)
+have=$(as_user cat "$here/web/dist/.build-source" 2>/dev/null || true)
 if [[ -z "$want" ]]; then
-  echo "note: git did not say which web/ this checkout has, so web/dist is not checked; if pages are missing, run 'npm run build' in $here"
+  echo "note: web/dist is not checked against the checkout: git, run as $user, says: $(printf '%s' "$git_out" | tail -n 1)"
+  echo "      if pages are missing, run 'npm run build' in $here"
 elif [[ -n "$dirty" || "$want" != "$have" ]]; then
   echo "== frontend: web/dist was not built from this checkout; building it"
   build_frontend || echo "warning: building the frontend failed; the previous one stays served. In $here run: npm ci --prefix web --include=dev && npm run build" >&2

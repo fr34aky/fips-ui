@@ -3,6 +3,7 @@ import { KeyRound, Play, RefreshCw, ShieldAlert, ShieldCheck } from 'lucide-reac
 import { Card, Chip, Copyable, Empty, ErrorNote, KV, Segmented, Skeleton, useNow, useToast } from '../components/ui';
 import { StatTile } from '../components/StatTile';
 import { usePoll } from '../lib/api';
+import { helperInstallCommand } from '../lib/admin';
 import { hashFor } from '../lib/route';
 import { fmtAgo, fmtDuration, fmtTime } from '../lib/format';
 import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, securityApi, severityTone, type HelperState, type Listener, type Report, type ScanSettings, type Severity, type Verdict } from '../lib/security';
@@ -75,8 +76,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
 /** Why the scan cannot run here, and the one thing that fixes it. */
 function HelperNotice({ helper, serviceManager }: { helper: HelperState; serviceManager?: string }) {
   const current = helper.available && (helper.version ?? 0) >= SECURITY_HELPER_VERSION;
-  // setup-local.sh sets up a service only under systemd; elsewhere the helper is installed on its own.
-  const command = !serviceManager || serviceManager === 'systemd' ? 'sudo ./deploy/setup-local.sh' : 'sudo ./deploy/install-upgrade-helper.sh';
+  const command = helperInstallCommand(serviceManager);
   return (
     <Card>
       <div className="flex items-start gap-3 text-sm">
@@ -119,7 +119,7 @@ function ScheduleCard({ settings, running, startedAt, nextRun, available, readOn
     finally { setBusy(false); }
   };
   return (
-    <Card title="Schedule" actions={!readOnly && <button className="btn primary sm" disabled={running || !available} onClick={onScan} title={available ? 'Run the checks now' : 'Needs helper v13'}>{running ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}{running ? 'Scanning…' : 'Scan now'}</button>}>
+    <Card title="Schedule" actions={!readOnly && <button className="btn primary sm" disabled={running || !available} onClick={onScan} title={available ? 'Run the checks now' : 'The scan cannot run here yet: see the note above'}>{running ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}{running ? 'Scanning…' : 'Scan now'}</button>}>
       <div className="grid gap-3 text-sm">
         {running && <div className="text-ink-2 pulse">Scanning since {startedAt ? fmtDuration(Math.round((now - startedAt) / 1000)) : 'now'}…</div>}
         <Segmented value={draft.enabled ? 'on' : 'off'} onChange={(v) => setDraft({ ...draft, enabled: v === 'on' })} options={[{ value: 'on', label: 'Weekly' }, { value: 'off', label: 'Off' }]} />
