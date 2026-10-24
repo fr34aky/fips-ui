@@ -82,7 +82,7 @@ function App({ route }: { route: AppRoute }) {
   // admin whose helper can install them.
   const pd = health?.pubdom;
   // The Node manager is this node's page: never offered while a managed node's pages are shown.
-  // The security page exists where the helper can scan (helper v13 on Linux); health says.
+  // The Security page exists on Linux nodes for admins; without helper v13 it says how to install it.
   const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const]), ...(health?.security ? [] : ['security' as const])];
 
   let body: React.ReactNode;

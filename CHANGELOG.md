@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The **Security** menu item shows on every Linux node for admins. Where the
+  helper is older than v13 the page says how to install it; the item was
+  hidden there, so nothing told you the page existed.
+- `deploy/setup-local.sh` builds the frontend when the checkout changed since
+  it was last built. After `git pull` and `setup-local.sh` (to install a new
+  helper) a node kept serving the previous frontend, e.g. without the Security
+  page. `npm run build` now records the `web/` tree it was built from in
+  `web/dist/.build-source`.
+
 ## [0.14.0] - 2026-10-24
 
 ### Added

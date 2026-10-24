@@ -8,7 +8,8 @@ of every managed node ([fleet.md](fleet.md)).
 
 ![The Security page](screenshots/security.png)
 
-The page is for admins: a list of what a node exposes is useful to an attacker too. The scan never changes the
+The page is for admins on Linux nodes: a list of what a node exposes is useful to an attacker too. Where the
+helper is missing or older than v13, the page says how to install it (`sudo ./deploy/setup-local.sh`). The scan never changes the
 system and nothing leaves the node; vulnerability data comes from the distribution's own tools.
 
 ## What is collected

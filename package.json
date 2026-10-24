@@ -11,7 +11,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:server": "node --watch server/index.ts",
     "dev:web": "npm --prefix web run dev",
-    "build": "npm --prefix web run build",
+    "build": "npm --prefix web run build && node scripts/stamp-build.mjs",
     "start": "node server/index.ts",
     "install:all": "npm --prefix web install",
     "test": "node --test \"test/**/*.test.ts\""

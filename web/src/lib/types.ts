@@ -75,7 +75,7 @@ export const isSuperadmin = (role?: Role | null): boolean => role === 'superadmi
 /** Whether a caller with role `by` may grant, change or remove an entry with role `role` (superadmin entries are a superadmin's to change). */
 export const mayChangeRole = (by: Role | undefined, role: Role | undefined): boolean => isSuperadmin(by) || !isSuperadmin(role);
 export type Principal = { kind: 'local'; role: Role } | { kind: 'mesh'; role: Role; npub: string; label?: string; address: string };
-export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; /** the weekly security scan can run here (helper v13, Linux) and the caller is an admin */ security?: boolean; /** the caller is a superadmin: the Node manager page applies */ fleet?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string; pubdom?: PubdomState }
+export interface Health { ok: boolean; auth: 'token' | 'none' | 'npub'; principal?: Principal; readOnly: boolean; serviceControl: boolean; nodeManagement?: boolean; /** the Security page applies: a Linux node and an admin caller (the page says when the helper cannot scan yet) */ security?: boolean; /** the caller is a superadmin: the Node manager page applies */ fleet?: boolean; socket: string; gatewaySocket: string | null; pollMs: number; uiVersion?: string; uiUptimeSecs: number; error?: string; version?: string; pubdom?: PubdomState }
 
 // Public domain names over fips (fr34aky/fips-pub-domains): what the node runs, and what the two
 // control sockets answer (that repository's docs/webui.md).

@@ -79,7 +79,7 @@ function HelperNotice({ helper }: { helper: { version: number | null; available:
         <KeyRound size={18} className="text-warn mt-0.5 shrink-0" />
         <div className="grid gap-2">
           <div className="font-medium">The security scan needs the privileged helper, version {SECURITY_HELPER_VERSION} or newer, on Linux</div>
-          <div className="text-ink-2">{helper.available && helper.version ? `The installed helper is v${helper.version}.` : helper.error ?? 'The helper is not available.'} Listing every listener with its process, reading the firewall and the account files needs root; install or update the helper from a shell in the fips-ui directory:</div>
+          <div className="text-ink-2">{helper.available && helper.version ? `The installed helper is v${helper.version}.` : helper.error ? `${helper.error.replace(/[.\s]*$/, '')}.` : 'The helper is not available.'} Listing every listener with its process, reading the firewall and the account files needs root; install or update the helper from a shell in the fips-ui directory:</div>
           <Copyable text="sudo ./deploy/setup-local.sh" className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit" />
         </div>
       </div>
