@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # One-shot local setup, run with sudo from the repo checkout:
 #   sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [--fips-test-peer] [--fips-peer <peer>]... [ui-user] [node-binary]
-# 1. checks preconditions (Node 22.18+/23.6+/24+) and builds the frontend as <ui-user> when it is missing or was
-#    built for an older checkout (web/dist/.build-source, written by npm run build, against git's tree of web/)
+# 1. checks preconditions (built frontend, Node 22.18+/23.6+/24+)
 # 2. installs the privileged helper + its single sudoers rule for <ui-user>; without the fips daemon it offers to
 #    install the newest fips release (deploy/install-fips.sh): asks on a terminal, --install-fips installs without
 #    asking, --no-install-fips skips it (the Upgrade page can install it later). The new node keeps its identity and
@@ -62,6 +61,7 @@ home=$(home_of "$user")
 
 # ---- preconditions (nothing is changed until these pass) ----
 for p in "$here" "$home"; do [[ "$p" =~ [[:space:]%] ]] && fail "path '$p' contains whitespace or '%', which this script does not escape"; done
+[[ -d "$here/web/dist" ]] || fail "$here/web/dist missing: run 'npm run install:all && npm run build' first"
 node=${2:-}
 if [[ -z "$node" ]]; then
   # Resolve node the way the user's login shell would (covers mise/nvm/volta), then pin the real binary
@@ -82,20 +82,6 @@ IFS=. read -r maj min _ <<<"$ver"
 # node's own directory first on PATH: npm (self-update) lives next to it when node comes from nvm, mise or a tarball.
 svc_path="$(dirname "$node"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 echo "== $kind: node $ver at $node, UI user $user, checkout $here"
-
-# ---- frontend: built for this checkout ----
-# A checkout moved with git pull keeps serving the frontend built before it (pages added since stay missing):
-# build it here, as the UI user who owns the checkout, when it is missing or was built from another web/ tree.
-as_user() { sudo -u "$user" -H env "PATH=$svc_path" "$@"; }
-want=$(as_user git -C "$here" rev-parse HEAD:web 2>/dev/null || true)
-have=$(cat "$here/web/dist/.build-source" 2>/dev/null || true)
-if [[ ! -f "$here/web/dist/index.html" || ( -n "$want" && "$want" != "$have" ) ]]; then
-  echo "== frontend: building web/dist for this checkout"
-  if [[ ! -d "$here/web/node_modules" || "$here/web/package-lock.json" -nt "$here/web/node_modules/.package-lock.json" ]]; then
-    as_user npm ci --prefix "$here/web" || fail "npm ci failed in $here/web"
-  fi
-  as_user npm --prefix "$here" run build || fail "the frontend build failed; fix it and run this again"
-fi
 
 # ---- helper + sudoers rule (prints its own self-test) ----
 echo "== helper"
@@ -124,6 +110,38 @@ if ! "$here/deploy/install-fips.sh" --check >/dev/null; then
 fi
 # The daemon's control socket belongs to group fips on Linux and FreeBSD; on macOS the package may not create it.
 fips_group=true; group_exists fips || fips_group=false
+
+# ---- frontend: built for this checkout ----
+# A checkout moved with git pull keeps serving the frontend built before it, so pages added since stay missing.
+# web/dist/.build-source names the web/ tree it was built from (npm run build writes it). When that is not the
+# checkout's, the frontend is built again as the UI user into web/dist.new and swapped in only once that worked;
+# a failure keeps the previous frontend served and the setup going, with a warning.
+as_user() { sudo -u "$user" -H env "PATH=$svc_path" "$@"; }
+build_frontend() {
+  local web=$here/web
+  as_user test -w "$web" || { echo "warning: $user cannot write $web" >&2; return 1; }
+  # The build tools are devDependencies: installed when missing (NODE_ENV=production leaves them out) or outdated.
+  if [[ ! -x "$web/node_modules/.bin/tsc" || ! -x "$web/node_modules/.bin/vite" || "$web/package-lock.json" -nt "$web/node_modules/.package-lock.json" ]]; then
+    as_user npm ci --prefix "$web" --include=dev --no-audit --no-fund || return 1
+  fi
+  rm -rf "$web/dist.new" "$web/dist.old"
+  if ! as_user npm --prefix "$web" run build -- --outDir dist.new --emptyOutDir || [[ ! -f "$web/dist.new/index.html" ]]; then
+    rm -rf "$web/dist.new"; return 1
+  fi
+  mv "$web/dist" "$web/dist.old" || { rm -rf "$web/dist.new"; return 1; }
+  if ! mv "$web/dist.new" "$web/dist"; then mv "$web/dist.old" "$web/dist"; rm -rf "$web/dist.new"; return 1; fi
+  rm -rf "$web/dist.old"
+  as_user "$node" "$here/scripts/stamp-build.mjs" || true
+}
+want=$(as_user git -C "$here" rev-parse HEAD:web 2>/dev/null || true)
+dirty=$(as_user git -C "$here" status --porcelain -- web 2>/dev/null || true)
+have=$(cat "$here/web/dist/.build-source" 2>/dev/null || true)
+if [[ -z "$want" ]]; then
+  echo "note: git did not say which web/ this checkout has, so web/dist is not checked; if pages are missing, run 'npm run build' in $here"
+elif [[ -n "$dirty" || "$want" != "$have" ]]; then
+  echo "== frontend: web/dist was not built from this checkout; building it"
+  build_frontend || echo "warning: building the frontend failed; the previous one stays served. In $here run: npm ci --prefix web --include=dev && npm run build" >&2
+fi
 
 # ---- service ----
 echo "== service"

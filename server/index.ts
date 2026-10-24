@@ -495,7 +495,7 @@ async function route(req: Req, res: Res) {
     if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' });
     const sub = p.slice('/api/admin/security'.length);
     if (method === 'GET') {
-      if (sub === '') return json(res, 200, { ...security.status(), available: await admin.securityCapable(), helper: await admin.helperInfo().then((h) => ({ version: h.version, available: h.available, error: h.error })) });
+      if (sub === '') return json(res, 200, { ...security.status(), available: await admin.securityCapable(), serviceManager: PLATFORM.serviceManager, helper: await admin.helperInfo().then((h) => ({ version: h.version, available: h.available, error: h.error, security: h.features.security })) });
       if (sub === '/history') return json(res, 200, { history: security.history() });
       if (sub === '/summary') return json(res, 200, { summary: security.summary(), available: await admin.securityCapable() });
       throw new HttpError(404, 'unknown security endpoint');

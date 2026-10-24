@@ -5,7 +5,7 @@ import { StatTile } from '../components/StatTile';
 import { usePoll } from '../lib/api';
 import { hashFor } from '../lib/route';
 import { fmtAgo, fmtDuration, fmtTime } from '../lib/format';
-import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, securityApi, severityTone, type Listener, type Report, type ScanSettings, type Severity, type Verdict } from '../lib/security';
+import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, securityApi, severityTone, type HelperState, type Listener, type Report, type ScanSettings, type Severity, type Verdict } from '../lib/security';
 
 export function Security({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
@@ -41,7 +41,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
         pending and security updates and known vulnerabilities from the distribution's own tools, reboots that updates are waiting for, and a few hardening settings.
         Nothing is changed and nothing leaves the node; the score is explained in <a className="underline" href="https://github.com/fr34aky/fips-ui/blob/main/docs/security-scan.md" target="_blank" rel="noreferrer">docs/security-scan.md</a>.
       </p>
-      {!s.available && <HelperNotice helper={s.helper} />}
+      {!s.available && <HelperNotice helper={s.helper} serviceManager={s.serviceManager} />}
       {s.lastError && !s.running && <ErrorNote>The last scan failed{s.lastFailure ? ` ${fmtAgo(s.lastFailure)}` : ''}: {s.lastError}</ErrorNote>}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -72,16 +72,27 @@ export function Security({ readOnly }: { readOnly: boolean }) {
   );
 }
 
-function HelperNotice({ helper }: { helper: { version: number | null; available: boolean; error?: string } }) {
+/** Why the scan cannot run here, and the one thing that fixes it. */
+function HelperNotice({ helper, serviceManager }: { helper: HelperState; serviceManager?: string }) {
+  const current = helper.available && (helper.version ?? 0) >= SECURITY_HELPER_VERSION;
+  // setup-local.sh sets up a service only under systemd; elsewhere the helper is installed on its own.
+  const command = !serviceManager || serviceManager === 'systemd' ? 'sudo ./deploy/setup-local.sh' : 'sudo ./deploy/install-upgrade-helper.sh';
   return (
     <Card>
       <div className="flex items-start gap-3 text-sm">
         <KeyRound size={18} className="text-warn mt-0.5 shrink-0" />
-        <div className="grid gap-2">
-          <div className="font-medium">The security scan needs the privileged helper, version {SECURITY_HELPER_VERSION} or newer, on Linux</div>
-          <div className="text-ink-2">{helper.available && helper.version ? `The installed helper is v${helper.version}.` : helper.error ? `${helper.error.replace(/[.\s]*$/, '')}.` : 'The helper is not available.'} Listing every listener with its process, reading the firewall and the account files needs root; install or update the helper from a shell in the fips-ui directory:</div>
-          <Copyable text="sudo ./deploy/setup-local.sh" className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit" />
-        </div>
+        {current && helper.security === false ? (
+          <div className="grid gap-2">
+            <div className="font-medium">The helper cannot scan this system</div>
+            <div className="text-ink-2">Helper v{helper.version} is installed, but the scan needs <code>python3</code> and <code>ss</code> (iproute2) on this machine. Install them with the package manager and reload this page.</div>
+          </div>
+        ) : (
+          <div className="grid gap-2">
+            <div className="font-medium">The security scan needs the privileged helper, version {SECURITY_HELPER_VERSION} or newer</div>
+            <div className="text-ink-2">{helper.available && helper.version ? `The installed helper is v${helper.version}.` : helper.error ? `${helper.error.replace(/[.\s]*$/, '')}.` : 'The helper is not available.'} Listing every listener with its process, reading the firewall and the account files needs root; install or update the helper from a shell in the fips-ui directory:</div>
+            <Copyable text={command} className="rounded-lg bg-surface-2 px-3 py-2 text-xs w-fit" />
+          </div>
+        )}
       </div>
     </Card>
   );

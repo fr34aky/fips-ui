@@ -25,10 +25,13 @@ What `setup-local.sh` does on every supported system:
    Upgrade page.
 4. Installs the privileged helper `/usr/local/libexec/fips-ui-helper` and one sudoers rule for the UI user
    ([node-management.md](node-management.md)).
-5. Adds the UI user to the `fips` group (the daemon's control socket), and on systemd to `systemd-journal`.
-6. Installs the service. It runs fips-ui from the checkout as the UI user, starts it at boot and restarts it
+5. Rebuilds the frontend as the UI user when `web/dist` was built from another version of the checkout (after a
+   `git pull`, so new pages show). The new build replaces the old one only when it succeeds; otherwise the
+   previous frontend stays and the script says how to build it by hand.
+6. Adds the UI user to the `fips` group (the daemon's control socket), and on systemd to `systemd-journal`.
+7. Installs the service. It runs fips-ui from the checkout as the UI user, starts it at boot and restarts it
    when it exits, which is how fips-ui restarts after [updating itself](self-update.md).
-7. (Re)starts it and checks `/api/health`.
+8. (Re)starts it and checks `/api/health`.
 
 Arguments: `sudo ./deploy/setup-local.sh [--install-fips|--no-install-fips] [--fips-test-peer]
 [--fips-peer npub1...@udp/host:port]... [ui-user] [node-binary]`. The UI

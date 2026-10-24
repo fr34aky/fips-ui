@@ -37,8 +37,12 @@ export interface SecurityState {
   settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null;
   lastError?: string; lastFailure?: number; latest: Report | null;
   /** Whether a scan can run here (helper v13 on Linux), and the helper as the backend sees it. */
-  available: boolean; helper: { version: number | null; available: boolean; error?: string };
+  available: boolean; helper: HelperState;
+  /** systemd nodes install the helper with setup-local.sh, others with install-upgrade-helper.sh. */
+  serviceManager?: string;
 }
+/** The helper as the backend sees it; `security`: a v13+ helper can scan on this system (python3 and ss present). */
+export interface HelperState { version: number | null; available: boolean; error?: string; security?: boolean }
 export interface HistoryPoint { score: number; grade: Grade; scannedAt: number; counts: Record<Severity, number>; categories: Report['categories'] }
 
 /** The helper version with the security scan (server/admin.ts). */
