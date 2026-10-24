@@ -11,7 +11,7 @@ import { LOGS, setDaemonProbe } from './platform.ts';
 import { unitStates, serviceAction, readHosts, hostInfo, unitName, PLATFORM, SERVICES, type ServiceId, type ServiceAction } from './system.ts';
 import { createUpgradeHandler } from './upgrade.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
-import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, SECURITY_HELPER_VERSION, meshAddress, type FirewallRule } from './admin.ts';
+import { createAdminHandler, NPUB_RE, GUARD_HELPER_VERSION, HOSTS_HELPER_VERSION, SECURITY_HELPER_VERSION, meshAddress, type FirewallRule, type HelperInfo } from './admin.ts';
 import { SecurityScanner, SettingsError } from './security.ts';
 import { HOSTS_PATH, HostsError, renderHosts, validateEntries, writeHostsDirect, type HostsFile } from './hosts.ts';
 import { HostsSync, SyncError } from './hosts-sync.ts';
@@ -366,6 +366,14 @@ const fleet = new Fleet({
 // Read-only: the page is off (health.fleet), so the nodes are not probed either.
 if (!SELFTEST && !READ_ONLY) void fleet.start();
 
+/** Why the helper cannot scan here, with the fix (the Security page shows the same). */
+function securityUnavailable(h: HelperInfo): string {
+  const install = (h.serviceManager ?? PLATFORM.serviceManager) === 'systemd' ? 'sudo ./deploy/setup-local.sh' : 'sudo ./deploy/install-upgrade-helper.sh';
+  if (PLATFORM.os !== 'linux') return 'the security scan runs on Linux only';
+  if (h.available && (h.version ?? 0) >= SECURITY_HELPER_VERSION && !h.features.security) return 'the helper cannot scan this system: install python3 and ss (iproute2)';
+  return `the security scan needs helper v${SECURITY_HELPER_VERSION} (installed: ${h.available && h.version ? `v${h.version}` : 'none'}); run ${install} in the fips-ui directory`;
+}
+
 // The weekly security scan (server/security.ts) through the helper's read-only security-scan. It changes nothing
 // on the node, so it runs in read-only mode too; starting one by hand and the schedule are changes.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -424,7 +432,7 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, security: isAdmin(pr.role) && await admin.securityCapable(), fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, security: isAdmin(pr.role) && PLATFORM.os === 'linux', fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -495,7 +503,13 @@ async function route(req: Req, res: Res) {
     if (!isAdminReq(req)) return json(res, 403, { error: 'admin role required' });
     const sub = p.slice('/api/admin/security'.length);
     if (method === 'GET') {
-      if (sub === '') return json(res, 200, { ...security.status(), available: await admin.securityCapable(), helper: await admin.helperInfo().then((h) => ({ version: h.version, available: h.available, error: h.error })) });
+      if (sub === '') {
+        // Not able to scan: check the helper again rather than from the minute's cache, so a fix shows on reload.
+        let h = await admin.helperInfo();
+        if (!(await admin.securityCapable())) h = await admin.helperInfo(true);
+        const available = await admin.securityCapable();
+        return json(res, 200, { ...security.status(), available, serviceManager: h.serviceManager ?? PLATFORM.serviceManager, helper: { version: h.version, available: h.available, error: h.error, security: h.features.security } });
+      }
       if (sub === '/history') return json(res, 200, { history: security.history() });
       if (sub === '/summary') return json(res, 200, { summary: security.summary(), available: await admin.securityCapable() });
       throw new HttpError(404, 'unknown security endpoint');
@@ -503,7 +517,7 @@ async function route(req: Req, res: Res) {
     if (method !== 'POST') throw new HttpError(405, 'GET or POST');
     if (!canChange(req)) throw new HttpError(403, READ_ONLY ? 'this UI instance is read-only (FIPS_UI_READ_ONLY=1)' : 'admin role required');
     if (sub === '/scan') {
-      if (!(await admin.securityCapable())) throw new HttpError(409, (await admin.helperInfo()).error ?? `the security scan needs helper v${SECURITY_HELPER_VERSION} on Linux; run sudo ./deploy/setup-local.sh`);
+      if (!(await admin.securityCapable())) throw new HttpError(409, securityUnavailable(await admin.helperInfo(true)));
       void security.scan();
       return json(res, 202, security.status());
     }

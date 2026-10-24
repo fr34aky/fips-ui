@@ -1,6 +1,7 @@
 // Client for the weekly security scan (server/security.ts): the report, its history and the schedule. Always the
 // node the page looks at (a managed node's scan is reached through this node's proxy).
 import { api } from './api';
+import type { HelperInfo } from './admin';
 
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type Category = 'exposure' | 'firewall' | 'patches' | 'vulns' | 'hardening';
@@ -37,8 +38,12 @@ export interface SecurityState {
   settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null;
   lastError?: string; lastFailure?: number; latest: Report | null;
   /** Whether a scan can run here (helper v13 on Linux), and the helper as the backend sees it. */
-  available: boolean; helper: { version: number | null; available: boolean; error?: string };
+  available: boolean; helper: HelperState;
+  /** The service manager the helper is installed for (lib/admin.ts helperInstallCommand). */
+  serviceManager?: string;
 }
+/** The helper as the backend sees it; `security`: a v13+ helper can scan on this system (python3 and ss present). */
+export type HelperState = Pick<HelperInfo, 'version' | 'available' | 'error'> & { security?: boolean };
 export interface HistoryPoint { score: number; grade: Grade; scannedAt: number; counts: Record<Severity, number>; categories: Report['categories'] }
 
 /** The helper version with the security scan (server/admin.ts). */

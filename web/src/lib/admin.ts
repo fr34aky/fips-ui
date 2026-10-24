@@ -3,6 +3,8 @@ import { api } from './api';
 
 export interface HelperFeatures { config: boolean; hosts: boolean; services: boolean; firewall: 'nft' | 'pf' | 'none'; guard: 'nft' | 'pf' | 'none' }
 export interface HelperInfo { available: boolean; version: number | null; error?: string; managementCapable: boolean; features?: HelperFeatures; serviceManager?: string; configPath?: string; pubdom?: { server: boolean; resolver: boolean } }
+/** How the helper is installed: setup-local.sh sets up a service only under systemd, elsewhere the helper alone. */
+export const helperInstallCommand = (serviceManager?: string) => (!serviceManager || serviceManager === 'systemd' ? 'sudo ./deploy/setup-local.sh' : 'sudo ./deploy/install-upgrade-helper.sh');
 /** Helper version with the public-domains verbs (server/admin.ts). */
 export const PUBDOM_HELPER_VERSION = 11;
 /** Helper version that installs and updates fips-pub-domains from its releases. */
