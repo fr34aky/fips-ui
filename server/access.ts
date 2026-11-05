@@ -25,7 +25,7 @@ import { homedir, networkInterfaces } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { expand6, isMeshAddress } from './net6.ts';
-import { query } from './control.ts';
+import { queryStatus } from './control.ts';
 import { meshAddress, NPUB_RE } from './admin.ts';
 
 /**
@@ -371,7 +371,7 @@ export class MeshAccess {
     await this.loadNow();
     if (!this.config.enabled) { if (this.server) this.close(); this.lastError = undefined; return; }
     try {
-      const st = await query<{ ipv6_addr?: string; npub?: string; tun_name?: string }>('show_status', undefined, { timeoutMs: 3000 });
+      const st = await queryStatus<{ ipv6_addr?: string; npub?: string; tun_name?: string }>({ timeoutMs: 3000 });
       if (st.ipv6_addr && st.npub) {
         const changed = this.own?.npub !== st.npub;
         this.own = { address: st.ipv6_addr, npub: st.npub };

@@ -110,6 +110,7 @@ Everything is via environment variables.
 | `FIPS_UI_SERVICE_MANAGER` | auto | Force `systemd`, `openrc`, `procd`, `launchd`, `rc` or `scm`. |
 | `FIPS_UI_SERVICE_FIPS`, `FIPS_UI_SERVICE_FIPS_GATEWAY`, … | per OS | Native service name for each service if your packaging differs (e.g. a custom launchd label). |
 | `FIPS_UI_LOG_FILE` | per OS | Read the daemon log from this file instead of the OS log system. |
+| `FIPS_IPV6TUN_SOCKET` | beside `FIPS_SOCKET` | The IPv6 adapter's status socket (`control-ipv6tun.sock` beside the control socket; the control port plus 2 on Windows), which answers the TUN state and the listening panel on fips from 2026-10-26 on. Older daemons answer them on the control socket, which is used when the adapter socket is absent. |
 | `FIPS_GATEWAY_SOCKET` | auto | Gateway control socket override. |
 | `FIPS_UNIT` | `fips.service` | Journal unit to follow (systemd only). |
 | `FIPS_HOSTS` | per OS | Hosts file ([docs/hosts.md](docs/hosts.md)). |

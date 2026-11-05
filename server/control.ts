@@ -30,6 +30,25 @@ export function defaultSocketPath(kind: 'control' | 'gateway' = 'control'): stri
 export const SOCKET_PATH = process.env.FIPS_SOCKET ?? defaultSocketPath('control');
 export const GATEWAY_SOCKET_PATH = process.env.FIPS_GATEWAY_SOCKET ?? defaultSocketPath('gateway');
 
+/**
+ * The IPv6 adapter's status socket (fips from 2026-10-26 on): a sibling of the control socket named with `-ipv6tun`
+ * before the extension (`control.sock` → `control-ipv6tun.sock`); on a TCP endpoint the control port plus 2. A
+ * symlinked control socket is followed first, as fipsctl does, so the adapter is looked for beside the real socket.
+ * It answers `show_status` (the TUN keys) and `show_listening_sockets`, which the control socket no longer does.
+ */
+export function ipv6tunEndpoint(control: string, realpath: (p: string) => string = (p) => fs.realpathSync(p)): string {
+  const o = endpointOptions(control);
+  if (!('path' in o) || !o.path) {
+    const port = (o as { port: number }).port + 2;
+    return /^\d{1,5}$/.test(control) ? String(port) : control.replace(/:\d{1,5}$/, `:${port}`);
+  }
+  let real = control;
+  try { real = realpath(control); } catch { /* not there yet: derive from the given path */ }
+  const ext = path.extname(real);
+  return path.join(path.dirname(real), `${path.basename(real, ext)}-ipv6tun${ext}`);
+}
+export const IPV6TUN_SOCKET_PATH = process.env.FIPS_IPV6TUN_SOCKET ?? ipv6tunEndpoint(SOCKET_PATH);
+
 /** Connection options for an endpoint string: a TCP port, host:port / [v6]:port, or a Unix socket path. */
 export function endpointOptions(ep: string): net.NetConnectOpts {
   if (/^\d{1,5}$/.test(ep)) return { host: '127.0.0.1', port: Number(ep) };
@@ -100,6 +119,34 @@ function describeSocketError(e: NodeJS.ErrnoException, socketPath: string): stri
     case 'ECONNREFUSED': return /^[\d.:[\]a-zA-Z-]*\d$/.test(socketPath) && !socketPath.startsWith('/') ? `nothing listening on control port ${socketPath} (is the fips daemon running?)` : `connection refused on ${socketPath} (stale socket? daemon restarting?)`;
     default: return `${e.code ?? 'error'}: ${e.message}`;
   }
+}
+
+/** The keys of `show_status` the IPv6 adapter answers for; what fipsctl shows when no adapter answers. */
+const TUN_DEFAULTS = { tun_state: 'disabled', tun_name: '-', effective_ipv6_mtu: 0 } as const;
+type TunKeys = Record<keyof typeof TUN_DEFAULTS, unknown>;
+
+/**
+ * `show_status` as fipsctl shows it: the daemon's answer with the TUN keys merged in from the adapter's socket where
+ * the daemon leaves them out. An older daemon answers them itself; a newer one without an adapter socket (the
+ * path too long to bind, or a permission problem) shows the defaults rather than nothing.
+ */
+export async function queryStatus<T extends Partial<TunKeys> = Record<string, unknown>>(opts: { timeoutMs?: number } = {}): Promise<T> {
+  const st = await query<T>('show_status', undefined, opts);
+  if (st && typeof st === 'object' && st.tun_state !== undefined) return st;
+  let tun: Partial<TunKeys> = {};
+  if (endpointExists(IPV6TUN_SOCKET_PATH)) {
+    try { tun = await query<TunKeys>('show_status', undefined, { ...opts, socketPath: IPV6TUN_SOCKET_PATH }); } catch { /* no adapter socket: defaults */ }
+  }
+  return { ...st, ...TUN_DEFAULTS, ...Object.fromEntries(Object.keys(TUN_DEFAULTS).filter((k) => tun[k as keyof TunKeys] !== undefined).map((k) => [k, tun[k as keyof TunKeys]])) } as T;
+}
+
+/** `show_listening_sockets` from the adapter's socket; from the control socket where there is no adapter (older daemons). */
+export async function queryListening<T = unknown>(opts: { timeoutMs?: number } = {}): Promise<T> {
+  if (endpointExists(IPV6TUN_SOCKET_PATH)) {
+    try { return await query<T>('show_listening_sockets', undefined, { ...opts, socketPath: IPV6TUN_SOCKET_PATH }); }
+    catch (e) { if (!(e instanceof ControlError) || e.kind !== 'transport') throw e; }
+  }
+  return query<T>('show_listening_sockets', undefined, opts);
 }
 
 /** Read-only queries that the HTTP layer may proxy verbatim. */
