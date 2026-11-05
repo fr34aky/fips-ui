@@ -9,8 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.14.2] - 2026-11-05
 
-## [0.14.1] - 2026-10-24
-
 ### Fixed
 
 - Works with a fips daemon from 2026-10-26 on, where the IPv6 adapter answers
@@ -23,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is asked where it exists (override: `FIPS_IPV6TUN_SOCKET`) and the control
   socket otherwise, so older daemons keep working; where neither answers the
   Overview says so instead of showing a TUN that is not there.
+
+## [0.14.1] - 2026-10-24
+
+### Fixed
+
 - The **Security** menu item shows on every Linux node for admins. Where the
   helper is older than v13 the page says how to install it; the item was
   hidden there, so nothing told you the page existed.
