@@ -115,7 +115,7 @@ export function Overview({ snap, health, onNav }: { snap: Snapshot; health: Heal
               ))}
             </div>
           ) : <Empty>No transports configured.</Empty>}
-          <div className="mt-3 text-xs text-ink-3">TUN <b className="text-ink-2">{s.tun_name}</b> {s.tun_state} · effective IPv6 MTU {s.effective_ipv6_mtu}</div>
+          <div className="mt-3 text-xs text-ink-3">TUN <b className="text-ink-2">{s.tun_name ?? '-'}</b> {s.tun_state ?? 'unknown'} · effective IPv6 MTU {s.effective_ipv6_mtu ?? '-'}</div>
         </Card>
 
         {/* Listening */}

@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Works with a fips daemon from 2026-10-26 on, where the IPv6 adapter answers
+  for itself on a socket beside the control socket (`control-ipv6tun.sock`):
+  the TUN name, state and effective IPv6 MTU, and `show_listening_sockets`.
+  Against such a daemon the Overview flashed `listening: unknown command:
+  show_listening_sockets` every few seconds, the "Listening on fips0" panels
+  were empty, the node name in the header lost its TUN device, and mesh
+  access and the security scan did not learn the TUN name. The adapter socket
+  is asked where it exists (override: `FIPS_IPV6TUN_SOCKET`) and the control
+  socket otherwise, so older daemons keep working; where neither answers the
+  Overview says so instead of showing a TUN that is not there.
 - The **Security** menu item shows on every Linux node for admins. Where the
   helper is older than v13 the page says how to install it; the item was
   hidden there, so nothing told you the page existed.

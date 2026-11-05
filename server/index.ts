@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
-import { query, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, endpointExists } from './control.ts';
+import { query, queryStatus, queryListening, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, ipv6tunSocketPath, endpointExists } from './control.ts';
 import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames, setServedOwnNpub, watchServedHostnames } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
@@ -173,14 +173,14 @@ async function pollOnce(): Promise<Snapshot> {
   tick++;
   try {
     const [status, peers, links, transports, tree, sessions, connections, listening, units, gateway] = await Promise.all([
-      settle(query('show_status'), 'status', errors),
+      settle(queryStatus({ onAdapterError: (e) => { errors.tun = e.message; } }), 'status', errors),
       settle(query('show_peers'), 'peers', errors),
       settle(query('show_links'), 'links', errors),
       settle(query('show_transports'), 'transports', errors),
       settle(query('show_tree'), 'tree', errors),
       settle(query('show_sessions'), 'sessions', errors),
       settle(query('show_connections'), 'connections', errors),
-      slow ? settle(query('show_listening_sockets'), 'listening', errors) : Promise.resolve(lastSnapshot?.listening),
+      slow ? settle(queryListening(), 'listening', errors) : Promise.resolve(lastSnapshot?.listening),
       slow ? settle(unitStates(), 'units', errors) : Promise.resolve(lastSnapshot?.units),
       slow && endpointExists(GATEWAY_SOCKET_PATH)
         ? settle(Promise.all([query('show_gateway', undefined, { socketPath: GATEWAY_SOCKET_PATH }), query('show_mappings', undefined, { socketPath: GATEWAY_SOCKET_PATH })]).then(([g, m]) => ({ ...(g as object), ...(m as object) })), 'gateway', errors)
@@ -383,7 +383,7 @@ const security = new SecurityScanner({
   context: async () => {
     // Asked now: the last browser's snapshot can be days old by the time a scheduled scan runs.
     const [st, units] = await Promise.all([
-      query('show_status', undefined, { timeoutMs: 3000 }).catch(() => lastSnapshot?.status) as Promise<{ tun_name?: string; ipv6_addr?: string } | undefined>,
+      queryStatus({ timeoutMs: 3000 }).catch(() => lastSnapshot?.status) as Promise<{ tun_name?: string; ipv6_addr?: string } | undefined>,
       unitStates().catch(() => (lastSnapshot?.units ?? [])) as Promise<{ id: string; loaded: boolean; active: string }[]>,
     ]);
     const fw = units.find((u) => u.id === 'fips-firewall');
@@ -566,6 +566,8 @@ async function route(req: Req, res: Res) {
     const cmd = p.slice('/api/q/'.length);
     const params = queryParams(url);
     if (typeof params.peer === 'string' && params.peer) params.peer = (await resolvePeer(params.peer)).npub;
+    if (cmd === 'show_status') return json(res, 200, await queryStatus());
+    if (cmd === 'show_listening_sockets') return json(res, 200, await queryListening());
     if (READ_ONLY_COMMANDS.has(cmd)) return json(res, 200, await query(cmd, params));
     if (GATEWAY_COMMANDS.has(cmd)) return json(res, 200, await query(cmd, params, { socketPath: GATEWAY_SOCKET_PATH }));
     throw new HttpError(404, `unknown or non-read-only command '${cmd}'`);
@@ -948,6 +950,7 @@ server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
   if (SELFTEST) { console.log('fips-ui selftest ok'); process.exit(0); }
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
+  console.log(`  adapter socket : ${ipv6tunSocketPath()}${endpointExists(ipv6tunSocketPath()) ? '' : ' (absent: TUN state and listeners from the control socket)'}`);
   console.log(`  platform       : ${PLATFORM.os}${PLATFORM.distro ? ` (${PLATFORM.distro})` : ''}, services via ${PLATFORM.serviceManager}, logs via ${LOG_SOURCE ?? 'none'}`);
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);
