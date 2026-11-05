@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
-import { query, queryStatus, queryListening, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, IPV6TUN_SOCKET_PATH, endpointExists } from './control.ts';
+import { query, queryStatus, queryListening, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, ipv6tunSocketPath, endpointExists } from './control.ts';
 import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames, setServedOwnNpub, watchServedHostnames } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
@@ -173,7 +173,7 @@ async function pollOnce(): Promise<Snapshot> {
   tick++;
   try {
     const [status, peers, links, transports, tree, sessions, connections, listening, units, gateway] = await Promise.all([
-      settle(queryStatus(), 'status', errors),
+      settle(queryStatus({ onAdapterError: (e) => { errors.tun = e.message; } }), 'status', errors),
       settle(query('show_peers'), 'peers', errors),
       settle(query('show_links'), 'links', errors),
       settle(query('show_transports'), 'transports', errors),
@@ -950,7 +950,7 @@ server.listen(SELFTEST ? 0 : PORT, SELFTEST ? '127.0.0.1' : HOST, () => {
   if (SELFTEST) { console.log('fips-ui selftest ok'); process.exit(0); }
   console.log(`fips-ui ${UI_VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  control socket : ${SOCKET_PATH}`);
-  console.log(`  adapter socket : ${IPV6TUN_SOCKET_PATH}${endpointExists(IPV6TUN_SOCKET_PATH) ? '' : ' (absent: TUN state and listeners from the control socket)'}`);
+  console.log(`  adapter socket : ${ipv6tunSocketPath()}${endpointExists(ipv6tunSocketPath()) ? '' : ' (absent: TUN state and listeners from the control socket)'}`);
   console.log(`  platform       : ${PLATFORM.os}${PLATFORM.distro ? ` (${PLATFORM.distro})` : ''}, services via ${PLATFORM.serviceManager}, logs via ${LOG_SOURCE ?? 'none'}`);
   console.log(`  static dir     : ${STATIC_DIR}${fs.existsSync(STATIC_DIR) ? '' : ' (not built yet)'}`);
   console.log(`  auth           : ${TOKEN ? 'token' : 'none (bind to loopback or set FIPS_UI_TOKEN)'}`);

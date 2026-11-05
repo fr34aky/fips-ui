@@ -42,8 +42,9 @@ export interface Listening { fips0_addr: string; firewall_active: boolean; socke
 
 export interface Status {
   version: string; npub: string; node_addr: string; ipv6_addr: string; state: string; is_leaf_only: boolean; is_root: boolean; root: string;
+  /** Answered by the IPv6 adapter's status socket on newer daemons: absent when it could not be read (snap.errors.tun says why). */
   persistent: boolean; peer_count: number; session_count: number; link_count: number; transport_count: number; connection_count: number;
-  transport_peer_counts: Record<string, number>; tun_state: string; tun_name: string; effective_ipv6_mtu: number; control_socket: string;
+  transport_peer_counts: Record<string, number>; tun_state?: string; tun_name?: string; effective_ipv6_mtu?: number; control_socket: string;
   pid: number; exe_path: string; uptime_secs: number; estimated_mesh_size: number; forwarding: Record<string, number>;
   sparklines: Record<string, number[]>;
 }

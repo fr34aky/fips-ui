@@ -47,7 +47,8 @@ export function ipv6tunEndpoint(control: string, realpath: (p: string) => string
   const ext = path.extname(real);
   return path.join(path.dirname(real), `${path.basename(real, ext)}-ipv6tun${ext}`);
 }
-export const IPV6TUN_SOCKET_PATH = process.env.FIPS_IPV6TUN_SOCKET ?? ipv6tunEndpoint(SOCKET_PATH);
+/** Derived on every call: the control socket may appear, or become a symlink, after fips-ui started. */
+export function ipv6tunSocketPath(): string { return process.env.FIPS_IPV6TUN_SOCKET ?? ipv6tunEndpoint(SOCKET_PATH); }
 
 /** Connection options for an endpoint string: a TCP port, host:port / [v6]:port, or a Unix socket path. */
 export function endpointOptions(ep: string): net.NetConnectOpts {
@@ -121,32 +122,40 @@ function describeSocketError(e: NodeJS.ErrnoException, socketPath: string): stri
   }
 }
 
-/** The keys of `show_status` the IPv6 adapter answers for; what fipsctl shows when no adapter answers. */
-const TUN_DEFAULTS = { tun_state: 'disabled', tun_name: '-', effective_ipv6_mtu: 0 } as const;
-type TunKeys = Record<keyof typeof TUN_DEFAULTS, unknown>;
-
 /**
- * `show_status` as fipsctl shows it: the daemon's answer with the TUN keys merged in from the adapter's socket where
- * the daemon leaves them out. An older daemon answers them itself; a newer one without an adapter socket (the
- * path too long to bind, or a permission problem) shows the defaults rather than nothing.
+ * `show_status` as fipsctl shows it: the daemon's answer with the IPv6 adapter's keys (`tun_state`, `tun_name`,
+ * `effective_ipv6_mtu`, ...) merged in where the daemon leaves them out. An older daemon answers them itself; a newer
+ * one without a reachable adapter socket answers without them, and `onAdapterError` says why, so a caller can show
+ * the failure rather than a placeholder (a placeholder TUN name would be taken for a real interface).
  */
-export async function queryStatus<T extends Partial<TunKeys> = Record<string, unknown>>(opts: { timeoutMs?: number } = {}): Promise<T> {
-  const st = await query<T>('show_status', undefined, opts);
-  if (st && typeof st === 'object' && st.tun_state !== undefined) return st;
-  let tun: Partial<TunKeys> = {};
-  if (endpointExists(IPV6TUN_SOCKET_PATH)) {
-    try { tun = await query<TunKeys>('show_status', undefined, { ...opts, socketPath: IPV6TUN_SOCKET_PATH }); } catch { /* no adapter socket: defaults */ }
-  }
-  return { ...st, ...TUN_DEFAULTS, ...Object.fromEntries(Object.keys(TUN_DEFAULTS).filter((k) => tun[k as keyof TunKeys] !== undefined).map((k) => [k, tun[k as keyof TunKeys]])) } as T;
+export async function queryStatus<T extends { tun_state?: unknown } = Record<string, unknown>>(
+  opts: { timeoutMs?: number; onAdapterError?: (e: Error) => void } = {},
+): Promise<T> {
+  const adapter = ipv6tunSocketPath();
+  const [st, tun] = await Promise.all([
+    query<T>('show_status', undefined, { timeoutMs: opts.timeoutMs }),
+    endpointExists(adapter)
+      ? query<Record<string, unknown>>('show_status', undefined, { timeoutMs: opts.timeoutMs, socketPath: adapter }).catch((e: Error) => e)
+      : new ControlError(`IPv6 adapter status socket not found at ${adapter}`, 'transport'),
+  ]);
+  if (!st || typeof st !== 'object' || st.tun_state !== undefined) return st; // the daemon answered the keys itself
+  if (tun instanceof Error) { opts.onAdapterError?.(tun); return st; }
+  return { ...tun, ...st } as T;
 }
 
 /** `show_listening_sockets` from the adapter's socket; from the control socket where there is no adapter (older daemons). */
 export async function queryListening<T = unknown>(opts: { timeoutMs?: number } = {}): Promise<T> {
-  if (endpointExists(IPV6TUN_SOCKET_PATH)) {
-    try { return await query<T>('show_listening_sockets', undefined, { ...opts, socketPath: IPV6TUN_SOCKET_PATH }); }
+  const adapter = ipv6tunSocketPath();
+  if (endpointExists(adapter)) {
+    try { return await query<T>('show_listening_sockets', undefined, { ...opts, socketPath: adapter }); }
     catch (e) { if (!(e instanceof ControlError) || e.kind !== 'transport') throw e; }
   }
-  return query<T>('show_listening_sockets', undefined, opts);
+  try { return await query<T>('show_listening_sockets', undefined, opts); }
+  catch (e) {
+    // A daemon that no longer answers it on the control socket: the adapter socket is what is missing.
+    if (e instanceof ControlError && e.kind === 'daemon' && /unknown command/.test(e.message)) throw new ControlError(`the IPv6 adapter's status socket at ${adapter} does not answer (the daemon serves listening sockets there; is it bound?)`, 'transport');
+    throw e;
+  }
 }
 
 /** Read-only queries that the HTTP layer may proxy verbatim. */

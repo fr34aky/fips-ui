@@ -73,7 +73,7 @@ function App({ route }: { route: AppRoute }) {
   const snap = live.snapshot;
   const viewer = !!health?.principal && !isAdmin(health.principal.role);
   const ownName = useHostName(snap?.status?.npub);
-  const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
+  const nodeName = useMemo(() => snap?.status ? `${snap.status.tun_name ?? '-'} · ${ownName ? `${ownName} · ` : ''}${shortKey(snap.status.npub, 12, 6)}` : '', [snap, ownName]);
   const managedName = useHostName(nodeNpub);
   const node = nodeNpub ? { npub: nodeNpub, name: fleetMeta?.label || managedName || shortKey(nodeNpub, 12, 6) } : undefined;
   const backToFleet = <a className="btn sm mt-3" href={hashFor('fleet', undefined, null)}>Back to Node manager</a>;
