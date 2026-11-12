@@ -1,9 +1,9 @@
 # Security scan
 
-The **Security** page shows a weekly scan of the machine fips-ui runs on: which services listen and whether the
+The **Security** page shows a daily scan of the machine fips-ui runs on: which services listen and whether the
 host firewall lets a new connection in, pending and security updates, known vulnerabilities in installed packages,
 reboots that updates are waiting for, and a few hardening settings. Each finding comes with a fix, and the whole
-report is scored 0–100 with a grade, so a change shows from one week to the next. The Node manager shows the grade
+report is scored 0–100 with a grade, so a change shows from one day to the next. The Node manager shows the grade
 of every managed node ([fleet.md](fleet.md)).
 
 ![The Security page](screenshots/security.png)
@@ -92,7 +92,8 @@ page lists what the scan could not cover.
 
 ## Schedule and storage
 
-Scans run weekly at a chosen weekday and hour (default Sunday 03:00, local time), and on **Scan now**. A slot missed
+Scans run daily at a chosen hour (default 03:00, local time) or weekly at a chosen weekday and hour, and on
+**Scan now**. A slot missed
 while fips-ui was down runs when it is back; after a failed scan it is tried again an hour later. A scan takes from
 seconds to a few minutes, mostly the package manager's metadata.
 
@@ -108,6 +109,6 @@ GET  /api/admin/security              schedule, running, next run, the latest re
 GET  /api/admin/security/history      score, grade and counts of the kept reports
 GET  /api/admin/security/summary      the latest score and counts (the Node manager reads this)
 POST /api/admin/security/scan         start a scan (202); poll GET until running is false
-POST /api/admin/security/settings     {enabled, weekday (0 = Sunday … 6), hour (0-23)}
+POST /api/admin/security/settings     {enabled, every ('day' | 'week'; absent: 'week'), weekday (0 = Sunday … 6), hour (0-23)}
 POST /api/admin/security/ignore       {id, ignored}: leave a finding out of the score (true) or count it again
 ```
