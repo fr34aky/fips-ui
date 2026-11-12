@@ -972,7 +972,7 @@ export class SecurityScanner {
     try {
       const saved = JSON.parse(await readFile(this.file, 'utf8')) as { ignored?: unknown };
       this.settings = validateSettings(saved);
-      this.ignored = new Set(Array.isArray(saved.ignored) ? saved.ignored.filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 300) : []);
+      this.ignored = new Set((Array.isArray(saved.ignored) ? saved.ignored : []).flatMap((x) => { try { return [validateFindingId(x)]; } catch { return []; } }));
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.lastError = `cannot load ${this.file}: ${(e as Error).message}`; }
     await this.loadReports();
     this.bootedAt = this.now();
@@ -992,8 +992,15 @@ export class SecurityScanner {
     this.reports = loaded.filter((r) => typeof r?.scannedAt === 'number').sort((a, b) => a.scannedAt - b.scannedAt).slice(-KEEP_REPORTS);
   }
 
-  private get latest(): Report | null { const r = this.reports.at(-1); return r ? applyIgnores(r, this.ignored) : null; }
-  private due(): number | null { return nextRun(this.settings, this.latest?.scannedAt ?? this.bootedAt, this.now(), this.lastFailure); }
+  /** The newest report with the ignores applied; computed once per (report, ignore list), since status() is polled. */
+  private shown: { raw: Report; ignored: ReadonlySet<string>; report: Report } | null = null;
+  private get latest(): Report | null {
+    const raw = this.reports.at(-1);
+    if (!raw) return null;
+    if (!this.shown || this.shown.raw !== raw || this.shown.ignored !== this.ignored) this.shown = { raw, ignored: this.ignored, report: applyIgnores(raw, this.ignored) };
+    return this.shown.report;
+  }
+  private due(): number | null { return nextRun(this.settings, this.reports.at(-1)?.scannedAt ?? this.bootedAt, this.now(), this.lastFailure); }
 
   /** Called once a minute: scan when due. */
   async tick(): Promise<void> {
@@ -1047,19 +1054,28 @@ export class SecurityScanner {
 
   async saveSettings(input: unknown): Promise<ScannerStatus> {
     const s = validateSettings(input);
-    await this.persist(s, this.ignored);
-    this.settings = s;
+    await this.write(async () => { await this.persist(s, this.ignored); this.settings = s; });
     return this.status();
   }
 
   /** Switch a finding out of the score (or back in). The id stays on the list while ignored, whether or not a scan still reports it. */
   async setIgnored(id: unknown, ignored: boolean): Promise<ScannerStatus> {
     const fid = validateFindingId(id);
-    const next = new Set(this.ignored);
-    if (ignored) next.add(fid); else next.delete(fid);
-    await this.persist(this.settings, next);
-    this.ignored = next;
+    await this.write(async () => {
+      const next = new Set(this.ignored);
+      if (ignored) next.add(fid); else next.delete(fid);
+      await this.persist(this.settings, next);
+      this.ignored = next;
+    });
     return this.status();
+  }
+
+  /** Writes to the settings file one after the other: two switches flipped quickly both land. */
+  private writing: Promise<void> = Promise.resolve();
+  private write(fn: () => Promise<void>): Promise<void> {
+    const run = this.writing.then(fn, fn);
+    this.writing = run.catch(() => {});
+    return run;
   }
 
   /** The settings file: the schedule and the ignored finding ids, written whole. */

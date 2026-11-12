@@ -6,7 +6,7 @@ import { usePoll } from '../lib/api';
 import { helperInstallCommand } from '../lib/admin';
 import { hashFor } from '../lib/route';
 import { fmtAgo, fmtDuration, fmtTime } from '../lib/format';
-import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, securityApi, severityTone, type Finding, type HelperState, type Listener, type Report, type ScanSettings, type Severity, type Verdict } from '../lib/security';
+import { CATEGORIES, SECURITY_HELPER_VERSION, SEVERITIES, WEEKDAYS, gradeTone, securityApi, severityTone, type HelperState, type Listener, type Report, type ScanSettings, type Severity, type Verdict } from '../lib/security';
 
 export function Security({ readOnly }: { readOnly: boolean }) {
   const toast = useToast();
@@ -34,6 +34,9 @@ export function Security({ readOnly }: { readOnly: boolean }) {
   if (!s) return <Skeleton className="h-40 w-full" />;
   const r = s.latest;
   const trend = (hist.data?.history ?? []).map((h) => h.score);
+  const ignoredCount = r ? r.findings.filter((f) => f.ignored).length : 0;
+  // A switch changes the score of every report: the status and the trend are both read again.
+  const changed = () => { st.refresh(); hist.refresh(); };
 
   return (
     <div className="grid gap-4 fade-in">
@@ -47,7 +50,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatTile hero label="Score" value={r ? <span className="flex items-baseline gap-2">{r.score}<span className="text-base text-ink-3">/ 100</span><Chip tone={gradeTone(r.grade)} dot={false} className="text-sm">{r.grade}</Chip></span> : '–'} sub={r ? `scanned ${fmtAgo(r.scannedAt)}` : 'not scanned yet'} trend={trend} />
-        <StatTile label="Findings" value={r ? <SeverityCounts report={r} /> : '–'} sub={r ? `${r.findings.filter((f) => f.severity !== 'info' && !f.ignored).length} that cost points${r.findings.some((f) => f.ignored) ? ` · ${r.findings.filter((f) => f.ignored).length} ignored` : ''}` : undefined} />
+        <StatTile label="Findings" value={r ? <SeverityCounts report={r} /> : '–'} sub={r ? `${r.findings.filter((f) => f.severity !== 'info' && !f.ignored).length} that cost points${ignoredCount ? ` · ${ignoredCount} ignored` : ''}` : undefined} />
         <StatTile label="Reachable services" value={r ? String(reachable(r.listeners).length) : '–'} sub={r ? `${r.firewall.backend === 'none' ? 'no host firewall' : r.firewall.defaultDeny ? `${FW_NAME[r.firewall.backend] ?? r.firewall.backend} · default deny` : r.firewall.defaultDeny === false ? `${FW_NAME[r.firewall.backend] ?? r.firewall.backend} · open by default` : 'firewall unknown'}` : undefined} />
         <StatTile label="Pending updates" value={r?.packages.updates ? String(r.packages.updates.length) : '–'} sub={r?.packages.updates ? `${r.packages.updates.filter((u) => u.security).length} security${r.reboot.required ? ' · reboot needed' : ''}` : r ? (r.packages.supported ? 'could not be read' : 'not supported here') : undefined} />
       </div>
@@ -58,7 +61,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
       </div>
 
       {r && <>
-        <FindingsCard report={r} readOnly={readOnly} onChanged={() => st.refresh()} />
+        <FindingsCard report={r} ignoredIds={s.ignored} readOnly={readOnly} onChanged={changed} />
         <ListenersCard listeners={r.listeners} readOnly={readOnly} defaultDeny={r.firewall.defaultDeny} />
         <PackagesCard report={r} />
         <Card title="About this scan">
@@ -156,23 +159,28 @@ function CategoryCard({ report }: { report: Report }) {
   );
 }
 
-function FindingsCard({ report, readOnly, onChanged }: { report: Report; readOnly: boolean; onChanged: () => void }) {
+function FindingsCard({ report, ignoredIds, readOnly, onChanged }: { report: Report; ignoredIds: string[]; readOnly: boolean; onChanged: () => void }) {
   const toast = useToast();
   const [filter, setFilter] = useState<'scored' | 'ignored' | 'all'>('scored');
   const [busy, setBusy] = useState<string | null>(null);
-  const ignored = report.findings.filter((f) => f.ignored).length;
+  // Ignored ids the latest scan did not report (the service is gone, the setting fixed): still on the list, shown so they can be switched on again.
+  const inReport = new Set(report.findings.map((f) => f.id));
+  const stale = ignoredIds.filter((id) => !inReport.has(id));
+  const ignored = report.findings.filter((f) => f.ignored).length + stale.length;
   const shown = report.findings.filter((f) => filter === 'all' || (filter === 'ignored' ? f.ignored : f.severity !== 'info' && !f.ignored));
   const label = Object.fromEntries(CATEGORIES.map((c) => [c.id, c.label]));
   // The switch takes a finding out of the score (or puts it back); the page reloads the report, which carries the new score.
-  const toggle = async (f: Finding) => {
-    setBusy(f.id);
-    try { await securityApi.ignore(f.id, !f.ignored); onChanged(); toast('ok', f.ignored ? 'Counted in the score again' : 'Left out of the score'); }
+  const toggle = async (id: string, nowIgnored: boolean, info = false) => {
+    setBusy(id);
+    try { await securityApi.ignore(id, !nowIgnored); onChanged(); toast('ok', nowIgnored ? (info ? 'Listed as a note again' : 'Counted in the score again') : 'Left out of the score'); }
     catch (e) { toast('err', (e as Error).message); }
     finally { setBusy(null); }
   };
+  const sw = (id: string, nowIgnored: boolean, info = false) => <Switch on={!nowIgnored} disabled={readOnly || busy === id} onChange={() => void toggle(id, nowIgnored, info)} label={nowIgnored ? (info ? 'Left out: switch on to list it as a note again' : 'Left out of the score: switch on to count it again') : 'Counted in the score: switch off to leave it out'} />;
+  const showStale = filter !== 'scored' && stale.length > 0;
   return (
-    <Card title={`Findings (${shown.length})`} hint="Switch a finding off to leave it out of the score, e.g. a port that is open on purpose; it stays listed under Ignored and comes back on when you switch it on again" pad={false} actions={<Segmented value={filter} onChange={setFilter} options={[{ value: 'scored', label: 'Scored' }, { value: 'ignored', label: `Ignored (${ignored})` }, { value: 'all', label: 'All' }]} />}>
-      {shown.length === 0 ? <Empty icon={<ShieldCheck size={22} className="text-good" />}>{filter === 'ignored' ? 'No finding is left out of the score.' : 'Nothing that costs points.'}</Empty> : (
+    <Card title={`Findings (${shown.length + (showStale ? stale.length : 0)})`} hint="Switch a finding off to leave it out of the score, e.g. a port that is open on purpose; it stays listed under Ignored and comes back on when you switch it on again" pad={false} actions={<Segmented value={filter} onChange={setFilter} options={[{ value: 'scored', label: 'Scored' }, { value: 'ignored', label: `Ignored (${ignored})` }, { value: 'all', label: 'All' }]} />}>
+      {shown.length === 0 && !showStale ? <Empty icon={<ShieldCheck size={22} className="text-good" />}>{filter === 'ignored' ? 'No finding is left out of the score.' : 'Nothing that costs points.'}</Empty> : (
         <div className="overflow-x-auto"><table className="data"><thead><tr><th>Severity</th><th>Category</th><th>Finding</th><th>What to do</th><th title="Counted in the score">Scored</th></tr></thead><tbody>
           {shown.map((f) => (
             <tr key={f.id} className={f.ignored ? 'opacity-60' : ''}>
@@ -180,7 +188,16 @@ function FindingsCard({ report, readOnly, onChanged }: { report: Report; readOnl
               <td className="text-xs text-ink-2">{label[f.category]}</td>
               <td className="whitespace-normal min-w-[260px]"><div className="font-medium">{f.title}</div>{f.detail && <div className="text-xs text-ink-3 break-words mono">{f.detail}</div>}</td>
               <td className="whitespace-normal min-w-[220px] text-xs text-ink-2">{f.fix ?? '–'}</td>
-              <td>{f.severity === 'info' && !f.ignored ? <span className="text-xs text-ink-3" title="A note costs no points">note</span> : <Switch on={!f.ignored} disabled={readOnly || busy === f.id} onChange={() => void toggle(f)} label={f.ignored ? 'Left out of the score: switch on to count it again' : 'Counted in the score: switch off to leave it out'} />}</td>
+              <td>{f.severity === 'info' && !f.ignored ? <span className="text-xs text-ink-3" title="A note costs no points">note</span> : sw(f.id, !!f.ignored, f.severity === 'info')}</td>
+            </tr>
+          ))}
+          {showStale && stale.map((id) => (
+            <tr key={`stale-${id}`} className="opacity-60">
+              <td><span className="text-xs text-ink-3">–</span></td>
+              <td className="text-xs text-ink-2">–</td>
+              <td className="whitespace-normal min-w-[260px]"><div className="font-medium mono">{id}</div><div className="text-xs text-ink-3">Not in the latest scan; still left out if it comes back.</div></td>
+              <td className="text-xs text-ink-3">–</td>
+              <td>{sw(id, true)}</td>
             </tr>
           ))}
         </tbody></table></div>

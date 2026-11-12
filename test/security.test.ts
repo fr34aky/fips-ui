@@ -2,7 +2,7 @@
 // weekly schedule and the scanner with a fake helper.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -337,6 +337,11 @@ test('ignored findings: out of the score and the counts, kept in the report, per
   assert.equal(sc.history()[0].score, 100); // the stored report is unchanged; the whole history is shown without it
   assert.deepEqual(sc.status().ignored, ['fips-firewall-off']);
   await assert.rejects(sc.setIgnored('', true), /finding id/);
+  // Two switches flipped before either answer: both land, in memory and on disk.
+  await Promise.all([sc.setIgnored('a', true), sc.setIgnored('b', true), sc.saveSettings({ enabled: true, weekday: 3, hour: 5 })]);
+  assert.deepEqual(sc.status().ignored, ['a', 'b', 'fips-firewall-off']);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'security.json'), 'utf8')).ignored, ['a', 'b', 'fips-firewall-off']);
+  await Promise.all([sc.setIgnored('a', false), sc.setIgnored('b', false)]);
   // Stays with the schedule, survives a restart, and a new scan is scored without it until switched back on.
   await sc.saveSettings({ enabled: true, weekday: 1, hour: 2 });
   const again = new SecurityScanner(deps);
