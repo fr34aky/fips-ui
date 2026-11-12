@@ -525,6 +525,13 @@ async function route(req: Req, res: Res) {
       try { return json(res, 200, await security.saveSettings(await readJsonBody(req))); }
       catch (e) { if (e instanceof SettingsError) throw new HttpError(400, e.message); throw e; }
     }
+    // A finding switched out of the score, or back in: {id, ignored}.
+    if (sub === '/ignore') {
+      const b = (await readJsonBody(req) ?? {}) as { id?: unknown; ignored?: unknown };
+      if (typeof b.ignored !== 'boolean') throw new HttpError(400, 'ignored must be true or false');
+      try { return json(res, 200, await security.setIgnored(b.id, b.ignored)); }
+      catch (e) { if (e instanceof SettingsError) throw new HttpError(400, e.message); throw e; }
+    }
     throw new HttpError(404, 'unknown security endpoint');
   }
   // Node management and the access list are admin-only even to read: they reveal configuration and other npubs.

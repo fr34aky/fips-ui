@@ -14,7 +14,7 @@ export const CATEGORIES: { id: Category; label: string; hint: string }[] = [
   { id: 'hardening', label: 'Hardening', hint: 'SSH, kernel settings, accounts and fips file modes' },
 ];
 
-export interface Finding { id: string; category: Category; severity: Severity; title: string; detail?: string; fix?: string }
+export interface Finding { id: string; category: Category; severity: Severity; title: string; detail?: string; fix?: string; /** switched out of the score */ ignored?: boolean }
 export type Scope = 'loopback' | 'link-local' | 'mesh' | 'lan' | 'public' | 'all';
 export type Verdict = 'blocked' | 'restricted' | 'allowed' | 'unknown' | 'none';
 export interface Listener { proto: 'tcp' | 'udp'; addr: string; port: number; iface?: string; process?: string; pid?: number; scope: Scope; ephemeral?: boolean; lan?: Verdict; mesh?: Verdict }
@@ -37,6 +37,8 @@ export interface ScanSettings { enabled: boolean; weekday: number; hour: number 
 export interface SecurityState {
   settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null;
   lastError?: string; lastFailure?: number; latest: Report | null;
+  /** The finding ids switched out of the score. */
+  ignored: string[];
   /** Whether a scan can run here (helper v13 on Linux), and the helper as the backend sees it. */
   available: boolean; helper: HelperState;
   /** The service manager the helper is installed for (lib/admin.ts helperInstallCommand). */
@@ -44,7 +46,7 @@ export interface SecurityState {
 }
 /** The helper as the backend sees it; `security`: a v13+ helper can scan on this system (python3 and ss present). */
 export type HelperState = Pick<HelperInfo, 'version' | 'available' | 'error'> & { security?: boolean };
-export interface HistoryPoint { score: number; grade: Grade; scannedAt: number; counts: Record<Severity, number>; categories: Report['categories'] }
+export interface HistoryPoint { score: number; grade: Grade; scannedAt: number; counts: Record<Severity, number>; ignored: number; categories: Report['categories'] }
 
 /** The helper version with the security scan (server/admin.ts). */
 export const SECURITY_HELPER_VERSION = 13;
@@ -54,6 +56,8 @@ export const securityApi = {
   history: () => api.get<{ history: HistoryPoint[] }>('/api/admin/security/history'),
   scan: () => api.post<SecurityState>('/api/admin/security/scan'),
   saveSettings: (s: ScanSettings) => api.post<SecurityState>('/api/admin/security/settings', s),
+  /** Switch a finding out of the score (ignored) or back in. */
+  ignore: (id: string, ignored: boolean) => api.post<SecurityState>('/api/admin/security/ignore', { id, ignored }),
 };
 
 export const severityTone = (s: Severity) => (s === 'critical' ? 'crit' : s === 'high' ? 'serious' : s === 'medium' ? 'warn' : s === 'low' ? 'accent' : 'neutral') as 'crit' | 'serious' | 'warn' | 'accent' | 'neutral';

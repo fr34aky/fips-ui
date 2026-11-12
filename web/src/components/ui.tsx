@@ -108,6 +108,11 @@ export function Segmented<T extends string>({ value, onChange, options }: { valu
   return <div className="seg">{options.map((o) => <button key={o.value} className={o.value === value ? 'on' : ''} onClick={() => onChange(o.value)}>{o.label}</button>)}</div>;
 }
 
+/** An on/off switch: a button with the switch role, so a screen reader says its state. */
+export function Switch({ on, onChange, disabled = false, label }: { on: boolean; onChange: (on: boolean) => void; disabled?: boolean; label?: string }) {
+  return <button type="button" role="switch" aria-checked={on} aria-label={label} title={label} className={`switch ${on ? 'on' : ''}`} disabled={disabled} onClick={() => onChange(!on)}><span className="switch-knob" /></button>;
+}
+
 export function Modal({ open, onClose, title, children, width = 'max-w-lg' }: { open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; width?: string }) {
   useEffect(() => {
     if (!open) return;

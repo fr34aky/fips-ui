@@ -168,6 +168,13 @@ label.field { display: grid; gap: 6px; font-size: 12px; color: var(--text-2); fo
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.25); }
 :root[data-theme="light"] .seg button.on { box-shadow: 0 1px 2px rgba(11,18,32,0.12); }
 
+.switch { position: relative; flex: none; width: 34px; height: 20px; padding: 0; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface-3); cursor: pointer; transition: background 120ms, border-color 120ms; }
+.switch.on { background: var(--accent); border-color: transparent; }
+.switch:disabled { opacity: 0.5; cursor: not-allowed; }
+.switch:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.switch-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); opacity: 0.8; box-shadow: 0 1px 2px rgba(0,0,0,0.3); transition: transform 120ms; }
+.switch.on .switch-knob { transform: translateX(14px); background: var(--accent-ink); opacity: 1; }
+
 table.data { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
 table.data th { text-align: left; font-weight: 600; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; position: sticky; top: 0; background: var(--surface); z-index: 1; }
 table.data td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }

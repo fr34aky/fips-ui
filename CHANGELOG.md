@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Security page: a switch per finding leaves it out of the score, e.g. a port
+  that is open on purpose; it stays listed under **Ignored** and counts again
+  when switched on. The switch applies to the whole history, so the trend stays
+  comparable, and to the grade the Node manager shows. The ignored ids are kept
+  with the scan schedule (`POST /api/admin/security/ignore`).
+
 ## [0.14.2] - 2026-11-05
 
 ### Fixed
