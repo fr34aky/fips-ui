@@ -109,6 +109,6 @@ GET  /api/admin/security              schedule, running, next run, the latest re
 GET  /api/admin/security/history      score, grade and counts of the kept reports
 GET  /api/admin/security/summary      the latest score and counts (the Node manager reads this)
 POST /api/admin/security/scan         start a scan (202); poll GET until running is false
-POST /api/admin/security/settings     {enabled, every ('day' | 'week'), weekday (0 = Sunday … 6), hour (0-23)}
+POST /api/admin/security/settings     {enabled, every ('day' | 'week'; absent: 'week'), weekday (0 = Sunday … 6), hour (0-23)}
 POST /api/admin/security/ignore       {id, ignored}: leave a finding out of the score (true) or count it again
 ```

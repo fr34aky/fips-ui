@@ -374,7 +374,7 @@ function securityUnavailable(h: HelperInfo): string {
   return `the security scan needs helper v${SECURITY_HELPER_VERSION} (installed: ${h.available && h.version ? `v${h.version}` : 'none'}); run ${install} in the fips-ui directory`;
 }
 
-// The weekly security scan (server/security.ts) through the helper's read-only security-scan. It changes nothing
+// The security scan (server/security.ts) through the helper's read-only security-scan. It changes nothing
 // on the node, so it runs in read-only mode too; starting one by hand and the schedule are changes.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 const security = new SecurityScanner({

@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The security scan runs daily by default, at 03:00; the schedule offers
   **Daily** at an hour or **Weekly** on a weekday. A schedule saved by an
-  earlier version stays weekly.
+  earlier version stays weekly; a node that never saved one scans daily from
+  now on.
 
 ## [0.14.2] - 2026-11-05
 

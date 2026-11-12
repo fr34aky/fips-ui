@@ -1,5 +1,5 @@
 // The security scan (server/security.ts): parsers against tool output, the firewall's input path, scoring, the
-// weekly schedule and the scanner with a fake helper.
+// daily or weekly schedule and the scanner with a fake helper.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';

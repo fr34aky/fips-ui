@@ -108,9 +108,11 @@ function SeverityCounts({ report }: { report: Report }) {
   return <span className="flex gap-1.5 flex-wrap text-base">{shown.map((s) => <Chip key={s} tone={severityTone(s)} dot={false}>{counts[s]} {s}</Chip>)}</span>;
 }
 
-function ScheduleCard({ settings, running, startedAt, nextRun, available, readOnly, onScan, onSaved }: { settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null; available: boolean; readOnly: boolean; onScan: () => void; onSaved: () => void }) {
+function ScheduleCard({ settings: saved, running, startedAt, nextRun, available, readOnly, onScan, onSaved }: { settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null; available: boolean; readOnly: boolean; onScan: () => void; onSaved: () => void }) {
   const toast = useToast();
   const now = useNow(1000);
+  // A managed node on a fips-ui before 0.15 answers without `every`: it scans weekly.
+  const settings = useMemo(() => ({ ...saved, every: saved.every ?? 'week' }), [saved]);
   const [draft, setDraft] = useState(settings);
   const [busy, setBusy] = useState(false);
   useEffect(() => setDraft(settings), [settings.enabled, settings.every, settings.weekday, settings.hour]); // eslint-disable-line react-hooks/exhaustive-deps
