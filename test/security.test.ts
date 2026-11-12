@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   analyse, firewallModel, firewalldModel, judgeListeners, nextRun, nftModel, parseAptUpgrade, parseArchAudit, parseCheckupdates, parseDebsecan, parseDnfUpdateinfo,
-  parseDnfUpdates, parseSs, parseZypperPatches, parseZypperUpdates, rebootState, score, SecurityScanner, ufwModel, validateSettings,
+  applyIgnores, parseDnfUpdates, parseSs, parseZypperPatches, parseZypperUpdates, rebootState, score, SecurityScanner, ufwModel, validateSettings,
   type Finding, type RawScan, type RawSection,
 } from '../server/security.ts';
 
@@ -314,6 +314,39 @@ test('SecurityScanner: scan, keep the newest reports, settings, failures', async
   await again.start(); again.stop();
   assert.deepEqual(again.status().settings, { enabled: false, weekday: 2, hour: 4 });
   assert.equal(again.history().length, 12);
+});
+
+test('ignored findings: out of the score and the counts, kept in the report, persisted with the schedule', async () => {
+  const f = (category: Finding['category'], severity: Finding['severity'], ignored = false): Finding => ({ id: `${category}-${severity}`, category, severity, title: '', ...(ignored ? { ignored } : {}) });
+  assert.equal(score([f('patches', 'high'), f('hardening', 'critical', true)]).score, 90);
+  assert.equal(score([f('hardening', 'critical', true)]).categories.hardening.findings, 0);
+
+  const dir = mkdtempSync(join(tmpdir(), 'fips-ui-security-'));
+  let t = 1_800_000_000_000;
+  const deps = { file: join(dir, 'security.json'), now: () => t, available: async () => true, context: async () => ({ fipsFirewallActive: false }), run: async () => ({ ...scan({}), finished: Math.floor(t / 1000) }) };
+  const sc = new SecurityScanner(deps);
+  await sc.start(); sc.stop();
+  await sc.scan();
+  assert.equal(sc.status().latest!.score, 95);
+  assert.equal(sc.status().latest!.findings.find((x) => x.id === 'fips-firewall-off')!.ignored, undefined);
+  await sc.setIgnored('fips-firewall-off', true);
+  const r = sc.status().latest!;
+  assert.equal(r.score, 100);
+  assert.equal(r.findings.find((x) => x.id === 'fips-firewall-off')!.ignored, true);
+  assert.deepEqual([sc.summary()!.counts.medium, sc.summary()!.ignored], [0, 1]);
+  assert.equal(sc.history()[0].score, 100); // the stored report is unchanged; the whole history is shown without it
+  assert.deepEqual(sc.status().ignored, ['fips-firewall-off']);
+  await assert.rejects(sc.setIgnored('', true), /finding id/);
+  // Stays with the schedule, survives a restart, and a new scan is scored without it until switched back on.
+  await sc.saveSettings({ enabled: true, weekday: 1, hour: 2 });
+  const again = new SecurityScanner(deps);
+  await again.start(); again.stop();
+  assert.deepEqual([again.status().ignored, again.status().settings.weekday], [['fips-firewall-off'], 1]);
+  t += 1000; await again.scan();
+  assert.equal(again.status().latest!.score, 100);
+  await again.setIgnored('fips-firewall-off', false);
+  assert.equal(again.status().latest!.score, 95);
+  assert.equal(applyIgnores(again.status().latest!, new Set(['fips-firewall-off'])).score, 100);
 });
 
 function ok(out: string): RawSection { return { code: 0, out }; }

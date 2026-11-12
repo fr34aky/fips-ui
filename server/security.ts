@@ -18,7 +18,11 @@ export const CATEGORY_CAP: Record<Category, number> = { exposure: 30, firewall: 
 /** A critical finding keeps the score below this, whatever else is fine. */
 export const CRITICAL_CEILING = 59;
 
-export interface Finding { id: string; category: Category; severity: Severity; title: string; detail?: string; fix?: string }
+export interface Finding {
+  id: string; category: Category; severity: Severity; title: string; detail?: string; fix?: string;
+  /** Switched out of the score on the Security page (SecurityScanner.setIgnored); set when a report is shown, never stored. */
+  ignored?: boolean;
+}
 
 /** The raw helper answer. */
 export interface RawSection { code: number; out: string }
@@ -813,12 +817,13 @@ export function gradeOf(score: number): Report['grade'] { return score >= 90 ? '
 export function score(findings: Finding[]): Pick<Report, 'score' | 'grade' | 'categories'> {
   const categories = Object.fromEntries(CATEGORIES.map((c) => [c, { deducted: 0, findings: 0 }])) as Report['categories'];
   for (const f of findings) {
+    if (f.ignored) continue;
     const c = categories[f.category];
     c.findings++;
     c.deducted = Math.min(CATEGORY_CAP[f.category], c.deducted + DEDUCTION[f.severity]);
   }
   let s = 100 - CATEGORIES.reduce((n, c) => n + categories[c].deducted, 0);
-  if (findings.some((f) => f.severity === 'critical')) s = Math.min(s, CRITICAL_CEILING);
+  if (findings.some((f) => f.severity === 'critical' && !f.ignored)) s = Math.min(s, CRITICAL_CEILING);
   s = Math.max(0, s);
   return { score: s, grade: gradeOf(s), categories };
 }
@@ -852,12 +857,23 @@ export function analyse(raw: RawScan, ctx: Context = {}, now = Date.now()): Repo
   };
 }
 
-/** What the Node manager shows for a node. */
-export interface Summary { score: number; grade: Report['grade']; scannedAt: number; counts: Record<Severity, number> }
+/**
+ * A stored report as the page shows it: the findings the admin switched off marked `ignored` and the score, grade
+ * and category deductions recomputed without them. Reports are stored as analysed, so a toggle applies to the
+ * whole history and the trend stays comparable.
+ */
+export function applyIgnores(r: Report, ignored: ReadonlySet<string>): Report {
+  const findings = r.findings.map(({ ignored: _, ...f }) => (ignored.has(f.id) ? { ...f, ignored: true } : f));
+  return { ...r, findings, ...score(findings) };
+}
+
+/** What the Node manager shows for a node. Ignored findings are not counted; `ignored` says how many there are. */
+export interface Summary { score: number; grade: Report['grade']; scannedAt: number; counts: Record<Severity, number>; ignored: number }
 export function summarise(r: Report): Summary {
   const counts = Object.fromEntries(SEVERITIES.map((s) => [s, 0])) as Record<Severity, number>;
-  for (const f of r.findings) counts[f.severity]++;
-  return { score: r.score, grade: r.grade, scannedAt: r.scannedAt, counts };
+  let ignored = 0;
+  for (const f of r.findings) { if (f.ignored) ignored++; else counts[f.severity]++; }
+  return { score: r.score, grade: r.grade, scannedAt: r.scannedAt, counts, ignored };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -873,6 +889,11 @@ export interface ScanSettings { enabled: boolean; /** 0 = Sunday */ weekday: num
 export const DEFAULT_SETTINGS: ScanSettings = { enabled: true, weekday: 0, hour: 3 };
 
 export class SettingsError extends Error {}
+/** A finding id as the page sends it back: what analyse() gave it, nothing longer. */
+export function validateFindingId(id: unknown): string {
+  if (typeof id !== 'string' || !id || id.length > 300) throw new SettingsError('id must be a finding id');
+  return id;
+}
 export function validateSettings(input: unknown): ScanSettings {
   const x = (input ?? {}) as Partial<ScanSettings>;
   if (typeof x.enabled !== 'boolean') throw new SettingsError('enabled must be true or false');
@@ -920,10 +941,13 @@ export interface ScannerDeps {
 export interface ScannerStatus {
   settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null;
   lastError?: string; lastFailure?: number; latest: Report | null;
+  /** The finding ids switched out of the score, also those not in the latest report (a finding that returns stays ignored). */
+  ignored: string[];
 }
 
 export class SecurityScanner {
   private settings: ScanSettings = { ...DEFAULT_SETTINGS };
+  private ignored = new Set<string>();
   private reports: Report[] = [];
   private running: Promise<void> | null = null;
   private startedAt?: number;
@@ -945,8 +969,11 @@ export class SecurityScanner {
   }
 
   async start(): Promise<void> {
-    try { this.settings = validateSettings(JSON.parse(await readFile(this.file, 'utf8'))); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.lastError = `cannot load ${this.file}: ${(e as Error).message}`; }
+    try {
+      const saved = JSON.parse(await readFile(this.file, 'utf8')) as { ignored?: unknown };
+      this.settings = validateSettings(saved);
+      this.ignored = new Set(Array.isArray(saved.ignored) ? saved.ignored.filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 300) : []);
+    } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') this.lastError = `cannot load ${this.file}: ${(e as Error).message}`; }
     await this.loadReports();
     this.bootedAt = this.now();
     this.timer = setInterval(() => void this.tick(), 60_000);
@@ -965,7 +992,7 @@ export class SecurityScanner {
     this.reports = loaded.filter((r) => typeof r?.scannedAt === 'number').sort((a, b) => a.scannedAt - b.scannedAt).slice(-KEEP_REPORTS);
   }
 
-  private get latest(): Report | null { return this.reports.at(-1) ?? null; }
+  private get latest(): Report | null { const r = this.reports.at(-1); return r ? applyIgnores(r, this.ignored) : null; }
   private due(): number | null { return nextRun(this.settings, this.latest?.scannedAt ?? this.bootedAt, this.now(), this.lastFailure); }
 
   /** Called once a minute: scan when due. */
@@ -981,10 +1008,11 @@ export class SecurityScanner {
       settings: this.settings, running: !!this.running, ...(this.startedAt && this.running ? { startedAt: this.startedAt } : {}),
       nextRun: this.due(),
       ...(this.lastError ? { lastError: this.lastError, lastFailure: this.lastFailure } : {}), latest: this.latest,
+      ignored: [...this.ignored].sort(),
     };
   }
 
-  history(): (Summary & { categories: Report['categories'] })[] { return this.reports.map((r) => ({ ...summarise(r), categories: r.categories })); }
+  history(): (Summary & { categories: Report['categories'] })[] { return this.reports.map((x) => { const r = applyIgnores(x, this.ignored); return { ...summarise(r), categories: r.categories }; }); }
 
   summary(): Summary | null { const r = this.latest; return r ? summarise(r) : null; }
 
@@ -1019,11 +1047,26 @@ export class SecurityScanner {
 
   async saveSettings(input: unknown): Promise<ScannerStatus> {
     const s = validateSettings(input);
-    await mkdir(dirname(this.file), { recursive: true, mode: 0o700 });
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    try { await writeFile(tmp, JSON.stringify(s, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, this.file); }
-    catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${this.file}: ${(e as Error).message}`); }
+    await this.persist(s, this.ignored);
     this.settings = s;
     return this.status();
+  }
+
+  /** Switch a finding out of the score (or back in). The id stays on the list while ignored, whether or not a scan still reports it. */
+  async setIgnored(id: unknown, ignored: boolean): Promise<ScannerStatus> {
+    const fid = validateFindingId(id);
+    const next = new Set(this.ignored);
+    if (ignored) next.add(fid); else next.delete(fid);
+    await this.persist(this.settings, next);
+    this.ignored = next;
+    return this.status();
+  }
+
+  /** The settings file: the schedule and the ignored finding ids, written whole. */
+  private async persist(s: ScanSettings, ignored: ReadonlySet<string>): Promise<void> {
+    await mkdir(dirname(this.file), { recursive: true, mode: 0o700 });
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    try { await writeFile(tmp, JSON.stringify({ ...s, ignored: [...ignored].sort() }, null, 2) + '\n', { mode: 0o600 }); await rename(tmp, this.file); }
+    catch (e) { await unlink(tmp).catch(() => {}); throw new Error(`cannot write ${this.file}: ${(e as Error).message}`); }
   }
 }

@@ -79,6 +79,14 @@ at most its cap, so one noisy area cannot hide the others. Any critical finding 
 
 Grades: A from 90, B from 80, C from 70, D from 60, F below.
 
+### Leaving a finding out
+
+Each finding in the table has a switch. Switching it off leaves the finding out of the score, the category
+deductions and the counts the Node manager shows, e.g. a port that is open on purpose or a setting the machine
+needs; it stays listed under **Ignored** and comes back when switched on again. The switch applies to the whole
+history, so the trend stays comparable, and a finding that keeps coming back in later scans stays ignored until it
+is switched on. The ignored ids are kept with the schedule (below).
+
 Where the firewall cannot be read, open ports cost points only for services that should never face a network; the
 page lists what the scan could not cover.
 
@@ -88,8 +96,9 @@ Scans run weekly at a chosen weekday and hour (default Sunday 03:00, local time)
 while fips-ui was down runs when it is back; after a failed scan it is tried again an hour later. A scan takes from
 seconds to a few minutes, mostly the package manager's metadata.
 
-The schedule is kept in `FIPS_UI_SECURITY_FILE` (default `~/.config/fips-ui/security.json`), the newest 12 reports
-in `security/` next to it, all mode 0600. `FIPS_UI_READ_ONLY=1` keeps the scheduled scans but refuses
+The schedule and the ignored finding ids are kept in `FIPS_UI_SECURITY_FILE` (default
+`~/.config/fips-ui/security.json`), the newest 12 reports in `security/` next to it, all mode 0600. Reports are
+stored as scanned; the ignored findings are taken out when a report is shown. `FIPS_UI_READ_ONLY=1` keeps the scheduled scans but refuses
 **Scan now** and schedule changes.
 
 ## API
@@ -100,4 +109,5 @@ GET  /api/admin/security/history      score, grade and counts of the kept report
 GET  /api/admin/security/summary      the latest score and counts (the Node manager reads this)
 POST /api/admin/security/scan         start a scan (202); poll GET until running is false
 POST /api/admin/security/settings     {enabled, weekday (0 = Sunday … 6), hour (0-23)}
+POST /api/admin/security/ignore       {id, ignored}: leave a finding out of the score (true) or count it again
 ```
