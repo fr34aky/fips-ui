@@ -1,4 +1,4 @@
-// Client for the weekly security scan (server/security.ts): the report, its history and the schedule. Always the
+// Client for the security scan (server/security.ts): the report, its history and the schedule. Always the
 // node the page looks at (a managed node's scan is reached through this node's proxy).
 import { api } from './api';
 import type { HelperInfo } from './admin';
@@ -33,7 +33,7 @@ export interface Report {
   notes: string[];
 }
 export type Grade = 'A' | 'B' | 'C' | 'D' | 'F';
-export interface ScanSettings { enabled: boolean; weekday: number; hour: number }
+export interface ScanSettings { enabled: boolean; /** each day at `hour`, or each week on `weekday` at `hour` */ every: 'day' | 'week'; weekday: number; hour: number }
 export interface SecurityState {
   settings: ScanSettings; running: boolean; startedAt?: number; nextRun: number | null;
   lastError?: string; lastFailure?: number; latest: Report | null;

@@ -1,4 +1,4 @@
-// The weekly security scan: the privileged helper's `security-scan` gathers raw output of a fixed set of read-only
+// The security scan (daily by default): the privileged helper's `security-scan` gathers raw output of a fixed set of read-only
 // commands (scripts/fips-ui-helper), and everything here turns it into a report: listeners and whether the host
 // firewall lets them through, pending and security updates, known vulnerabilities from the distribution's own
 // tools, reboot needs and a few hardening checks, scored 0-100 (docs/security-scan.md). Parsing and scoring are pure
@@ -877,7 +877,7 @@ export function summarise(r: Report): Summary {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The scanner: weekly schedule, one scan at a time, the newest reports kept
+// The scanner: daily or weekly schedule, one scan at a time, the newest reports kept
 // ---------------------------------------------------------------------------------------------
 
 const FILE = process.env.FIPS_UI_SECURITY_FILE ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'fips-ui', 'security.json');
@@ -885,8 +885,9 @@ const KEEP_REPORTS = 12;
 /** After a scan that could not run, the next automatic attempt waits this long. */
 const RETRY_MS = 60 * 60_000;
 
-export interface ScanSettings { enabled: boolean; /** 0 = Sunday */ weekday: number; hour: number }
-export const DEFAULT_SETTINGS: ScanSettings = { enabled: true, weekday: 0, hour: 3 };
+/** `every`: a scan each day at `hour`, or each week on `weekday` at `hour`. Absent in settings saved before 0.15: weekly. */
+export interface ScanSettings { enabled: boolean; every: 'day' | 'week'; /** 0 = Sunday */ weekday: number; hour: number }
+export const DEFAULT_SETTINGS: ScanSettings = { enabled: true, every: 'day', weekday: 0, hour: 3 };
 
 export class SettingsError extends Error {}
 /** A finding id as the page sends it back: what analyse() gave it, nothing longer. */
@@ -897,30 +898,34 @@ export function validateFindingId(id: unknown): string {
 export function validateSettings(input: unknown): ScanSettings {
   const x = (input ?? {}) as Partial<ScanSettings>;
   if (typeof x.enabled !== 'boolean') throw new SettingsError('enabled must be true or false');
+  if (x.every !== undefined && x.every !== 'day' && x.every !== 'week') throw new SettingsError("every must be 'day' or 'week'");
   if (!Number.isInteger(x.weekday) || x.weekday! < 0 || x.weekday! > 6) throw new SettingsError('weekday must be 0 (Sunday) to 6');
   if (!Number.isInteger(x.hour) || x.hour! < 0 || x.hour! > 23) throw new SettingsError('hour must be 0 to 23');
-  return { enabled: x.enabled, weekday: x.weekday!, hour: x.hour! };
+  return { enabled: x.enabled, every: x.every ?? 'week', weekday: x.weekday!, hour: x.hour! };
 }
+
+/** Days between two slots. */
+const periodDays = (s: ScanSettings) => (s.every === 'day' ? 1 : 7);
 
 /** The latest scheduled slot at or before `now`, in local time. */
 function lastSlot(s: ScanSettings, now: number): number {
   const d = new Date(now);
   d.setHours(s.hour, 0, 0, 0);
-  d.setDate(d.getDate() - ((d.getDay() - s.weekday + 7) % 7));
-  if (d.getTime() > now) d.setDate(d.getDate() - 7);
+  if (s.every === 'week') d.setDate(d.getDate() - ((d.getDay() - s.weekday + 7) % 7));
+  if (d.getTime() > now) d.setDate(d.getDate() - periodDays(s));
   return d.getTime();
 }
 
 /**
- * When the next automatic scan is due: at the weekly slot, or at once when a slot passed since `since` (the last
+ * When the next automatic scan is due: at the daily or weekly slot, or at once when a slot passed since `since` (the last
  * scan, or when the scanner started on a node never scanned) without a scan, e.g. while fips-ui was down. After a
  * failed attempt at a slot, it is tried again an hour later.
  */
 export function nextRun(s: ScanSettings, since: number, now: number, lastFailure?: number): number | null {
   if (!s.enabled) return null;
   const slot = lastSlot(s, now);
-  // A week later on the calendar: the same local hour across a daylight-saving change.
-  const d = new Date(slot); d.setDate(d.getDate() + 7);
+  // A day or a week later on the calendar: the same local hour across a daylight-saving change.
+  const d = new Date(slot); d.setDate(d.getDate() + periodDays(s));
   const following = d.getTime();
   if (since >= slot) return following;
   if (lastFailure !== undefined && lastFailure >= slot) return Math.min(following, lastFailure + RETRY_MS);

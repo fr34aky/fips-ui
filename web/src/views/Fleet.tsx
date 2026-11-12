@@ -64,7 +64,7 @@ function Nodes({ data, own, onChanged, busy }: { data: FleetData; own?: string; 
     <div className="grid gap-3 pb-4">
       <div className="hidden md:block overflow-x-auto">
         <table className="data">
-          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="The node's latest weekly security scan">Security</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th><th /></tr></thead>
+          <thead><tr><th>Node</th><th>Status</th><th>Daemon</th><th>fips-ui</th><th>Uptime</th><th>Peers</th><th>Helper</th><th title="The node's latest security scan">Security</th><th title="Whether every manager (this node and the standbys) is an admin on that node">Managers</th><th /></tr></thead>
           <tbody>
             {data.nodes.map((n) => (
               <tr key={n.npub}>

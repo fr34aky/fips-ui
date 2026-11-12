@@ -273,7 +273,7 @@ test('analyse: the report from a whole scan', () => {
 });
 
 test('nextRun: weekly slot, missed slots, failures, disabled', () => {
-  const s = { enabled: true, weekday: 0, hour: 3 };
+  const s = { enabled: true, every: 'week' as const, weekday: 0, hour: 3 };
   const sunday3 = new Date(2026, 9, 25, 3, 0, 0).getTime(); // Sunday 25 Oct 2026, 03:00 local
   const wed = new Date(2026, 9, 28, 12, 0, 0).getTime();
   // Scanned at the last slot: next Sunday.
@@ -286,6 +286,14 @@ test('nextRun: weekly slot, missed slots, failures, disabled', () => {
   // Across a daylight-saving change the next scan keeps its local hour.
   const next = new Date(nextRun({ ...s, weekday: 3, hour: 2 }, wed, wed)!);
   assert.deepEqual([next.getDay(), next.getHours(), next.getMinutes()], [3, 2, 0]);
+  // Daily: the slot is today's hour, or yesterday's when it has not come yet; a saved schedule without `every` is weekly.
+  const daily = { ...s, every: 'day' as const };
+  assert.equal(nextRun(daily, wed - 10 * 3600_000, wed), new Date(2026, 9, 28, 3).getTime()); // last scan 02:00: today's 03:00 was missed
+  assert.equal(nextRun(daily, wed, wed), new Date(2026, 9, 29, 3).getTime());
+  assert.equal(nextRun(daily, wed, new Date(2026, 9, 29, 1).getTime()), new Date(2026, 9, 29, 3).getTime());
+  assert.equal(validateSettings({ enabled: true, weekday: 0, hour: 3 }).every, 'week');
+  assert.equal(validateSettings({ enabled: true, every: 'day', weekday: 0, hour: 3 }).every, 'day');
+  assert.throws(() => validateSettings({ enabled: true, every: 'month', weekday: 0, hour: 3 }), /every/);
   assert.throws(() => validateSettings({ enabled: true, weekday: 7, hour: 3 }), /weekday/);
   assert.throws(() => validateSettings({ enabled: 'yes', weekday: 0, hour: 3 }), /enabled/);
 });
@@ -309,10 +317,10 @@ test('SecurityScanner: scan, keep the newest reports, settings, failures', async
   await sc.scan();
   assert.match(sc.status().lastError!, /no security-scan/);
   assert.equal(sc.history().length, 12);
-  await sc.saveSettings({ enabled: false, weekday: 2, hour: 4 });
+  await sc.saveSettings({ enabled: false, every: 'week', weekday: 2, hour: 4 });
   const again = new SecurityScanner({ file: join(dir, 'security.json'), now: () => t, available: async () => true, context: async () => ({}), run: async () => scan({}) });
   await again.start(); again.stop();
-  assert.deepEqual(again.status().settings, { enabled: false, weekday: 2, hour: 4 });
+  assert.deepEqual(again.status().settings, { enabled: false, every: 'week', weekday: 2, hour: 4 });
   assert.equal(again.history().length, 12);
 });
 

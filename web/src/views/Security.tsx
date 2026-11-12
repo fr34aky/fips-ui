@@ -41,7 +41,7 @@ export function Security({ readOnly }: { readOnly: boolean }) {
   return (
     <div className="grid gap-4 fade-in">
       <p className="text-ink-2 text-sm max-w-3xl">
-        Once a week the privileged helper runs a fixed set of read-only checks on this machine: what listens and whether the host firewall lets it through,
+        Every day (or week, as scheduled) the privileged helper runs a fixed set of read-only checks on this machine: what listens and whether the host firewall lets it through,
         pending and security updates and known vulnerabilities from the distribution's own tools, reboots that updates are waiting for, and a few hardening settings.
         Nothing is changed and nothing leaves the node; the score is explained in <a className="underline" href="https://github.com/fr34aky/fips-ui/blob/main/docs/security-scan.md" target="_blank" rel="noreferrer">docs/security-scan.md</a>.
       </p>
@@ -113,8 +113,8 @@ function ScheduleCard({ settings, running, startedAt, nextRun, available, readOn
   const now = useNow(1000);
   const [draft, setDraft] = useState(settings);
   const [busy, setBusy] = useState(false);
-  useEffect(() => setDraft(settings), [settings.enabled, settings.weekday, settings.hour]); // eslint-disable-line react-hooks/exhaustive-deps
-  const dirty = draft.enabled !== settings.enabled || draft.weekday !== settings.weekday || draft.hour !== settings.hour;
+  useEffect(() => setDraft(settings), [settings.enabled, settings.every, settings.weekday, settings.hour]); // eslint-disable-line react-hooks/exhaustive-deps
+  const dirty = draft.enabled !== settings.enabled || draft.every !== settings.every || draft.weekday !== settings.weekday || draft.hour !== settings.hour;
   const save = async () => {
     setBusy(true);
     try { await securityApi.saveSettings(draft); toast('ok', 'Schedule saved'); onSaved(); }
@@ -125,10 +125,10 @@ function ScheduleCard({ settings, running, startedAt, nextRun, available, readOn
     <Card title="Schedule" actions={!readOnly && <button className="btn primary sm" disabled={running || !available} onClick={onScan} title={available ? 'Run the checks now' : 'The scan cannot run here yet: see the note above'}>{running ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}{running ? 'Scanning…' : 'Scan now'}</button>}>
       <div className="grid gap-3 text-sm">
         {running && <div className="text-ink-2 pulse">Scanning since {startedAt ? fmtDuration(Math.round((now - startedAt) / 1000)) : 'now'}…</div>}
-        <Segmented value={draft.enabled ? 'on' : 'off'} onChange={(v) => setDraft({ ...draft, enabled: v === 'on' })} options={[{ value: 'on', label: 'Weekly' }, { value: 'off', label: 'Off' }]} />
+        <Segmented value={draft.enabled ? draft.every : 'off'} onChange={(v) => setDraft(v === 'off' ? { ...draft, enabled: false } : { ...draft, enabled: true, every: v })} options={[{ value: 'day', label: 'Daily' }, { value: 'week', label: 'Weekly' }, { value: 'off', label: 'Off' }]} />
         <div className="flex gap-2 items-center flex-wrap">
-          <select className="input w-auto" disabled={!draft.enabled || readOnly} value={draft.weekday} onChange={(e) => setDraft({ ...draft, weekday: Number(e.target.value) })}>{WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}</select>
-          <span className="text-ink-3">at</span>
+          {draft.every === 'week' && <select className="input w-auto" disabled={!draft.enabled || readOnly} value={draft.weekday} onChange={(e) => setDraft({ ...draft, weekday: Number(e.target.value) })}>{WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}</select>}
+          <span className="text-ink-3">{draft.every === 'week' ? 'at' : 'every day at'}</span>
           <select className="input w-auto" disabled={!draft.enabled || readOnly} value={draft.hour} onChange={(e) => setDraft({ ...draft, hour: Number(e.target.value) })}>{Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>)}</select>
         </div>
         <div className="text-xs text-ink-3">{nextRun === null ? 'Automatic scans are off.' : nextRun <= now ? 'A scheduled scan is due now.' : `Next scan ${fmtSlot(nextRun)}. A scan missed while fips-ui was down runs when it is back.`}</div>

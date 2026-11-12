@@ -21,7 +21,7 @@ export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[]
   { id: 'pubdom', label: 'Public domains', icon: <Globe size={17} />, hint: 'Domains served over fips, and the resolver for them' },
   { id: 'config', label: 'Configuration', icon: <FileCog size={17} />, hint: 'Edit fips.yaml with automatic rollback' },
   { id: 'firewall', label: 'Firewall', icon: <BrickWall size={17} />, hint: 'fips0 firewall service and inbound rules' },
-  { id: 'security', label: 'Security', icon: <ScanSearch size={17} />, hint: 'Weekly host scan: open ports, firewall, patches, vulnerabilities' },
+  { id: 'security', label: 'Security', icon: <ScanSearch size={17} />, hint: 'Daily host scan: open ports, firewall, patches, vulnerabilities' },
   { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={17} />, hint: 'Install a release or build master' },
   { id: 'fleet', label: 'Node manager', icon: <Server size={17} />, hint: 'Other fips nodes managed from this one' },
 ];
