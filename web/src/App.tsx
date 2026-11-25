@@ -19,6 +19,7 @@ import { Upgrade } from './views/Upgrade';
 const Config = lazy(() => import('./views/Config'));
 import { Firewall } from './views/Firewall';
 import { PublicDomains } from './views/PublicDomains';
+import { ExitNode } from './views/ExitNode';
 import { Fleet } from './views/Fleet';
 import { Security } from './views/Security';
 import { shortKey } from './lib/format';
@@ -83,7 +84,7 @@ function App({ route }: { route: AppRoute }) {
   const pd = health?.pubdom;
   // The Node manager is this node's page: never offered while a managed node's pages are shown.
   // The Security page exists on Linux nodes for admins; without helper v13 it says how to install it.
-  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const]), ...(health?.security ? [] : ['security' as const])];
+  const hidden: ViewId[] = [...((pd && (pd.resolver.installed || pd.server.installed)) || health?.nodeManagement ? [] : ['pubdom' as const]), ...(health?.fleet && !nodeNpub ? [] : ['fleet' as const]), ...(health?.security ? [] : ['security' as const]), ...(health?.exit?.installed ? [] : ['exit' as const])];
 
   let body: React.ReactNode;
   if (viewer && ADMIN_VIEWS.includes(route.view)) {
@@ -114,6 +115,7 @@ function App({ route }: { route: AppRoute }) {
       case 'access': body = <Access snap={snap} onProbe={probe} readOnly={!!health?.readOnly} prefillNpub={route.params.get('name')} />; break;
       case 'gateway': body = <Gateway snap={snap} />; break;
       case 'pubdom': body = <PublicDomains health={health} />; break;
+      case 'exit': body = <ExitNode readOnly={!!health?.readOnly} />; break;
       case 'upgrade': body = <Upgrade />; break;
       case 'fleet': body = <Fleet snap={snap} />; break;
       case 'security': body = <Security readOnly={!!health?.readOnly} />; break;

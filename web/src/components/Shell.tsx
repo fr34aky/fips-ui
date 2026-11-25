@@ -1,11 +1,11 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe, Server, ArrowLeft, ScanSearch } from 'lucide-react';
+import { Activity, Users, Network, GitBranch, LineChart, Cpu, ScrollText, Stethoscope, ShieldCheck, Router, ArrowUpCircle, FileCog, BrickWall, Sun, Moon, Menu, X, Wifi, WifiOff, Globe, Server, ArrowLeft, ScanSearch, DoorOpen } from 'lucide-react';
 import type { ConnState } from '../lib/api';
 import { hashFor } from '../lib/route';
 import { isAdmin, type Principal } from '../lib/types';
 import { useUiUpdate } from '../lib/uiUpdate';
 
-export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'pubdom' | 'upgrade' | 'config' | 'firewall' | 'security' | 'fleet';
+export type ViewId = 'overview' | 'peers' | 'topology' | 'metrics' | 'network' | 'internals' | 'logs' | 'diagnostics' | 'access' | 'gateway' | 'exit' | 'pubdom' | 'upgrade' | 'config' | 'firewall' | 'security' | 'fleet';
 
 export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[] = [
   { id: 'overview', label: 'Overview', icon: <Activity size={17} />, hint: 'Node status at a glance' },
@@ -18,6 +18,7 @@ export const NAV: { id: ViewId; label: string; icon: ReactNode; hint: string }[]
   { id: 'diagnostics', label: 'Diagnostics', icon: <Stethoscope size={17} />, hint: 'Probe reachability of a node' },
   { id: 'access', label: 'Access', icon: <ShieldCheck size={17} />, hint: 'ACL, firewall exposure, hosts' },
   { id: 'gateway', label: 'Gateway', icon: <Router size={17} />, hint: 'LAN gateway pool and mappings' },
+  { id: 'exit', label: 'Exit node', icon: <DoorOpen size={17} />, hint: 'Mesh clients that send their internet traffic through this node' },
   { id: 'pubdom', label: 'Public domains', icon: <Globe size={17} />, hint: 'Domains served over fips, and the resolver for them' },
   { id: 'config', label: 'Configuration', icon: <FileCog size={17} />, hint: 'Edit fips.yaml with automatic rollback' },
   { id: 'firewall', label: 'Firewall', icon: <BrickWall size={17} />, hint: 'fips0 firewall service and inbound rules' },

@@ -11,6 +11,11 @@ export const PUBDOM_HELPER_VERSION = 11;
 export const PUBDOM_INSTALL_HELPER_VERSION = 12;
 export interface PubdomInstallResult { ok: boolean; side?: string; version?: string; unit?: string; active?: boolean; setup?: string; restarted?: string[]; error?: string; detail?: string }
 export interface PubdomResult { ok: boolean; changed?: boolean; restarted?: boolean; file?: string; error?: string; detail?: string }
+/** Helper version with the exit-node verbs (server/admin.ts). */
+export const EXIT_HELPER_VERSION = 14;
+export interface ExitClient { address: string; inner: string; name: string; served: boolean }
+export interface ExitState { installed: boolean; unit: { active: string; enabled: string } | null; clients: ExitClient[]; clientsFile: string; error?: string }
+export interface ExitResult { ok: boolean; detail?: string; error?: string }
 export interface ConfigBackup { id: string; size: number; mtime: number }
 export interface ApplyResult { ok: boolean; changed?: boolean; restarted?: boolean; backup_id?: string; rolled_back?: boolean; restored_healthy?: boolean; error?: string; journal?: string }
 export type RuleSource = { kind: 'any' } | { kind: 'npub'; npub: string; label?: string; addr?: string } | { kind: 'prefix'; prefix: string; label?: string };
@@ -38,6 +43,9 @@ export const adminApi = {
   deleteDropin: (name: string) => api.post<DropinResult>('/api/admin/firewall/dropin/delete', { name }),
   service: (unit: string, action: 'start' | 'stop' | 'restart' | 'reload' | 'enable' | 'disable') => api.post<{ ok: boolean; active: boolean; enabled: string }>('/api/admin/service', { unit, action }),
   address: (npub: string) => api.get<{ npub: string; address: string }>(`/api/admin/address?npub=${encodeURIComponent(npub)}`),
+  // The exit node (docs/exit-node.md): the client list, through the helper.
+  exitAdd: (who: string, name?: string) => api.post<ExitResult>('/api/admin/exit/client', { who, ...(name ? { name } : {}) }),
+  exitRemove: (address: string) => api.post<ExitResult>('/api/admin/exit/client/remove', { who: address }),
   // Public domains (docs/public-domains.md): files through the helper, actions over the control sockets.
   pubdomZone: (file: string, content: string, base: string) => api.post<PubdomResult>('/api/admin/pubdom/zone', { file, content, base }),
   pubdomZoneDelete: (file: string) => api.post<PubdomResult>('/api/admin/pubdom/zone/delete', { file }),

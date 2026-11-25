@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Exit node** page, where the node runs
+  [fips-exit](https://github.com/fr34aky/fips-exit): the service's state and
+  the mesh clients allowed to send their internet traffic out through this
+  node, each with its mesh address and its address inside the tunnel. Admins
+  allow a client by npub or fips address, remove one, and start, stop, enable
+  or disable the service. Reads need no privilege; changes go through the
+  helper's new `exit-add` and `exit-remove` (helper v14: run
+  `sudo ./deploy/setup-local.sh` once), which run `fips-exit add` and
+  `remove` with a checked fips address and a one-word name
+  (`GET /api/exit/state`, `POST /api/admin/exit/client`,
+  `POST /api/admin/exit/client/remove`). See `docs/exit-node.md`.
+
 ## [0.15.0] - 2026-11-12
 
 ### Added
