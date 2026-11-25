@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { query, queryStatus, queryListening, ControlError, READ_ONLY_COMMANDS, GATEWAY_COMMANDS, SOCKET_PATH, GATEWAY_SOCKET_PATH, ipv6tunSocketPath, endpointExists } from './control.ts';
+import { detect as detectExit, state as exitState } from './exit.ts';
 import { detect as detectPubdom, fullState as pubdomFullState, latestRelease as pubdomLatestRelease, isSide as isPubdomSide, READ_COMMANDS as PUBDOM_READ, CONFIG_FILE as PUBDOM_CONFIG_FILE, PubdomStateError, pubdomQuery, readEditable, readZoneFile, hostMatches, servedHostnames, setServedOwnNpub, watchServedHostnames } from './pubdom.ts';
 import { journal, recentLogs, LOG_SOURCE, type LogLine } from './journal.ts';
 import { LOGS, setDaemonProbe } from './platform.ts';
@@ -432,7 +433,7 @@ async function route(req: Req, res: Res) {
     const pr = principalOf(req);
     // Host details only for callers that passed authentication (health itself is open locally).
     const authed = via === 'mesh' || tokenOk(req, url);
-    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, security: isAdmin(pr.role) && PLATFORM.os === 'linux', fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
+    return json(res, 200, { ok: !error, auth: via === 'mesh' ? 'npub' : TOKEN ? 'token' : 'none', principal: pr, readOnly: READ_ONLY || !isAdmin(pr.role), upgrade: true, serviceControl: isAdmin(pr.role) && (await serviceControlMode()) !== null, nodeManagement: isAdmin(pr.role) && (await admin.helperInfo()).managementCapable && !READ_ONLY, security: isAdmin(pr.role) && PLATFORM.os === 'linux', fleet: authed && isSuperadmin(pr.role) && !READ_ONLY, socket: SOCKET_PATH, gatewaySocket: endpointExists(GATEWAY_SOCKET_PATH) ? GATEWAY_SOCKET_PATH : null, ...(authed ? { platform: PLATFORM, logSource: LOG_SOURCE, pubdom: detectPubdom(), exit: detectExit() } : {}), pollMs: POLL_MS, uiVersion: UI_VERSION, uiUptimeSecs: Math.floor((Date.now() - startedAt) / 1000), error, version: (daemon as { version?: string } | null)?.version });
   }
 
   if (p === '/api/events') return handleSse(req, res);
@@ -540,6 +541,8 @@ async function route(req: Req, res: Res) {
 
   // Public domain names (server/pubdom.ts): /api/pubdom/state says what is installed and running right now;
   // /api/pubdom/<resolver|server>/<command> proxies the read-only commands, for every role.
+  // The exit node (server/exit.ts): what is installed, whether it runs, and the client list, for every role.
+  if (p === '/api/exit/state') { if (method !== 'GET') throw new HttpError(405, 'GET only'); return json(res, 200, await exitState()); }
   if (p === '/api/pubdom/state') { if (method !== 'GET') throw new HttpError(405, 'GET only'); return json(res, 200, await pubdomFullState()); }
   // The newest release on GitHub, for the install and update buttons (admins: it is a request to a third party).
   if (p === '/api/pubdom/releases') {

@@ -64,6 +64,9 @@
 #                                     pending and security updates from the distribution's tools, reboot and
 #                                     restart needs, sshd and sysctl hardening, accounts, fips file modes) and
 #                                     print their raw output as JSON; fips-ui parses and scores it
+#   exit-add <fd-address> [name]   -> (v14) allow a mesh client to use this node as its exit node: runs
+#                                     `fips-exit add` (fr34aky/fips-exit), which saves the list and applies it
+#   exit-remove <fd-address>       -> (v14) `fips-exit remove`: the client is cut off at once
 #
 # Environment overrides (also honoured under sudo only if the sudoers rule
 # passes them; the defaults are chosen per OS):
@@ -75,7 +78,7 @@
 set -euo pipefail
 umask 022
 
-HELPER_VERSION=13
+HELPER_VERSION=14
 OS=$(uname -s)
 BINARIES=(fips fipsctl fipstop fips-gateway)
 
@@ -220,7 +223,7 @@ svc_enabled() {
 # The native service name for a fips unit id (fips, fips-dns, fips-gateway, fips-firewall), or nothing.
 svc_native() {
   case "$SM:$1" in
-    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall|systemd:fips-pubdom|systemd:fips-pubdom-server) echo "$1.service" ;;
+    systemd:fips|systemd:fips-dns|systemd:fips-gateway|systemd:fips-firewall|systemd:fips-pubdom|systemd:fips-pubdom-server|systemd:fips-exit) echo "$1.service" ;;
     rc:fips|rc:fips-dns|rc:fips-gateway) echo "${1//-/_}" ;;
     pfsense:fips) echo fips ;;
     launchd:fips) echo "$SERVICE" ;;
@@ -1762,7 +1765,7 @@ case "$cmd" in
     trap '' INT TERM HUP
     action=${2:-}; unit=${3:-}
     case "$action" in start|stop|restart|reload|enable|disable) ;; *) die "action must be start, stop, restart, reload, enable or disable" ;; esac
-    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server) ;; *) die "unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom or fips-pubdom-server" ;; esac
+    case "$unit" in fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server|fips-exit) ;; *) die "unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom, fips-pubdom-server or fips-exit" ;; esac
     # With pf the fips firewall is not a service but the fips-ui anchor: its buttons act on pf.
     if [[ "$unit" == fips-firewall && "$(fw_backend)" == pf ]]; then
       pf_fw_action "$action"
@@ -1783,6 +1786,25 @@ case "$cmd" in
     esac
     a=false; svc_active "$native" && a=true
     printf '{"ok":true,"unit":%s,"active":%s,"enabled":%s}\n' "$(json_escape "$native")" "$a" "$(json_escape "$(svc_enabled "$native")")"
+    ;;
+
+  exit-add|exit-remove)
+    # fips-exit's own script does the work (the client list, the routes, NAT, the firewall); this only decides
+    # what may reach it as root. The address is a fips address and nothing else; the name is one plain word.
+    # Neither can begin with a dash, so neither can be taken for an option.
+    take_lock
+    addr=${2:-}; name=${3:-}
+    [[ "$addr" =~ ^fd[0-9a-f]{0,2}(:[0-9a-f]{0,4}){1,7}$ ]] || die "not a fips address (fd…): $addr"
+    [[ -z "$name" || "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]] || die "the name must be one word of letters, digits, dot, dash or underscore (at most 40 characters)"
+    script=${FIPS_EXIT_SCRIPT:-/usr/local/sbin/fips-exit}
+    [[ -x "$script" ]] || die "fips-exit is not installed here ($script)"
+    if [[ "$cmd" == exit-add ]]; then
+      out=$("$script" add "$addr" ${name:+"$name"} 2>&1) || die "${out:-fips-exit add failed}"
+    else
+      [[ -z "$name" ]] || die "exit-remove takes the address only"
+      out=$("$script" remove "$addr" 2>&1) || die "${out:-fips-exit remove failed}"
+    fi
+    printf '{"ok":true,"detail":%s}\n' "$(json_escape "$out")"
     ;;
 
   pubdom-zone-apply)

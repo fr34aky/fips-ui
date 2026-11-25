@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { isMeshPrefix } from './net6.ts';
 import { readJsonBody, BodyError, sendJson } from './http.ts';
+import { fipsAddress, EXIT_NAME_RE } from './exit.ts';
 import { unitStates } from './system.ts';
 import type { RawScan } from './security.ts';
 
@@ -24,6 +25,8 @@ export const HOSTS_HELPER_VERSION = 6;
 export const PUBDOM_HELPER_VERSION = 11;
 /** Helper version with the read-only security scan (docs/security-scan.md). */
 export const SECURITY_HELPER_VERSION = 13;
+/** Helper version with the exit-node verbs (exit-add, exit-remove) and the fips-exit unit. */
+export const EXIT_HELPER_VERSION = 14;
 // Above the helper's own worst case: four dnf steps of 5 minutes, the restart checks (4 minutes) and the rest.
 const SECURITY_SCAN_TIMEOUT = 30 * 60_000;
 // Worst case for config-apply: stop timeout (90 s) + health window (45 s), twice when it rolls back, plus margin.
@@ -442,9 +445,22 @@ export function createAdminHandler(opts: AdminOptions) {
         if ((command === 'check-dns' || command === 'forget') && domain === undefined) throw new BodyError(400, 'domain required');
         sendJson(res, 200, { ok: true, result: await pubdomQuery(side, command, domain === undefined ? undefined : { domain }) }); return true;
       }
+      // The exit node (server/exit.ts): the client list, through the helper's exit-add / exit-remove. A client
+      // is named by npub or by fips address; the helper is only ever given the address.
+      if (sub === '/exit/client' || sub === '/exit/client/remove') {
+        const { who, name } = body as { who?: unknown; name?: unknown };
+        if (typeof who !== 'string' || !who.trim()) throw new BodyError(400, 'who must be an npub or a fips address');
+        const address = NPUB_RE.test(who.trim()) ? await meshAddress(who.trim()) : fipsAddress(who);
+        if (!address || !fipsAddress(address)) throw new BodyError(400, 'who must be an npub or a fips address (fd…)');
+        if (sub === '/exit/client' && name !== undefined && name !== '' && (typeof name !== 'string' || !EXIT_NAME_RE.test(name))) throw new BodyError(400, 'the name must be one word of letters, digits, dot, dash or underscore (at most 40 characters)');
+        const h = await helperInfo();
+        if ((h.version ?? 0) < EXIT_HELPER_VERSION) throw new Conflict(`managing the exit node needs helper v${EXIT_HELPER_VERSION} (installed: ${h.version ? `v${h.version}` : 'none'}); run sudo ./deploy/setup-local.sh`);
+        if (sub === '/exit/client/remove') { sendJson(res, 200, await helperJson<Record<string, unknown>>(['exit-remove', address])); return true; }
+        sendJson(res, 200, await helperJson<Record<string, unknown>>(['exit-add', address, ...(name ? [name as string] : [])])); return true;
+      }
       if (sub === '/service') {
         const { unit, action } = body as { unit?: unknown; action?: unknown };
-        if (typeof unit !== 'string' || !/^(fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server)(\.service)?$/.test(unit)) throw new BodyError(400, 'unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom or fips-pubdom-server');
+        if (typeof unit !== 'string' || !/^(fips|fips-firewall|fips-dns|fips-gateway|fips-pubdom|fips-pubdom-server|fips-exit)(\.service)?$/.test(unit)) throw new BodyError(400, 'unit must be fips, fips-firewall, fips-dns, fips-gateway, fips-pubdom, fips-pubdom-server or fips-exit');
         if (typeof action !== 'string' || !['start', 'stop', 'restart', 'reload', 'enable', 'disable'].includes(action)) throw new BodyError(400, 'invalid action');
         sendJson(res, 200, await serviceAction(unit, action)); return true;
       }
