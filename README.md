@@ -105,7 +105,7 @@ Everything is via environment variables.
 | `FIPS_UI_ACCESS_FILE` | `~/.config/fips-ui/access.json` | Mesh access settings and allowed npubs, managed from the Access page. |
 | `FIPS_UI_TOKEN` | – | When set, every API call needs `Authorization: Bearer <token>`; the UI prompts for it once and stores it in the browser. Put it in `/etc/default/fips-ui` (mode 0600), not in the unit file. |
 | `FIPS_UI_READ_ONLY` | – | `1` disables every mutating action (connect, disconnect, probe, service control, upgrade). |
-| `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | Legacy: `1` enables service buttons through plain `systemctl` (polkit rule or root) when the helper is not installed. With helper v3 they work without it. |
+| `FIPS_UI_ALLOW_SERVICE_CONTROL` | – | Legacy: `1` enables service buttons through plain `systemctl` (polkit rule or root) when the helper is not installed. With helper v4 they work without it. |
 | `FIPS_UI_POLL_MS` | `2000` | How often the backend polls the daemon while at least one browser is connected. |
 | `FIPS_SOCKET` | auto | Control endpoint: a Unix socket path, a TCP port (Windows default `21210`), or `host:port`. |
 | `FIPS_UI_SERVICE_MANAGER` | auto | Force `systemd`, `openrc`, `procd`, `launchd`, `rc` or `scm`. |
@@ -116,6 +116,8 @@ Everything is via environment variables.
 | `FIPS_UNIT` | `fips.service` | Journal unit to follow (systemd only). |
 | `FIPS_HOSTS` | per OS | Hosts file ([docs/hosts.md](docs/hosts.md)). |
 | `FIPS_PUBDOM_SOCKET`, `FIPS_PUBDOM_SERVER_SOCKET` | `/run/fips-pubdom/control.sock`, `/run/fips-pubdom-server/control.sock` | The public-domains resolver's and server's control sockets ([docs/public-domains.md](docs/public-domains.md)). |
+| `FIPS_EXIT_SCRIPT`, `FIPS_EXIT_DAEMON`, `FIPS_EXIT_CLIENTS` | `/usr/local/sbin/fips-exit`, `/usr/local/sbin/fips-exitd`, `/etc/fips-exit/clients` | Where fips-exit is looked for, and its client list ([docs/exit-node.md](docs/exit-node.md)). |
+| `FIPS_UI_DROPIN_DIR` | `/etc/fips/fips.d` | The directory the fips firewall's nftables drop-ins are read from. |
 | `FIPS_UI_HOSTS_SYNC_FILE` | `~/.config/fips-ui/hosts-sync.json` | Settings for syncing names from another node. |
 | `FIPS_UI_HOSTS_FOLLOWERS_FILE` | `~/.config/fips-ui/hosts-followers.json` | On a master or distribution node: the nodes that sync from it. |
 | `FIPS_UI_CONFIG_PROPOSAL_FILE` | `~/.config/fips-ui/config-proposal.json` | A fips.yaml template merge waiting for review. |
@@ -124,6 +126,7 @@ Everything is via environment variables.
 | `FIPS_UI_SECURITY_FILE` | `~/.config/fips-ui/security.json` | The security scan's schedule; its reports are kept in `security/` next to it ([docs/security-scan.md](docs/security-scan.md)). |
 | `FIPS_UI_REPO` | `fr34aky/fips-ui` | Repository whose releases fips-ui installs for itself. |
 | `FIPS_UI_STATIC` | `web/dist` | Directory with the built frontend. |
+| `FIPS_UI_DEV_HOST` | `127.0.0.1` | `npm run dev` only: the address the Vite dev server binds. |
 
 Upgrade-specific variables (`FIPS_UI_WORKDIR`, `FIPS_UI_GITHUB_TOKEN`, …) are listed in [docs/upgrade.md](docs/upgrade.md). `FIPS_UI_GITHUB_TOKEN` (a token without permissions) also lifts GitHub's 60-requests-per-hour limit for the release checks.
 
@@ -171,6 +174,10 @@ as admins or superadmins are (superadmin is admin plus the Node manager page, [d
 every change and also the admin reads that come with one (sync settings, followers, a pending config proposal, the
 update state).
 
+With `FIPS_UI_TOKEN` set, send `Authorization: Bearer <token>`, or `?token=<token>` where a header cannot be set
+(an `EventSource`). `?refresh=1` on `/api/admin/status`, `/api/upgrade/status`, `/api/pubdom/releases` and (for
+admins) `/api/ui-update` asks again instead of answering from the cache.
+
 **Node state**
 
 ```
@@ -178,7 +185,7 @@ GET  /api/health                      UI + daemon health, enabled features, who 
 GET  /api/snapshot                    latest polled state (status, peers, links, transports, tree, sessions, …)
 GET  /api/events                      SSE stream: `snapshot` every poll, `log` per log line
 GET  /api/q/<show_command>?k=v        any read-only control-socket query, e.g. /api/q/show_stats_history?metric=srtt_ms&peer=home&window=1h
-GET  /api/logs?lines=300              recent daemon log lines (parsed)
+GET  /api/logs?lines=300              recent daemon log lines (parsed; at most 5000, &since=<time> with journald)
 GET  /api/system                      host facts + service state
 GET  /api/resolve?id=<name>           npub for an npub, hosts-file name or peer name
 POST /api/connect                     {peer, address, transport}
@@ -204,7 +211,7 @@ GET  /api/ui-update                   newest fips-ui release; for admins (not re
 ```
 GET  /api/fleet                       the managed nodes with what each last answered (?refresh=1 probes them now);  POST {nodes: [{npub, label?, port?}], managers: [{npub, label?}]} saves the list
 GET  /api/fleet/nodes/<npub>/api/…    that node's own API, forwarded (GET and POST, streams included): the pages above shown for a managed node
-POST /api/fleet/nodes/<npub>/sync-managers   make every manager (this node and the standbys) an admin on that node;  POST /api/fleet/sync-managers for all nodes
+POST /api/fleet/nodes/<npub>/sync-managers   make every manager (this node and the standbys) an admin on that node;  POST /api/fleet/sync-managers {npubs?} for the named nodes, or without it every reachable node that is out of sync
 ```
 
 **Node management** (through the privileged helper, [docs/node-management.md](docs/node-management.md))
@@ -221,7 +228,8 @@ GET  /api/admin/address?npub=         the npub's fips0 address
 POST /api/admin/log-access            let the UI read the daemon's log file (FreeBSD, macOS)
 GET  /api/admin/security              the security scan: schedule, whether one runs, next run, the latest report ([docs/security-scan.md](docs/security-scan.md))
 GET  /api/admin/security/history      score, grade and counts of the kept reports;  GET …/summary the latest score (for the Node manager)
-POST /api/admin/security/scan         scan now (202, poll GET);  POST …/settings {enabled, weekday 0-6 (Sunday 0), hour 0-23}
+POST /api/admin/security/scan         scan now (202, poll GET);  POST …/settings {enabled, every: day|week, weekday 0-6 (Sunday 0), hour 0-23}
+POST /api/admin/security/ignore       {id, ignored}: leave a finding out of the score (true) or count it again
 ```
 
 **Daemon upgrades and fresh installs** ([docs/upgrade.md](docs/upgrade.md))
@@ -236,19 +244,24 @@ POST /api/upgrade/install-daemon      {tag?, peers?: ["npub1…@udp/host:port"],
 GET  /api/upgrade/toolchain/plan      what a source build needs and how to install it
 ```
 
-**Public domains** ([docs/public-domains.md](docs/public-domains.md))
+**Exit node** ([docs/exit-node.md](docs/exit-node.md))
 
 ```
 GET  /api/exit/state                  the exit node (fips-exit): installed, service state, the client list
 POST /api/admin/exit/client           {who, name?}: allow a client, by npub or fips address (helper);  POST …/client/remove {who}
+```
+
+**Public domains** ([docs/public-domains.md](docs/public-domains.md))
+
+```
 GET  /api/pubdom/state                what is installed and running, per side (resolver, server)
-GET  /api/pubdom/<side>/<command>     read-only socket commands: resolver status|pins|log, server status|zones|txt|attestations|log
+GET  /api/pubdom/<side>/<command>     read-only socket commands: resolver status|pins|log, server status|zones|txt|attestations|log (log?n=200 for that many lines)
 GET  /api/pubdom/<side>/config-file   the side's configuration file (admin);  GET /api/pubdom/server/zone-file?file= a zone file (admin)
 GET  /api/pubdom/releases             newest fips-pub-domains release (admin)
 POST /api/admin/pubdom/zone           {file, content, base}: a zone file (helper);  POST …/zone/delete {file}
 POST /api/admin/pubdom/config         {side, yaml, base, restart?}: a side's configuration (helper)
 POST /api/admin/pubdom/install        {side, tag?};  POST /api/admin/pubdom/update {tag?}  (helper, systemd, not NixOS)
-POST /api/admin/pubdom/action         socket commands that change something, over the control sockets
+POST /api/admin/pubdom/action         {side, command, domain?}: resolver forget|flush, server publish|check-dns, over the control sockets (domain required for forget and check-dns)
 ```
 
 `peer` accepts an npub, a name from the hosts file, or the display name of a known peer.
@@ -265,6 +278,8 @@ server/            zero-dependency Node backend (TypeScript run by Node directly
   upgrade.ts         daemon upgrades and fresh installs config-merge.ts         fips.yaml template merge after upgrades
   pubdom.ts          fips-pub-domains sockets and files github.ts               GitHub release lookups
   self-update.ts     fips-ui's own updates              version.ts              fips-ui's version from the git tag
+  fleet.ts           the Node manager                   security.ts             the security scan
+  exit.ts            the exit node (fips-exit) state and client list
   journal.ts, http.ts  log follower, HTTP helpers
 web/               Vite + React + Tailwind frontend: src/views/* one file per page, src/components/* shared, src/lib/* API and stores
 scripts/
@@ -292,6 +307,8 @@ docs/              feature documentation, screenshots
 | [docs/node-management.md](docs/node-management.md) | The helper, the configuration editor and its redaction, firewall rules, services |
 | [docs/upgrade.md](docs/upgrade.md) | Upgrading the fips daemon, the privilege model, the fips.yaml template merge |
 | [docs/public-domains.md](docs/public-domains.md) | The Public domains page: fips-pub-domains' resolver and domain server, zones, installing and updating them |
+| [docs/exit-node.md](docs/exit-node.md) | The Exit node page: fips-exit's service state and its client list |
+| [docs/security-scan.md](docs/security-scan.md) | The security scan: what it checks, the score, ignoring findings, the schedule |
 | [docs/self-update.md](docs/self-update.md) | fips-ui updating itself |
 | [docs/fleet.md](docs/fleet.md) | The Node manager: other nodes' fips-ui instances managed from this one over the mesh, standby managers for recovery |
 
