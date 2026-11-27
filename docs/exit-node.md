@@ -7,6 +7,8 @@ clients on its list send their internet traffic to it over the mesh, and it forw
 its own address, as a VPN server would. The clients are phones running
 [fips2go](https://github.com/fr34aky/fips2go) (Overview → Internet route) or other fips nodes.
 
+![The Exit node page](screenshots/exit-node.png)
+
 When fips-ui finds `fips-exit` on the node (`/usr/local/sbin/fips-exit` and `fips-exitd`), an **Exit
 node** page appears in the sidebar. Viewers see:
 
