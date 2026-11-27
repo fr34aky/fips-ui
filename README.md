@@ -38,6 +38,8 @@ Dark and light themes, responsive down to phone width, no external fonts or CDNs
 
 ![security](docs/screenshots/security.png)
 
+![exit node](docs/screenshots/exit-node.png)
+
 ## Requirements
 
 - Node.js 22.18+, 23.6+ or 24+ (the backend is TypeScript run directly by Node's unflagged type stripping; no build step for the server)
